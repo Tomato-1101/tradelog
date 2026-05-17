@@ -1,0 +1,86 @@
+@import "tailwindcss";
+
+/* === ライト (デフォルト) === */
+:root,
+[data-theme="light"] {
+  --background: #f6f7f9;
+  --foreground: #14171c;
+  --surface: #ffffff;
+  --surface-muted: #f1f4f8;
+  --border: #e1e6ee;
+  --border-strong: #c5cdd9;
+  --muted: #6b7280;
+  --muted-strong: #3f4651;
+
+  /* moomoo オレンジ系プライマリ */
+  --primary: #ff7a00;
+  --primary-soft: #fff1e0;
+  --primary-foreground: #ffffff;
+
+  /* 損益 (日本式: +=緑, -=赤) */
+  --pos: #16a34a;
+  --pos-bg: rgba(22, 163, 74, 0.12);
+  --neg: #dc2626;
+  --neg-bg: rgba(220, 38, 38, 0.12);
+}
+
+/* === ダーク === */
+[data-theme="dark"] {
+  --background: #0b0d12;
+  --foreground: #e6e8ec;
+  --surface: #151921;
+  --surface-muted: #1c2129;
+  --border: #2a313c;
+  --border-strong: #3a414d;
+  --muted: #8b919c;
+  --muted-strong: #c1c6ce;
+
+  --primary: #ff8a2c;
+  --primary-soft: rgba(255, 138, 44, 0.18);
+  --primary-foreground: #14171c;
+
+  --pos: #2ecc71;
+  --pos-bg: rgba(46, 204, 113, 0.18);
+  --neg: #ef5350;
+  --neg-bg: rgba(239, 83, 80, 0.18);
+}
+
+@theme inline {
+  --color-background: var(--background);
+  --color-foreground: var(--foreground);
+  --color-surface: var(--surface);
+  --color-surface-muted: var(--surface-muted);
+  --color-border: var(--border);
+  --color-muted: var(--muted);
+  --color-primary: var(--primary);
+  --color-primary-soft: var(--primary-soft);
+  --color-pos: var(--pos);
+  --color-neg: var(--neg);
+  --font-sans: var(--font-geist-sans);
+  --font-mono: var(--font-geist-mono);
+}
+
+html,
+body {
+  background: var(--background);
+}
+
+body {
+  color: var(--foreground);
+  font-family: var(--font-sans), -apple-system, BlinkMacSystemFont, "Hiragino Sans",
+    "Yu Gothic", "Segoe UI", sans-serif;
+  font-feature-settings: "tnum" 1, "lnum" 1;
+}
+
+/* スクロールバー (macOS で目立たないように) */
+::-webkit-scrollbar { width: 10px; height: 10px; }
+::-webkit-scrollbar-thumb { background: var(--border-strong); border-radius: 999px; }
+::-webkit-scrollbar-track { background: transparent; }
+
+/* date input のテーマ追従 */
+input[type="date"] {
+  color-scheme: light dark;
+}
+[data-theme="dark"] input[type="date"] {
+  color-scheme: dark;
+}

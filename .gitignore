@@ -1,0 +1,66 @@
+# Node / Next.js
+node_modules/
+.next/
+out/
+dist/
+.turbo/
+*.tsbuildinfo
+next-env.d.ts
+
+# Python
+.venv/
+.venv-*/
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Backups / temp / OS junk
+*.bak
+*.bak-*
+*.tmp
+
+# Secrets / env
+.env
+.env.*
+!.env.example
+
+# Local data (trade history, OHLC cache, SQLite DB)
+data/raw/**
+!data/raw/.gitkeep
+!data/raw/sbi/.gitkeep
+!data/raw/moomoo/.gitkeep
+data/ohlc-cache/**
+!data/ohlc-cache/.gitkeep
+data/app.db
+data/app.db-journal
+data/app.db-wal
+data/app.db-shm
+data/derived/
+data/backups/
+
+# OS / editor
+.DS_Store
+.idea/
+.vscode/*
+!.vscode/extensions.json
+!.vscode/settings.json
+*.swp
+*.swo
+
+# Logs
+*.log
+logs/
+npm-debug.log*
+
+# Prisma migration shadow DB
+prisma/dev.db
+
+# Prisma 7 generated client (apps/web 配下に出力される、再生成可能)
+apps/web/generated/
+
+# ローカル限定スクリプト (口座番号など本人固有の情報を含む)
+apps/web/scripts/*.local.ts
+apps/api-py/.python-version
