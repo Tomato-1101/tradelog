@@ -1,0 +1,9 @@
+fastapi>=0.115,<1.0
+uvicorn[standard]>=0.32,<1.0
+yfinance>=0.2.40
+diskcache>=5.6
+python-dateutil>=2.9
+httpx>=0.28
+pydantic>=2.9
+# moomoo Python SDK。3.12 系を要求する。OpenD (127.0.0.1:11111) 経由で米株 OHLC / 履歴を取得。
+futu-api>=10.5

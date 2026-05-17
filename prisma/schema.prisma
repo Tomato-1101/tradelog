@@ -1,0 +1,192 @@
+// データモデル詳細は docs/DATA_MODEL.md / plan ファイルを参照。
+// dedupe / round 集計は apps/web/lib に実装。
+
+generator client {
+  provider = "prisma-client"
+  // Prisma 7 では output 必須。apps/web から相対 import するため apps/web/generated/prisma に出す。
+  output   = "../apps/web/generated/prisma"
+}
+
+datasource db {
+  provider = "sqlite"
+  // Prisma 7: url は prisma.config.ts (リポルート) で指定する。
+}
+
+enum BrokerCode {
+  SBI
+  MOOMOO
+}
+
+enum InstrumentKind {
+  EQUITY_JP
+  EQUITY_US
+  OPTION_US
+}
+
+enum OptionRight {
+  CALL
+  PUT
+}
+
+enum Side {
+  BUY
+  SELL
+}
+
+enum MarginType {
+  CASH
+  MARGIN_LONG
+  MARGIN_SHORT
+}
+
+model Broker {
+  id       Int        @id @default(autoincrement())
+  code     BrokerCode @unique
+  name     String
+  accounts Account[]
+}
+
+model Account {
+  id           Int         @id @default(autoincrement())
+  brokerId     Int
+  broker       Broker      @relation(fields: [brokerId], references: [id])
+  externalId   String
+  label        String?
+  baseCcy      String
+  executions   Execution[]
+  importBatches ImportBatch[]
+  rounds       Round[]
+
+  @@unique([brokerId, externalId])
+}
+
+// 現物・米株・米株オプションを同一テーブルで保持。
+// OPTION_US のとき expiry/strike/right/underlying/occSymbol が非 null。
+// 自然キーは (kind, symbol, expiry, strike, right) — 現物は expiry=null/strike=null/right=null。
+model Instrument {
+  id         Int            @id @default(autoincrement())
+  kind       InstrumentKind
+  symbol     String
+  exchange   String?
+  name       String?
+  ccy        String
+  // OPTION_US 固有
+  underlying String?
+  expiry     DateTime?
+  strike     Decimal?
+  right      OptionRight?
+  multiplier Int?
+  occSymbol  String?        @unique
+
+  executions Execution[]
+  ohlcBars   OhlcBar[]
+  rounds     Round[]
+
+  @@unique([kind, symbol, expiry, strike, right])
+  @@index([kind, symbol])
+}
+
+model ImportBatch {
+  id         String      @id @default(cuid())
+  accountId  Int
+  account    Account     @relation(fields: [accountId], references: [id])
+  source     String // "sbi-csv" / "moomoo-api" / "moomoo-csv"
+  fileName   String?
+  fileSha256 String?
+  importedAt DateTime    @default(now())
+  newCount   Int         @default(0)
+  dupCount   Int         @default(0)
+  // 「ノーカン」フラグ: true のとき集計・チャート・Round 再構築から除外する。
+  // 削除ではなく一時的に隠すだけ。元データは Execution 側にそのまま残る。
+  hidden     Boolean     @default(false)
+  executions Execution[]
+}
+
+model Execution {
+  id              Int         @id @default(autoincrement())
+  accountId       Int
+  account         Account     @relation(fields: [accountId], references: [id])
+  instrumentId    Int
+  instrument      Instrument  @relation(fields: [instrumentId], references: [id])
+  importBatchId   String
+  importBatch     ImportBatch @relation(fields: [importBatchId], references: [id])
+
+  executedAt      DateTime
+  side            Side
+  qty             Decimal
+  price           Decimal
+  fee             Decimal     @default(0)
+  tax             Decimal     @default(0)
+  marginType      MarginType  @default(CASH)
+  externalOrderId String?
+  externalFillId  String?
+  // 取引日の USDJPY 中値。instrument.ccy が JPY なら "1"。
+  fxRateToJpy     Decimal
+  dedupeHash      String      @unique
+  rawJson         String // JSON 文字列で生データを保持
+
+  @@index([instrumentId, executedAt])
+  @@index([accountId, executedAt])
+}
+
+// ポジションラウンド = 銘柄(+口座+marginType) 単位で
+// ポジション 0 → エントリー → 部分決済を経て 0 に戻るまでの 1 サイクル。
+// Execution が真実、Round は決定論的に再計算可能なキャッシュ。
+model Round {
+  id              Int        @id @default(autoincrement())
+  instrumentId    Int
+  instrument      Instrument @relation(fields: [instrumentId], references: [id])
+  accountId       Int
+  account         Account    @relation(fields: [accountId], references: [id])
+  marginType      MarginType
+  direction       Side // BUY = ロング, SELL = ショート
+  openedAt        DateTime
+  closedAt        DateTime?
+  qtyOpened       Decimal
+  avgEntryPrice   Decimal
+  realizedPnl     Decimal
+  realizedPnlJpy  Decimal
+  feesTotal       Decimal
+  holdSeconds     Int?
+  rMultiple       Decimal?
+  executionsJson  String // 構成 Execution の id 配列と role: [{ id, role }]
+  recomputedAt    DateTime   @default(now())
+
+  @@index([instrumentId, openedAt])
+  @@index([closedAt])
+  @@index([accountId, marginType, openedAt])
+}
+
+model OhlcBar {
+  id           Int        @id @default(autoincrement())
+  instrumentId Int
+  instrument   Instrument @relation(fields: [instrumentId], references: [id])
+  timeframe    String // "1m" | "5m" | "1h" | "1d"
+  ts           DateTime
+  open         Decimal
+  high         Decimal
+  low          Decimal
+  close        Decimal
+  volume       Decimal
+  source       String // "moomoo" | "yfinance"
+  fetchedAt    DateTime   @default(now())
+
+  @@unique([instrumentId, timeframe, ts])
+  @@index([instrumentId, timeframe, ts])
+}
+
+model FxRate {
+  id     Int      @id @default(autoincrement())
+  pair   String // "USDJPY"
+  date   DateTime
+  rate   Decimal
+  source String
+
+  @@unique([pair, date])
+}
+
+model UserPreference {
+  key       String   @id
+  value     String // JSON 文字列
+  updatedAt DateTime @updatedAt @default(now())
+}
