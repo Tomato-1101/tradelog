@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest';
 import Decimal from 'decimal.js';
 import { buildPaperRounds, buildSbiRounds, compareExecs } from '@/lib/rounds/builder';
 import type { ExecForRound } from '@/lib/rounds/types';
+import { computeStats } from '@/lib/stats/compute';
 
 let nextId = 1;
 function ex(p: Partial<ExecForRound>): ExecForRound {
@@ -81,10 +82,11 @@ describe('SBI: 基本ケース（旧テストの移植）', () => {
     expect(new Set(rounds.map((r) => r.id)).size).toBe(2);
   });
 
+  // 現物は空売りできない（期間外の売却になる）ので、ショート系は信用売で確かめる
   it('short-simple: SELL 100 / BUY 100 → ショート', () => {
     const [r] = buildSbiRounds([
-      ex({ side: 'SELL', price: '100', executedAt: t('09:00') }),
-      ex({ side: 'BUY', price: '90', executedAt: t('09:10') }),
+      ex({ marginType: 'MARGIN_SHORT', side: 'SELL', price: '100', executedAt: t('09:00') }),
+      ex({ marginType: 'MARGIN_SHORT', side: 'BUY', price: '90', executedAt: t('09:10') }),
     ]);
     expect(r.direction).toBe('SHORT');
     expect(r.realizedPnl).toBe('1000');
@@ -92,17 +94,17 @@ describe('SBI: 基本ケース（旧テストの移植）', () => {
 
   it('short-scaled-out: SELL 1.0 / BUY 0.4 / BUY 0.6', () => {
     const [r] = buildSbiRounds([
-      ex({ side: 'SELL', qty: '1', price: '100', executedAt: t('09:00') }),
-      ex({ side: 'BUY', qty: '0.4', price: '90', executedAt: t('09:01') }),
-      ex({ side: 'BUY', qty: '0.6', price: '80', executedAt: t('09:02') }),
+      ex({ marginType: 'MARGIN_SHORT', side: 'SELL', qty: '1', price: '100', executedAt: t('09:00') }),
+      ex({ marginType: 'MARGIN_SHORT', side: 'BUY', qty: '0.4', price: '90', executedAt: t('09:01') }),
+      ex({ marginType: 'MARGIN_SHORT', side: 'BUY', qty: '0.6', price: '80', executedAt: t('09:02') }),
     ]);
     expect(r.realizedPnl).toBe('16');
   });
 
   it('flip-overfill: BUY 100 / SELL 150 → ロング CLOSE + ショート OPEN（ID は別）', () => {
     const rounds = buildSbiRounds([
-      ex({ side: 'BUY', price: '100', executedAt: t('09:00') }),
-      ex({ side: 'SELL', qty: '150', price: '110', executedAt: t('10:00') }),
+      ex({ marginType: 'MARGIN_LONG', side: 'BUY', price: '100', executedAt: t('09:00') }),
+      ex({ marginType: 'MARGIN_LONG', side: 'SELL', qty: '150', price: '110', executedAt: t('10:00') }),
     ]);
     expect(rounds).toHaveLength(2);
     expect(rounds[0].direction).toBe('LONG');
@@ -144,8 +146,8 @@ describe('SBI: 基本ケース（旧テストの移植）', () => {
 
   it('口座が違えば別ラウンド', () => {
     const rounds = buildSbiRounds([
-      ex({ account: 'A', side: 'BUY', price: '100', executedAt: t('09:00') }),
-      ex({ account: 'B', side: 'SELL', price: '110', executedAt: t('09:01') }),
+      ex({ account: 'A', marginType: 'MARGIN_LONG', side: 'BUY', price: '100', executedAt: t('09:00') }),
+      ex({ account: 'B', marginType: 'MARGIN_LONG', side: 'SELL', price: '110', executedAt: t('09:01') }),
     ]);
     expect(rounds).toHaveLength(2);
     expect(rounds.every((r) => r.status === 'OPEN')).toBe(true);
@@ -315,3 +317,122 @@ describe('価格の欠け・未確定', () => {
   });
 });
 
+
+describe('SBI 現物: 期間外に買った株の売却（現物で空売りはできない）', () => {
+  const PRIOR = /期間外に買った株の売却/;
+
+  it('建玉 0 からの現物売り → 建値不明の売却 1 ラウンド（ショートにしない・損益 null）', () => {
+    const rounds = buildSbiRounds([
+      ex({ marginType: 'CASH', side: 'SELL', qty: '3', price: '3650', fee: '55', executedAt: t('09:00') }),
+    ]);
+    expect(rounds).toHaveLength(1);
+    const r = rounds[0];
+    expect(r.direction).toBe('LONG');
+    expect(r.status).toBe('CLOSED');
+    expect(r.closedAt?.toISOString()).toBe(t('09:00').toISOString());
+    expect(r.remainingQty).toBe('0');
+    expect(r.avgEntryPrice).toBeNull();
+    expect(r.avgExitPrice).toBe('3650');
+    expect(r.realizedPnl).toBeNull();
+    expect(r.netPnl).toBeNull();
+    expect(r.holdSeconds).toBeNull();
+    expect(r.fees).toBe('55');
+    expect(r.warnings.some((w) => PRIOR.test(w))).toBe(true);
+    expect(r.executions.map((e) => e.role)).toEqual(['CLOSE']);
+  });
+
+  it('建玉不足の現物売り → 建玉分は通常決済、超過分は建値不明の売却（ドテンでショートを建てない）', () => {
+    const rounds = buildSbiRounds([
+      ex({ marginType: 'CASH', side: 'BUY', qty: '100', price: '100', fee: '10', executedAt: t('09:00') }),
+      ex({ marginType: 'CASH', side: 'SELL', qty: '150', price: '110', fee: '20', executedAt: t('10:00') }),
+    ]);
+    expect(rounds).toHaveLength(2);
+    const [closed, prior] = rounds;
+    expect(closed.direction).toBe('LONG');
+    expect(closed.status).toBe('CLOSED');
+    expect(closed.realizedPnl).toBe('1000');
+    expect(closed.netPnl).toBe('970'); // 売りの手数料は決済側に計上（ドテンと同じ扱い）
+    expect(closed.warnings).toEqual([]);
+
+    expect(prior.direction).toBe('LONG');
+    expect(prior.status).toBe('CLOSED');
+    expect(prior.qtyOpened).toBe('50');
+    expect(prior.remainingQty).toBe('0');
+    expect(prior.avgExitPrice).toBe('110');
+    expect(prior.realizedPnl).toBeNull();
+    expect(prior.netPnl).toBeNull();
+    expect(prior.fees).toBe('0');
+    expect(prior.warnings.some((w) => PRIOR.test(w))).toBe(true);
+    // 1 約定を 2 ラウンドに分ける既存の仕組み（-flip）に乗せる
+    expect(prior.id).toMatch(/^sbi-[0-9a-z-]{16}-flip$/);
+    expect(prior.executions).toEqual([{ id: closed.executions[1].id, role: 'FLIP' }]);
+  });
+
+  it('期間外の売却の後の現物買いは、新しいロングの建て（2024-05-07 SELL 3 → 2024-06-25 BUY 13 の実例）', () => {
+    const rounds = buildSbiRounds([
+      ex({ marginType: 'CASH', side: 'SELL', qty: '3', price: '3650', executedAt: new Date('2024-05-07T00:00:00Z'), timePrecision: 'day' }),
+      ex({ marginType: 'CASH', side: 'BUY', qty: '13', price: '3199', executedAt: new Date('2024-06-25T00:00:00Z'), timePrecision: 'day' }),
+    ]);
+    expect(rounds).toHaveLength(2);
+    const [prior, long] = rounds;
+    expect(prior.netPnl).toBeNull();
+    expect(prior.qtyOpened).toBe('3');
+    expect(long.direction).toBe('LONG');
+    expect(long.status).toBe('OPEN');
+    expect(long.qtyOpened).toBe('13');
+    expect(long.remainingQty).toBe('13');
+    expect(long.remainingAvgPrice).toBe('3199');
+    expect(long.realizedPnl).toBe('0');
+    expect(long.executions.map((e) => e.role)).toEqual(['OPEN']);
+    expect(rounds.some((r) => r.direction === 'SHORT')).toBe(false);
+  });
+
+  it('安定 ID: 建玉 0 からの売却は、その売り約定の dedupeHash から決まる', () => {
+    const [r] = buildSbiRounds([
+      ex({ marginType: 'CASH', side: 'SELL', executedAt: t('09:00'), dedupeHash: 'abcdef0123456789zzzz' }),
+    ]);
+    expect(r.id).toBe('sbi-abcdef0123456789');
+  });
+
+  it('統計では損益なし（excludedNoPnl）として件数だけ数える', () => {
+    const rounds = buildSbiRounds([
+      ex({ marginType: 'CASH', side: 'SELL', qty: '3', price: '3650', executedAt: t('09:00') }),
+      ex({ marginType: 'CASH', side: 'BUY', price: '100', executedAt: t('10:00') }),
+      ex({ marginType: 'CASH', side: 'SELL', price: '110', executedAt: t('11:00') }),
+    ]);
+    const stats = computeStats(rounds.map((r) => ({ ...r, symbol: 'X' })));
+    expect(stats.excludedNoPnl).toBe(1);
+    expect(stats.counted).toBe(1);
+    expect(stats.totalNetPnl).toBe('1000');
+  });
+
+  it('信用（MARGIN_SHORT）の売り建ては従来どおりショート', () => {
+    const [r] = buildSbiRounds([
+      ex({ marginType: 'MARGIN_SHORT', side: 'SELL', price: '100', executedAt: t('09:00') }),
+      ex({ marginType: 'MARGIN_SHORT', side: 'BUY', price: '90', executedAt: t('09:10') }),
+    ]);
+    expect(r.direction).toBe('SHORT');
+    expect(r.realizedPnl).toBe('1000');
+    expect(r.warnings).toEqual([]);
+  });
+
+  it('PAPER は marginType が CASH でも空売り（建玉 0 からの売り）は従来どおりショート', () => {
+    const rounds = buildPaperRounds([
+      ex({ source: 'PAPER', marginType: 'CASH', positionId: 'S', side: 'SELL', price: '100', executedAt: t('09:00') }),
+      ex({ source: 'PAPER', marginType: 'CASH', positionId: 'S', side: 'BUY', price: '95', executedAt: t('09:05') }),
+    ]);
+    expect(rounds).toHaveLength(1);
+    expect(rounds[0].direction).toBe('SHORT');
+    expect(rounds[0].realizedPnl).toBe('500');
+    expect(rounds[0].warnings).toEqual([]);
+  });
+
+  it('PAPER の決済しすぎは従来どおりドテンでショートを建てる', () => {
+    const rounds = buildPaperRounds([
+      ex({ source: 'PAPER', marginType: 'CASH', positionId: 'F', side: 'BUY', price: '100', executedAt: t('09:00') }),
+      ex({ source: 'PAPER', marginType: 'CASH', positionId: 'F', side: 'SELL', qty: '150', price: '110', executedAt: t('09:05') }),
+    ]);
+    expect(rounds.map((r) => r.direction)).toEqual(['LONG', 'SHORT']);
+    expect(rounds[1].netPnl).toBe('0');
+  });
+});

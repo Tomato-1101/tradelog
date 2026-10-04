@@ -150,14 +150,14 @@ const dur = (s: number | null) => (s === null ? '—' : s < 3600 ? `${(s / 60).t
 function renderSection(title: string, s: Stats): string {
   const out = [`## ${title}`, ''];
   if (s.counted === 0) {
-    out.push(`集計対象なし（未決済 ${s.openCount}、損益未確定 ${s.excludedNoPnl}）`, '');
+    out.push(`集計対象なし（未決済 ${s.openCount}、損益なし（価格未確定・建値不明の売却） ${s.excludedNoPnl}）`, '');
     return out.join('\n');
   }
   out.push(
     '| 項目 | 値 |',
     '|---|---|',
-    `| 件数（決済済み・損益確定） | ${s.counted}（勝 ${s.wins} / 負 ${s.losses} / 分 ${s.draws}） |`,
-    `| 除外 | 未決済 ${s.openCount}、損益未確定 ${s.excludedNoPnl} |`,
+    `| 件数（決済済み・損益あり。要確認の仮価格を含みうる） | ${s.counted}（勝 ${s.wins} / 負 ${s.losses} / 分 ${s.draws}） |`,
+    `| 除外 | 未決済 ${s.openCount}、損益なし（価格未確定・建値不明の売却） ${s.excludedNoPnl} |`,
     `| 勝率 | ${pct(s.winRate)} |`,
     `| 損益合計（手数料込み） | ${yen(s.totalNetPnl)} |`,
     `| 総利益 / 総損失 | ${yen(s.grossProfit)} / ${yen(s.grossLoss)} |`,

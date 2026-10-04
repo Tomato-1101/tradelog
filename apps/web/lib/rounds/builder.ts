@@ -1,5 +1,7 @@
 // ポジションラウンドの構築（純粋関数）。
 // SBI: 「銘柄 × 口座 × 信用区分」ごとに、建玉が 0 → 0 に戻るまでを 1 ラウンドとする（部分決済・買い増し・ドテン対応）。
+// SBI の現物は空売りできないので、建玉を超える売りは「CSV の期間より前に買った（入庫した）株の売却」として
+// 建値不明・損益 null のラウンドにする（ショートを建てない）。
 // PAPER: 建玉 ID（positionId）ごとに 1 ラウンド。0 に戻った後にも約定がある・決済しすぎた等は警告付きで分割する。
 // 損益は移動平均法（買い増しで建値を加重平均し、決済分は平均建値との差で実現）。
 
@@ -120,13 +122,32 @@ function finalize(a: Acc): RoundDraft {
   return d;
 }
 
+export const PRIOR_HOLDING_SALE_WARNING = '期間外に買った株の売却（建値不明・損益は計算しない）';
+
+/**
+ * 建玉の無い現物売り（期間外に買った株の売却）を 1 本の決済済みラウンドにする。
+ * 建値も保有期間も分からないので、損益・平均建値・保有時間は null。数量は売った株数。
+ */
+function priorHoldingSale(e: ExecForRound, qty: Decimal, id: string, role: ExecutionRole, withFee: boolean): RoundDraft {
+  const d = open(e, qty, id, role, withFee).draft; // qty は正 → direction LONG
+  d.qtyOpened = qty.toString();
+  d.closedAt = e.executedAt;
+  d.avgExitPrice = e.price == null ? null : new Decimal(e.price).toString();
+  d.fees = withFee ? new Decimal(e.fee).toString() : '0';
+  d.status = 'CLOSED';
+  d.warnings.push(PRIOR_HOLDING_SALE_WARNING);
+  return d;
+}
+
 /**
  * 1 グループ分の約定列（並べ替え済み）を 0 → 0 のサイクルに分ける。
  * idFor(先頭約定, 何本目のサイクルか, ドテンで生まれたか) で安定 ID を決める。
+ * noShort: 売りでショートを建てない（SBI 現物）。建玉を超える売りは priorHoldingSale にする。
  */
 function buildCycles(
   execs: ExecForRound[],
   idFor: (first: ExecForRound, index: number, flipped: boolean) => string,
+  noShort = false,
 ): RoundDraft[] {
   const out: RoundDraft[] = [];
   let cur: Acc | null = null;
@@ -139,6 +160,10 @@ function buildCycles(
     const fee = new Decimal(e.fee);
 
     if (!cur) {
+      if (noShort && sQty.lt(0)) {
+        out.push(priorHoldingSale(e, qty, idFor(e, out.length, false), 'CLOSE', true));
+        continue;
+      }
       cur = open(e, sQty, idFor(e, out.length, false), 'OPEN', true);
       cur.draft.qtyOpened = sQty.abs().toString();
       continue;
@@ -185,8 +210,13 @@ function buildCycles(
       out.push(finalize(cur));
       cur = null;
       if (!remaining.isZero()) {
-        cur = open(e, remaining, idFor(e, out.length, true), 'FLIP', false);
-        cur.draft.qtyOpened = remaining.abs().toString();
+        if (noShort) {
+          // 超過分はドテンと同じく 1 約定を 2 ラウンドに分け（-flip）、手数料は決済側で計上済み
+          out.push(priorHoldingSale(e, remaining.abs(), idFor(e, out.length, true), 'FLIP', false));
+        } else {
+          cur = open(e, remaining, idFor(e, out.length, true), 'FLIP', false);
+          cur.draft.qtyOpened = remaining.abs().toString();
+        }
       }
     }
   }
@@ -211,7 +241,8 @@ export function buildSbiRounds(execs: ExecForRound[]): RoundDraft[] {
   const out: RoundDraft[] = [];
   for (const arr of groups.values()) {
     arr.sort(compareExecs);
-    out.push(...buildCycles(arr, sbiRoundId));
+    const cash = arr[0].source === 'SBI' && arr[0].marginType === 'CASH';
+    out.push(...buildCycles(arr, sbiRoundId, cash));
   }
   return out.sort((a, b) => a.openedAt.getTime() - b.openedAt.getTime() || (a.id < b.id ? -1 : 1));
 }

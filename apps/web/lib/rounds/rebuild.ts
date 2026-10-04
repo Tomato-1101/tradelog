@@ -39,6 +39,10 @@ export async function rebuildRounds(db: PrismaClient, now: Date): Promise<Rebuil
     excursion.set(r.id, computeExcursion(r, bars, now));
   }
 
+  // ドテン・現物の建玉超過売りの約定は、決済側（元ラウンド）と建て側（role FLIP のラウンド）の両方に載る。
+  // DB 上は必ず FLIP 側に所属させる（ラウンドの書き込み順で付け替わらないよう、決済側では付けない）。
+  const flipOwned = new Set(all.flatMap((r) => r.executions.filter((x) => x.role === 'FLIP').map((x) => x.id)));
+
   const keep = new Set(all.map((r) => r.id));
   const stale = (await db.round.findMany({ select: { id: true } })).map((r) => r.id).filter((id) => !keep.has(id));
 
@@ -75,7 +79,8 @@ export async function rebuildRounds(db: PrismaClient, now: Date): Promise<Rebuil
         warningsJson: JSON.stringify(r.warnings),
       };
       await tx.round.upsert({ where: { id: r.id }, create: { id: r.id, ...data }, update: data });
-      await tx.execution.updateMany({ where: { id: { in: r.executions.map((x) => x.id) } }, data: { roundId: r.id } });
+      const own = r.executions.filter((x) => x.role === 'FLIP' || !flipOwned.has(x.id)).map((x) => x.id);
+      await tx.execution.updateMany({ where: { id: { in: own } }, data: { roundId: r.id } });
     }
 
     // メモ → ラウンド: 注文に紐づくメモはその約定のラウンド、それ以外は建玉の中でメモ時刻に建っていたラウンド
