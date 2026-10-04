@@ -2,9 +2,18 @@
 // エクイティカーブ（決済済みラウンドの累積損益）。時刻付きはラウンドごと、日付だけは日ごとの最終値。
 
 import { useEffect, useRef } from 'react';
-import { ColorType, LineSeries, LineStyle, createChart, type Time } from 'lightweight-charts';
+import { AreaSeries, ColorType, LineStyle, createChart, type Time } from 'lightweight-charts';
 import type { EquityPoint } from '@/lib/stats/equity';
-import { onSchemeChange, readChartColors } from './chart-colors';
+import { onSchemeChange, readChartColors, withAlpha, type ChartColors } from './chart-colors';
+
+function fmtTick(t: Time): string {
+  if (typeof t === 'number') {
+    const d = new Date(t * 1000).toISOString();
+    return `${Number(d.slice(5, 7))}/${Number(d.slice(8, 10))}`;
+  }
+  if (typeof t === 'string') return `${Number(t.slice(5, 7))}/${Number(t.slice(8, 10))}`;
+  return `${t.month}/${t.day}`;
+}
 
 export default function EquityChart({ points, precision }: { points: EquityPoint[]; precision: 'ms' | 'day' }) {
   const ref = useRef<HTMLDivElement>(null);
@@ -14,14 +23,21 @@ export default function EquityChart({ points, precision }: { points: EquityPoint
     const c0 = readChartColors();
     const chart = createChart(el, {
       autoSize: true,
-      layout: { background: { type: ColorType.Solid, color: c0.bg }, textColor: c0.muted, fontFamily: 'inherit' },
-      grid: { vertLines: { color: c0.border }, horzLines: { color: c0.border } },
-      rightPriceScale: { borderColor: c0.border },
-      timeScale: { borderColor: c0.border, timeVisible: precision === 'ms', secondsVisible: false },
+      layout: { background: { type: ColorType.Solid, color: c0.surface }, textColor: c0.muted, fontFamily: 'inherit', fontSize: 11, attributionLogo: false },
+      grid: { vertLines: { visible: false }, horzLines: { color: c0.grid } },
+      rightPriceScale: { borderVisible: false },
+      // 時刻付きは JST にずらした秒。軸の目盛りが「14:00」「2日」と混ざらないよう日付で揃える
+      timeScale: { borderVisible: false, timeVisible: precision === 'ms', secondsVisible: false, tickMarkFormatter: fmtTick },
+      localization: { timeFormatter: fmtTick },
     });
     const lastValue = points[points.length - 1].value;
-    const line = chart.addSeries(LineSeries, {
-      color: lastValue >= 0 ? c0.up : c0.down,
+    // 最終値の符号で線の色を決め、下に薄い塗り（moomoo の資産推移と同じ見せ方）
+    const tone = (c: ChartColors) => {
+      const col = lastValue >= 0 ? c.up : c.down;
+      return { lineColor: col, topColor: withAlpha(col, 0.22), bottomColor: withAlpha(col, 0.01) };
+    };
+    const line = chart.addSeries(AreaSeries, {
+      ...tone(c0),
       lineWidth: 2,
       priceFormat: { type: 'price', precision: 0, minMove: 1 },
       priceLineVisible: false,
@@ -32,12 +48,10 @@ export default function EquityChart({ points, precision }: { points: EquityPoint
     const theme = () => {
       const c = readChartColors();
       chart.applyOptions({
-        layout: { background: { type: ColorType.Solid, color: c.bg }, textColor: c.muted },
-        grid: { vertLines: { color: c.border }, horzLines: { color: c.border } },
-        rightPriceScale: { borderColor: c.border },
-        timeScale: { borderColor: c.border },
+        layout: { background: { type: ColorType.Solid, color: c.surface }, textColor: c.muted },
+        grid: { horzLines: { color: c.grid } },
       });
-      line.applyOptions({ color: lastValue >= 0 ? c.up : c.down });
+      line.applyOptions(tone(c));
       zero.applyOptions({ color: c.muted });
     };
     const off = onSchemeChange(theme);

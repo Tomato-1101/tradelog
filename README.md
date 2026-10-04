@@ -1,93 +1,61 @@
 # tradelog
 
-ローカルで完結する個人向けトレード復習 + 資産管理アプリ。
+日本株デイトレの練習と振り返りを、お金を使わずにローカルで完結させるアプリ。
 
-- 取引履歴 (SBI 日本株 CSV / moomoo 米株・米株オプション API) を取り込み、ローソク足チャートに **エントリー/エグジットをピン留め**
-- 勝率・ペイオフレシオ・期待値・プロフィットファクター・最大ドローダウン・銘柄別損益・月次バー・カレンダーヒートマップ
-- すべてローカル動作。SQLite 1 ファイル DB。サーバや外部 SaaS にデータを送らない。
-- 取り込んだバッチを「ノーカン (非表示)」「再表示」「削除」で柔軟に整理可能。
+- 値動きは HYPER SBI 2 で見て、発注だけを常に最前面の小窓で行う（ペーパートレード。本物の発注機能は持たない）
+- 発注の瞬間に HYPER SBI 2 の画面を撮り、表示中の現在値を読み取って約定価格の根拠にする
+- 音声入力のメモで「なぜ入ったか・なぜ出たか」を建玉中でも後からでも残せる
+- 引け後に 1 分足を取って約定を確定し、チャートに売買の位置（ピン・約定価格の点・平均建値線）を表示する
+- 勝率・ペイオフレシオ・期待値・PF・最大ドローダウン・時間帯別・銘柄別・損益曲線
+- 本番の取引は SBI の約定履歴 CSV を取り込んで同じ画面で振り返る
+- すべての売買・メモ・前後の足を AI が読める形（`data/ai/`）に書き出し、Claude Code に聞けば分析できる
 
-## スクリーンショット & 機能
-
-- ダッシュボード: KPI + エクイティカーブ + 月次バー + 銘柄別 Top5
-- トレード復習: ラウンド単位で OHLC を表示し、約定マーカー (BUY/SELL + 実約定価格の小円) で建値の位置まで可視化
-- 統計: 期間プリセット (1M/3M/6M/1Y/YTD/ALL/カスタム) で再集計
-- 取り込み: SBI CSV (注文一覧_約定履歴 / 注文一覧_当日約定) と moomoo OpenD API。ImportBatch 単位で非表示/再表示/削除
+データはすべてローカルの SQLite とファイルに置く。外部に出るのは足の取得（Yahoo）だけ。
 
 ## 構成
 
 ```
-apps/web      Next.js 16 (App Router) + Prisma 7 (SQLite) + Tailwind + lightweight-charts v5
-apps/api-py   FastAPI サイドカー (moomoo OpenAPI + yfinance)
-prisma/       スキーマ + マイグレーション + シード
-data/raw/     ユーザーが投入する取引履歴 CSV (gitignore)
-data/app.db   SQLite 本体 (gitignore)
-docs/         セットアップ手順
+apps/panel   発注小窓（Swift / SwiftUI + NSPanel）。data/paper/events.jsonl に追記するだけ。外部送信なし（サンドボックスで遮断）
+apps/web     振り返り画面と日次処理（Next.js 16 + Prisma 7 / SQLite + lightweight-charts v5）
+docs/        paper-events.md（小窓 → web のイベント契約・約定価格の決め方）
+data/        すべて gitignore（DB・CSV 原本・イベント・スクショ・AI 書き出し）
+  app.db        SQLite 本体
+  raw/sbi/      SBI の約定履歴 CSV（原本）
+  paper/        events.jsonl とスクショ
+  ai/           trades.jsonl（1 行 1 トレード）と summary.md
 ```
 
-## 必要環境
-
-- Node.js 22 以上 (v25 で開発)
-- Python 3.12 系 (moomoo-api SDK の対応都合、`pyenv` 推奨)
-- moomoo OpenD (米株・オプションを使う場合のみ、`docs/OPEND_SETUP.md` 参照)
-
-## 初回セットアップ
+## セットアップ
 
 ```sh
-# Node 側
-cd apps/web && npm install && cd ../..
-cd apps/web && npx prisma migrate dev && cd ../..
-npx tsx prisma/seed.ts
-
-# Python 側 (米株・オプション機能を使うなら必須)
-cd apps/api-py
-python -m venv .venv && source .venv/bin/activate
-pip install -r requirements.txt
-pip install futu-api
+cd apps/web
+npm install
+npx prisma migrate deploy   # data/app.db を作る
 ```
 
-## 開発起動
+発注小窓のビルドと権限（画面収録・撮影範囲の設定）は `apps/panel/README.md`。
+
+## 使い方
 
 ```sh
-./scripts/dev.sh   # web + api-py を同時起動
+./scripts/dev.sh                                   # 振り返り画面 http://localhost:3000
+cd apps/web && npm run daily                       # 引け後: 取り込み → 足の取得 → 約定確定 → 再計算 → AI 書き出し
+cd apps/web && npm run import:sbi -- ../../data/raw/sbi/*.csv   # 本番の約定 CSV を取り込む（重複は除外）
+./scripts/backup-db.sh                             # DB のバックアップ（data/backups/）
 ```
 
-- Next.js: <http://localhost:3000>
-- FastAPI サイドカー: <http://127.0.0.1:8770> (`/healthz` で疎通確認)
+- Yahoo の 1 分足は約 30 日前までしか遡れない。取りこぼさないよう daily は早めに回す。
+- 画面を撮れなかった・読めなかった約定は「要確認」「未確定」になる。画面の「要確認」から価格を手入力して確定する。
+- SBI の CSV は日付だけで時刻が無い。同じ日の売買は「買い → 売り」の順とみなすため、取り込み期間より前に買った株をその日に売り、同じ日に買い直した場合は、損益が実際とずれることがある。
+- 現物で、持っている株数を超える売りは「期間外に買った株の売却」として扱う（建値が分からないので損益は計算しない）。
 
-## 取引履歴の取り込み
+## 開発
 
-UI からインポートするファイルは下記のディレクトリに置くと、`/import` 画面から選択できる。
-
-| ブローカー | パス | 形式 |
-|---|---|---|
-| SBI 証券 (日本株・信用) | `data/raw/sbi/*.csv` | 「注文一覧_約定履歴」「注文一覧_当日約定」(Shift_JIS / UTF-8 自動判定、和暦混在可) |
-| moomoo (米株・オプション) | OpenD API 経由 | UI から「moomoo 全口座から取り込む」を押すと過去 90 日分を一括取得 |
-
-ファイル名は自由。同じファイルを再投入しても `Execution.dedupeHash` の UNIQUE 制約で 2 重取り込みされない (取り込み画面で 新規 / 重複 件数が確認できる)。
-
-### ImportBatch の管理
-
-`/import` 画面の「直近の取り込み」リストで、バッチごとに次の操作ができる:
-
-- **非表示 (ノーカン)**: 集計・チャート・Round 構築から除外する。データは残るのでいつでも戻せる。
-- **再表示**: 非表示を解除して再集計する。
-- **削除**: バッチに紐づく Execution を物理削除して該当ラウンドを再構築する (不可逆)。
-
-## バックアップ
-
-```sh
-./scripts/backup-db.sh
-# data/backups/app-YYYYMMDD-HHMMSS.db に SQLite online backup を保存。
-# 直近 30 件を保持。
-```
-
-## プライバシー設計
-
-- 取引履歴・口座番号・bank ID 等は **すべてローカルの `data/app.db`** に置く。
-- moomoo の口座番号 (`uni_card_num`) や個人特有のスクリプトは `apps/web/scripts/*.local.ts` に分離し、`.gitignore` で除外している。
-- `.env*` は除外、`data/raw/**` `data/backups/` `data/ohlc-cache/**` `data/app.db*` も除外。
+- テスト: `cd apps/web && npm test`、`cd apps/panel && ./scripts/test.sh`
+- 型とビルド: `cd apps/web && npm run build`
+- 外部送信が無いことの検査: `cd apps/panel && ./scripts/check-no-network.sh`
+- 旧版（moomoo 連携・Python サイドカー・旧 UI）は `v0-legacy` タグにだけ残している。
 
 ## ライセンス
 
-MIT。`docs/OPEND_SETUP.md` に moomoo OpenD のセットアップ手順を別途記載。
+MIT

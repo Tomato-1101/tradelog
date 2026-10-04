@@ -19,8 +19,8 @@ export default async function ReviewPage() {
       {rows.length === 0 ? (
         <div className="empty">要確認・未確定の約定はありません</div>
       ) : (
-        <div className="scroll">
-          <table>
+        <div className="panel scroll">
+          <table className="wide">
             <thead>
               <tr>
                 <th>時刻</th>
@@ -46,7 +46,7 @@ export default async function ReviewPage() {
                     <td>
                       {e.symbol} <span className="muted">{e.name ?? ''}</span>
                     </td>
-                    <td className={e.side === 'BUY' ? 'up' : 'down'}>{SIDE_LABEL[e.side]}</td>
+                    <td><span className={`side ${e.side === 'BUY' ? 'buy' : 'sell'}`}>{SIDE_LABEL[e.side]}</span></td>
                     <td className="num">{fmtPrice(e.qty)}</td>
                     <td className="num">{e.price == null ? '—' : fmtPrice(e.price)}</td>
                     <td>

@@ -17,7 +17,7 @@ function pnlClass(s: string | null) {
 function StateCell({ r }: { r: ListedRound }) {
   return (
     <>
-      <span className="chip">{r.status === 'OPEN' ? '保有中' : '決済済'}</span>
+      {r.status === 'OPEN' ? <span className="chip live">保有中</span> : <span className="chip">決済済</span>}
       {r.unresolved > 0 && <span className="chip warn"> 未確定{r.unresolved > 1 ? ` ${r.unresolved}` : ''}</span>}
       {r.needsReview > 0 && <span className="chip warn"> 要確認{r.needsReview > 1 ? ` ${r.needsReview}` : ''}</span>}
     </>
@@ -70,39 +70,41 @@ export default async function Home({ searchParams }: { searchParams: Promise<SP>
       {list.rows.length === 0 ? (
         <div className="empty">該当するトレードがありません</div>
       ) : (
-        <div className="scroll">
+        <div className="panel scroll">
           <table>
             <thead>
               <tr>
                 <th>日時</th>
                 <th>銘柄</th>
-                <th>方向</th>
-                <th className="num">数量</th>
-                <th className="num">建値 → 決済値</th>
+                <th className="hide-sm">方向</th>
+                <th className="num hide-sm">数量</th>
+                <th className="num hide-sm">建値 → 決済値</th>
                 <th className="num">損益(円)</th>
-                <th className="num">保有時間</th>
+                <th className="num hide-sm">保有時間</th>
                 <th>状態</th>
               </tr>
             </thead>
             <tbody>
               {list.rows.map((r) => (
                 <tr key={r.id}>
-                  <td>
-                    <Link href={`/trades/${encodeURIComponent(r.id)}`}>{fmtJst(r.openedAt, r.timePrecision)}</Link>
+                  <td style={{ whiteSpace: 'nowrap' }}>
+                    <span className="muted">{fmtJst(r.openedAt, r.timePrecision)}</span>
                   </td>
                   <td>
-                    {r.symbol} <span className="muted">{r.name ?? ''}</span>
+                    <Link className="sym" href={`/trades/${encodeURIComponent(r.id)}`}>{r.symbol}</Link>
+                    {r.name && <span className="sub">{r.name}</span>}
+                    <span className={`chip only-sm ${r.direction === 'LONG' ? 'up' : 'down'}`}>{DIRECTION_LABEL[r.direction]}</span>
                   </td>
-                  <td>
-                    {DIRECTION_LABEL[r.direction]}
-                    {r.marginType && <span className="muted"> {MARGIN_LABEL[r.marginType]}</span>}
+                  <td className="hide-sm">
+                    <span className={`chip ${r.direction === 'LONG' ? 'up' : 'down'}`}>{DIRECTION_LABEL[r.direction]}</span>
+                    {r.marginType && <span className="sub">{MARGIN_LABEL[r.marginType]}</span>}
                   </td>
-                  <td className="num">{fmtPrice(r.qtyOpened)}</td>
-                  <td className="num">
-                    {fmtPrice(r.avgEntryPrice ?? r.remainingAvgPrice, 4)} → {r.status === 'OPEN' ? '—' : fmtPrice(r.avgExitPrice, 4)}
+                  <td className="num hide-sm">{fmtPrice(r.qtyOpened)}</td>
+                  <td className="num hide-sm">
+                    {fmtPrice(r.avgEntryPrice ?? r.remainingAvgPrice, 2)} → {r.status === 'OPEN' ? '—' : fmtPrice(r.avgExitPrice, 2)}
                   </td>
-                  <td className={`num ${pnlClass(r.netPnl)}`}>{r.status === 'OPEN' ? '—' : fmtYen(r.netPnl, true)}</td>
-                  <td className="num">{r.status === 'OPEN' ? '—' : fmtHold(r.holdSeconds, r.timePrecision)}</td>
+                  <td className={`num pnl ${pnlClass(r.netPnl)}`}>{r.status === 'OPEN' ? '—' : fmtYen(r.netPnl, true)}</td>
+                  <td className="num hide-sm">{r.status === 'OPEN' ? '—' : fmtHold(r.holdSeconds, r.timePrecision)}</td>
                   <td>
                     <StateCell r={r} />
                   </td>

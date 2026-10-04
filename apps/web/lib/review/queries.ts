@@ -6,8 +6,10 @@ import type { PrismaClient } from '@/generated/prisma/client';
 import { dailyWindow } from '@/lib/bars/round-daily';
 import { BAR_WINDOW_MIN } from '@/lib/ai/export';
 import { chartDay, chartSeconds } from '@/lib/chart-time';
+import { fmtJst, fmtJstDate, fmtPrice, PRICE_BASIS_LABEL } from '@/lib/format';
 import { floorToMinute } from '@/lib/time';
 import { applyPeriodToRounds, periodToRange, type Period } from '@/lib/period';
+import { PRIOR_HOLDING_SALE_WARNING } from '@/lib/rounds/builder';
 import { avgPriceTimeline, avgSteps, type AvgStep, type TimelinePoint } from '@/lib/rounds/timeline';
 import type { StatsRound } from '@/lib/stats/types';
 
@@ -100,6 +102,12 @@ export async function reviewRoundCounts(db: PrismaClient): Promise<Record<Source
   return { PAPER: paper, SBI: sbi };
 }
 
+/** 損益が要確認（仮置きの価格）を含む決済済みラウンドの数。集計の「暫定」表示用 */
+export async function provisionalRoundCount(db: PrismaClient, ids: string[]): Promise<number> {
+  if (ids.length === 0) return 0;
+  return db.round.count({ where: { id: { in: ids }, netPnl: { not: null }, executions: { some: { priceStatus: 'NEEDS_REVIEW' } } } });
+}
+
 export async function pendingExecutionCount(db: PrismaClient): Promise<number> {
   return db.execution.count({ where: { priceStatus: { not: 'CONFIRMED' } } });
 }
@@ -176,6 +184,9 @@ export type ChartExec = {
   qty: string;
   price: string | null;
   priceStatus: 'CONFIRMED' | 'NEEDS_REVIEW' | 'UNRESOLVED';
+  /** ツールチップ用: JST の約定時刻と価格の根拠 */
+  at: string;
+  basis: string | null;
 };
 export type ChartAvgStep = { from: number | string; to: number | string | null; avg: string };
 
@@ -224,6 +235,8 @@ export type RoundDetail = {
     /** 約定後の建玉数（ロング正・ショート負）と平均建値 */
     /** 反転約定: この約定の一部は次のラウンドの建て（数量は約定全体） */
     flipShared: boolean;
+    /** 1 約定を 2 つの取引で分け合うときの注記（反転・期間外に買った株の売却）。無ければ null */
+    shareNote: string | null;
     posAfter: string | null;
     avgAfter: string | null;
   }>;
@@ -237,17 +250,32 @@ export type RoundDetail = {
   };
 };
 
-type RoundWithExecs = { id: string; source: string; instrumentId: number; account: string; closedAt: Date | null; status: string; timePrecision: string; direction: string };
+type RoundWithExecs = {
+  id: string;
+  source: string;
+  instrumentId: number;
+  account: string;
+  marginType: 'CASH' | 'MARGIN_LONG' | 'MARGIN_SHORT' | null;
+  closedAt: Date | null;
+  status: string;
+  timePrecision: string;
+  direction: string;
+};
 
-/** 反転で次ラウンド（-flip）に紐づいた、このラウンドの決済約定を探す（SBI の決済済みラウンドのみ） */
+/**
+ * 反転で次ラウンド（-flip）に紐づいた、このラウンドの決済約定を探す（SBI の決済済みラウンドのみ）。
+ * 同じ日の別の取引（別の建値不明ラウンド・別の信用区分）の約定を拾わないよう、信用区分が同じで、
+ * かつその約定自身が建てた -flip ラウンド（ID は builder の sbiRoundId と同じ規則）に属するものだけを返す。
+ */
 async function findFlipClosers(db: PrismaClient, r: RoundWithExecs) {
   if (r.source !== 'SBI' || r.status !== 'CLOSED' || !r.closedAt || r.id.endsWith('-flip')) return [];
   const closeSide = r.direction === 'LONG' ? 'SELL' : 'BUY';
-  return db.execution.findMany({
+  const es = await db.execution.findMany({
     where: {
       source: r.source,
       instrumentId: r.instrumentId,
       account: r.account,
+      marginType: r.marginType,
       executedAt: r.closedAt,
       side: closeSide,
       roundId: { endsWith: '-flip', not: r.id },
@@ -255,6 +283,7 @@ async function findFlipClosers(db: PrismaClient, r: RoundWithExecs) {
     include: { paperOrder: { include: { shot: true } } },
     orderBy: [{ executedAt: 'asc' }, { seq: 'asc' }],
   });
+  return es.filter((e) => e.roundId === `sbi-${(e.dedupeHash ?? e.id).slice(0, 16)}-flip`);
 }
 
 /** ラウンド 1 件の画面用データ（約定・メモ・スクショ・足・平均建値の推移）。無ければ null */
@@ -300,15 +329,24 @@ export async function loadRoundDetail(db: PrismaClient, id: string, now: Date): 
     qty,
     price: e.price,
   });
-  let timeline = avgPriceTimeline(r.executions.map((e) => toTl(e)));
+  // 期間外に買った株の売却は建玉を持たない（建値不明）ので、建玉数も平均建値の線も出さない
+  const priorSale = (JSON.parse(r.warningsJson) as string[]).includes(PRIOR_HOLDING_SALE_WARNING);
+  let timeline = priorSale ? [] : avgPriceTimeline(r.executions.map((e) => toTl(e)));
 
   // SBI の反転（建玉をまたいで逆売買）では、決済と次の建てが 1 約定のため、約定は次ラウンド（-flip）にだけ紐づく。
   // このラウンドの画面にも決済側として見せる（平均建値の線もここで止める）。
-  const flipExecs = await findFlipClosers(db, r);
+  // 自分の約定だけで建玉が 0 に戻らないときだけ探す（建値不明ラウンドは建玉を持たないので探さない）。
   const lastPos = timeline.length ? new Decimal(timeline[timeline.length - 1].pos).abs() : new Decimal(0);
-  if (flipExecs.length > 0 && lastPos.gt(0)) {
+  const flipExecs = !priorSale && lastPos.gt(0) ? await findFlipClosers(db, r) : [];
+  if (flipExecs.length > 0) {
     timeline = avgPriceTimeline([...r.executions.map((e) => toTl(e)), ...flipExecs.map((e) => toTl(e, lastPos.toFixed()))]);
   }
+  const shareNote = (qty: string, flipShared: boolean): string | null => {
+    if (flipShared) return r.marginType === 'CASH' ? '一部は期間外に買った株の売却（別の取引）' : '反転（一部は次の取引の建て）';
+    // 建値不明ラウンドの約定が前の取引の決済も兼ねる（現物の建玉超過売り）とき、ラウンドの数量はその一部
+    if (priorSale && !new Decimal(qty).eq(r.qtyOpened)) return `うち ${fmtPrice(r.qtyOpened)} 株が期間外に買った株の売却（残りは前の取引の決済）`;
+    return null;
+  };
   const tl = new Map<string, TimelinePoint>(timeline.map((p) => [p.id, p]));
   const steps: AvgStep[] = avgSteps(timeline);
 
@@ -340,6 +378,7 @@ export async function loadRoundDetail(db: PrismaClient, id: string, now: Date): 
     },
     executions: [...r.executions.map((e) => ({ e, flipShared: false })), ...flipExecs.map((e) => ({ e, flipShared: true }))].map(({ e, flipShared }) => ({
       flipShared,
+      shareNote: shareNote(e.qty, flipShared),
       id: e.id,
       executedAt: e.executedAt,
       timePrecision: e.timePrecision,
@@ -374,6 +413,8 @@ export async function loadRoundDetail(db: PrismaClient, id: string, now: Date): 
         qty: e.qty,
         price: e.price,
         priceStatus: e.priceStatus,
+        at: r.timePrecision === 'day' ? fmtJstDate(e.executedAt) : fmtJst(e.executedAt, 'ms', true),
+        basis: e.priceBasis ? PRICE_BASIS_LABEL[e.priceBasis as keyof typeof PRICE_BASIS_LABEL] : null,
       })),
       avgSteps: steps.map((s) => ({ from: tChart(paper ? floorToMinute(s.from) : s.from), to: s.to ? tChart(paper ? floorToMinute(s.to) : s.to) : null, avg: s.avg })),
     },
