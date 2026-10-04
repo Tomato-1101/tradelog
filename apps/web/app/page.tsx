@@ -1,44 +1,127 @@
-// 仮置きのページ（画面は別途作る）。DB の件数だけを出す。
+// 取引一覧: ペーパー / 本番(SBI) のタブ、期間プリセット、要確認だけの絞り込み。新しい順。
+import Link from 'next/link';
 import { prisma } from '@/lib/db';
+import { DIRECTION_LABEL, MARGIN_LABEL, fmtHold, fmtJst, fmtPrice, fmtYen, pnlSign } from '@/lib/format';
+import { parsePeriodParams } from '@/lib/period';
+import { PAGE_SIZE, listRounds, reviewRoundCounts, type ListedRound } from '@/lib/review/queries';
+import { buildHref, first, parseSource, sourceParam, type SP } from '@/lib/review/url';
+import PeriodNav from '@/components/PeriodNav';
 
 export const dynamic = 'force-dynamic';
 
-export default async function Home() {
-  const [orders, execs, needsReview, unresolved, rounds, openRounds, memos, bars, events] = await Promise.all([
-    prisma.paperOrder.count(),
-    prisma.execution.count(),
-    prisma.execution.count({ where: { priceStatus: 'NEEDS_REVIEW' } }),
-    prisma.execution.count({ where: { priceStatus: 'UNRESOLVED' } }),
-    prisma.round.count(),
-    prisma.round.count({ where: { status: 'OPEN' } }),
-    prisma.memo.count(),
-    prisma.bar.count(),
-    prisma.paperEventLog.count(),
-  ]);
-  const rows: Array<[string, number]> = [
-    ['取り込んだイベント', events],
-    ['ペーパー注文', orders],
-    ['約定', execs],
-    ['うち要確認', needsReview],
-    ['うち未確定', unresolved],
-    ['ラウンド', rounds],
-    ['うち未決済', openRounds],
-    ['メモ', memos],
-    ['足', bars],
-  ];
+function pnlClass(s: string | null) {
+  const x = pnlSign(s);
+  return x > 0 ? 'up' : x < 0 ? 'down' : '';
+}
+
+function StateCell({ r }: { r: ListedRound }) {
   return (
-    <main style={{ fontFamily: 'system-ui, sans-serif', padding: 24 }}>
-      <h1>tradelog</h1>
-      <table>
-        <tbody>
-          {rows.map(([k, v]) => (
-            <tr key={k}>
-              <td style={{ paddingRight: 16 }}>{k}</td>
-              <td style={{ textAlign: 'right' }}>{v.toLocaleString('ja-JP')}</td>
-            </tr>
-          ))}
-        </tbody>
-      </table>
-    </main>
+    <>
+      <span className="chip">{r.status === 'OPEN' ? '保有中' : '決済済'}</span>
+      {r.unresolved > 0 && <span className="chip warn"> 未確定{r.unresolved > 1 ? ` ${r.unresolved}` : ''}</span>}
+      {r.needsReview > 0 && <span className="chip warn"> 要確認{r.needsReview > 1 ? ` ${r.needsReview}` : ''}</span>}
+    </>
+  );
+}
+
+export default async function Home({ searchParams }: { searchParams: Promise<SP> }) {
+  const sp = await searchParams;
+  const source = parseSource(sp.source);
+  const period = parsePeriodParams(sp);
+  const reviewOnly = first(sp.review) === '1';
+  const page = Math.max(1, Number.parseInt(first(sp.page) ?? '1', 10) || 1);
+  const now = new Date();
+
+  const [counts, list] = await Promise.all([
+    reviewRoundCounts(prisma),
+    listRounds(prisma, { source, period, reviewOnly, page, now }),
+  ]);
+
+  const keep = { source: sourceParam(source), review: reviewOnly ? '1' : undefined };
+  const periodParams = {
+    preset: period.preset === 'all' ? undefined : period.preset,
+    from: period.preset === 'custom' ? period.from : undefined,
+    to: period.preset === 'custom' ? period.to : undefined,
+  };
+  const href = (extra: Record<string, string | undefined>) => buildHref('/', { ...keep, ...periodParams, ...extra });
+  const tab = (s: 'PAPER' | 'SBI', label: string) => (
+    <a href={buildHref('/', { source: sourceParam(s), review: reviewOnly ? '1' : undefined, ...periodParams })} aria-current={source === s ? 'page' : undefined}>
+      {label}
+      {counts[s] > 0 && <span className="badge" title="要確認・未確定の約定があるトレード">{counts[s]}</span>}
+    </a>
+  );
+
+  return (
+    <>
+      <h1>取引一覧</h1>
+      <div className="bar">
+        <nav className="tabs" aria-label="種別">
+          {tab('PAPER', 'ペーパー')}
+          {tab('SBI', '本番(SBI)')}
+        </nav>
+        <nav className="tabs" aria-label="絞り込み">
+          <a href={href({ review: undefined, page: undefined })} aria-current={!reviewOnly ? 'page' : undefined}>すべて</a>
+          <a href={href({ review: '1', page: undefined })} aria-current={reviewOnly ? 'page' : undefined}>要確認・未確定のみ</a>
+        </nav>
+        <span className="muted">{list.total} 件</span>
+      </div>
+      <PeriodNav path="/" keep={keep} period={period} />
+
+      {list.rows.length === 0 ? (
+        <div className="empty">該当するトレードがありません</div>
+      ) : (
+        <div className="scroll">
+          <table>
+            <thead>
+              <tr>
+                <th>日時</th>
+                <th>銘柄</th>
+                <th>方向</th>
+                <th className="num">数量</th>
+                <th className="num">建値 → 決済値</th>
+                <th className="num">損益(円)</th>
+                <th className="num">保有時間</th>
+                <th>状態</th>
+              </tr>
+            </thead>
+            <tbody>
+              {list.rows.map((r) => (
+                <tr key={r.id}>
+                  <td>
+                    <Link href={`/trades/${encodeURIComponent(r.id)}`}>{fmtJst(r.openedAt, r.timePrecision)}</Link>
+                  </td>
+                  <td>
+                    {r.symbol} <span className="muted">{r.name ?? ''}</span>
+                  </td>
+                  <td>
+                    {DIRECTION_LABEL[r.direction]}
+                    {r.marginType && <span className="muted"> {MARGIN_LABEL[r.marginType]}</span>}
+                  </td>
+                  <td className="num">{fmtPrice(r.qtyOpened)}</td>
+                  <td className="num">
+                    {fmtPrice(r.avgEntryPrice ?? r.remainingAvgPrice, 4)} → {r.status === 'OPEN' ? '—' : fmtPrice(r.avgExitPrice, 4)}
+                  </td>
+                  <td className={`num ${pnlClass(r.netPnl)}`}>{r.status === 'OPEN' ? '—' : fmtYen(r.netPnl, true)}</td>
+                  <td className="num">{r.status === 'OPEN' ? '—' : fmtHold(r.holdSeconds, r.timePrecision)}</td>
+                  <td>
+                    <StateCell r={r} />
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      )}
+
+      {list.pages > 1 && (
+        <div className="pager">
+          {page > 1 && <a href={href({ page: String(page - 1) })}>前へ</a>}
+          <span className="muted">
+            {Math.min(page, list.pages)} / {list.pages}（{PAGE_SIZE} 件ずつ）
+          </span>
+          {page < list.pages && <a href={href({ page: String(page + 1) })}>次へ</a>}
+        </div>
+      )}
+    </>
   );
 }

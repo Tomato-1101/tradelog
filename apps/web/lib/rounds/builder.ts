@@ -14,17 +14,19 @@ function signedQty(side: Side, qty: Decimal): Decimal {
 }
 
 /** その約定が建て（新規）側か。日付しか分からない約定を同じ日の中で並べるのに使う */
-function isOpeningSide(e: ExecForRound): boolean {
+function isOpeningSide(e: Pick<ExecForRound, 'marginType' | 'side'>): boolean {
   if (e.marginType === 'MARGIN_SHORT') return e.side === 'SELL';
   return e.side === 'BUY'; // CASH / MARGIN_LONG
 }
+
+export type SortableExec = Pick<ExecForRound, 'id' | 'executedAt' | 'timePrecision' | 'marginType' | 'side' | 'seq'>;
 
 /**
  * 並び順: 約定時刻 → （日付だけの約定は）建て → 決済 → 行順 → id。
  * SBI の約定履歴 CSV は時刻が無く、同じ日の中では「返済」行が「新規」行より先に並ぶ。
  * そのまま並べると建玉が一時的にマイナスになり、ラウンドが壊れるため、同日内は建てを先に置く。
  */
-export function compareExecs(a: ExecForRound, b: ExecForRound): number {
+export function compareExecs(a: SortableExec, b: SortableExec): number {
   const ta = a.executedAt.getTime();
   const tb = b.executedAt.getTime();
   if (ta !== tb) return ta - tb;
