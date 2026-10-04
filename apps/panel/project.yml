@@ -1,0 +1,79 @@
+# ペーパー発注の小窓（xcodegen で TradePanel.xcodeproj を生成する）。
+# このファイルを変えたら `scripts/build.sh` で作り直す（xcodegen generate も中で走る）。
+#
+# 構成:
+#   PanelKit  … ロジックと画面の本体（framework）。テストはここだけを読み込むので、テスト中にアプリは起動しない。
+#   TradePanel … NSPanel を出すだけの薄いアプリ（App Sandbox あり・ネットワーク entitlement なし）。
+name: TradePanel
+options:
+  bundleIdPrefix: com.tomato.tradelog
+  deploymentTarget:
+    macOS: "15.0"
+  createIntermediateGroups: true
+settings:
+  base:
+    # Swift 6 の厳格な並行性チェックは ScreenCaptureKit/Vision の受け渡しで注記が膨らむので Swift 5 モードで書く
+    SWIFT_VERSION: "5.0"
+    MACOSX_DEPLOYMENT_TARGET: "15.0"
+    # 画面収録の権限が再ビルドで外れないよう、毎回同じ Apple Development 証明書で署名する（ad-hoc は使わない）
+    CODE_SIGN_STYLE: Manual
+    CODE_SIGN_IDENTITY: "Apple Development"
+    DEVELOPMENT_TEAM: 9KT598FS4A
+    PROVISIONING_PROFILE_SPECIFIER: ""
+    ENABLE_USER_SCRIPT_SANDBOXING: YES
+    DEAD_CODE_STRIPPING: YES
+targets:
+  PanelKit:
+    type: framework
+    platform: macOS
+    sources:
+      - path: PanelKit
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.tomato.tradelog.panelkit
+        GENERATE_INFOPLIST_FILE: YES
+        DEFINES_MODULE: YES
+        SKIP_INSTALL: YES
+  TradePanel:
+    type: application
+    platform: macOS
+    sources:
+      - path: App
+    dependencies:
+      - target: PanelKit
+        embed: true
+        codeSign: true
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.tomato.tradelog.panel
+        PRODUCT_NAME: TradePanel
+        INFOPLIST_FILE: App/Info.plist
+        GENERATE_INFOPLIST_FILE: NO
+        CODE_SIGN_ENTITLEMENTS: App/TradePanel.entitlements
+      configs:
+        # Release にはデバッガ接続用の get-task-allow を入れない（entitlements を sandbox とファイル選択だけにする）
+        Release:
+          CODE_SIGN_INJECT_BASE_ENTITLEMENTS: NO
+  PanelKitTests:
+    type: bundle.unit-test
+    platform: macOS
+    sources:
+      - path: Tests
+    dependencies:
+      - target: PanelKit
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.tomato.tradelog.panelkit.tests
+        GENERATE_INFOPLIST_FILE: YES
+        # アプリをホストにしない（テストで小窓が画面に出ないように）
+        TEST_HOST: ""
+        BUNDLE_LOADER: ""
+schemes:
+  TradePanel:
+    build:
+      targets:
+        TradePanel: all
+        PanelKitTests: [test]
+    test:
+      targets:
+        - PanelKitTests

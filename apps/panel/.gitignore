@@ -1,0 +1,6 @@
+# xcodegen の生成物（project.yml が正）
+TradePanel.xcodeproj/
+# ビルド成果物
+build/
+# 見た目確認用のオフスクリーン描画
+shots-dev/
