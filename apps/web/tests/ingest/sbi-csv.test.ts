@@ -278,6 +278,183 @@ describe('parseSbiCsvText: 新フォーマット (約定履歴) で受渡損益�
   });
 });
 
+describe('parseSbiCsvText: 約定履歴照会 (SaveFile_*.csv) フォーマット', () => {
+  const THIRD_HEADER =
+    '約定日,銘柄,銘柄コード,市場,取引,期限,預り,課税,約定数量,約定単価,手数料/諸経費等,税額,受渡日,受渡金額/決済損益';
+  const PREAMBLE = [
+    '',
+    '約定履歴照会 ',
+    '',
+    '商品指定,約定開始年月日,約定終了年月日,明細数,明細指定開始,明細指定終了',
+    '"すべての商品","2024年01月01日","2026年12月17日","6944","1","6944"',
+    '',
+    '（注）明細数はご指定された期間の合計です。',
+    '',
+  ].join('\n');
+
+  it('プリアンブル付きで現物売をパースできる (受渡金額が roleSuffix に乗る)', () => {
+    const csv = [
+      PREAMBLE,
+      THIRD_HEADER,
+      '"2024/05/02","東京電力ホールディングス","9501","--",株式現物売,"--"," 特定 ","申告",4,960,--,--,"2024/05/08",3840',
+    ].join('\n');
+    const { executions, warnings } = parseSbiCsvText(csv);
+    expect(warnings).toEqual([]);
+    expect(executions).toHaveLength(1);
+    const e = executions[0];
+    expect(e.broker).toBe('SBI');
+    expect(e.instrument.symbol).toBe('9501');
+    expect(e.instrument.name).toBe('東京電力ホールディングス');
+    expect(e.side).toBe('SELL');
+    expect(e.marginType).toBe('CASH');
+    expect(e.qty).toBe('4');
+    expect(e.price).toBe('960');
+    expect(e.fee).toBe('0');
+    expect(e.roleSuffix).toBe('pnl=3840');
+  });
+
+  it('信用返済売で同価格・同数量・異損益の 2 行が別 dedupeHash になる', () => {
+    const csv = [
+      PREAMBLE,
+      THIRD_HEADER,
+      '"2026/05/11","住友ファーマ","4506","東証",信用返済売,"６ヵ月"," 特定 ","--",100,"1,666.8",12,--,"2026/05/13","-1,262"',
+      '"2026/05/11","住友ファーマ","4506","東証",信用返済売,"６ヵ月"," 特定 ","--",100,"1,666.8",12,--,"2026/05/13","348"',
+    ].join('\n');
+    const { executions, warnings } = parseSbiCsvText(csv);
+    expect(warnings).toEqual([]);
+    expect(executions).toHaveLength(2);
+    expect(executions[0].roleSuffix).toBe('pnl=-1262');
+    expect(executions[1].roleSuffix).toBe('pnl=348');
+    expect(makeDedupeHash(executions[0])).not.toBe(makeDedupeHash(executions[1]));
+  });
+
+  it('MRF / 投信 / 入出庫 は警告を出さずに静かにスキップ', () => {
+    const csv = [
+      PREAMBLE,
+      THIRD_HEADER,
+      '"2024/05/02","野村ＭＲＦ",,,MRF解約,"--"," 特定 ","--",99944,1,--,--,"2024/05/07",99944',
+      '"2024/05/02","野村ＭＲＦ",,,MRF買付,"--"," 特定 ","--",1000,1,--,--,"2024/05/07",1000',
+      '"2024/05/02","野村ＭＲＦ",,,MRF再投資,"--"," 特定 ","--",100,1,--,--,"2024/05/07",100',
+      '"2024/05/02","eMAXIS Slim","2557","--",投信金額買付,"--"," 特定 ","--",10000,1,--,--,"2024/05/07",10000',
+      '"2024/05/02","eMAXIS Slim","2557","--",投信金額解約,"--"," 特定 ","--",10000,1,--,--,"2024/05/07",10000',
+      '"2024/05/02","トヨタ自動車","7203","--",株式現物買,"--"," 特定 ","--",100,2500,--,--,"2024/05/07",250000',
+    ].join('\n');
+    const { executions, warnings } = parseSbiCsvText(csv);
+    expect(warnings).toEqual([]);
+    expect(executions).toHaveLength(1);
+    expect(executions[0].instrument.symbol).toBe('7203');
+    expect(executions[0].side).toBe('BUY');
+  });
+
+  it('現引行は MARGIN_LONG SELL + CASH BUY に分割され、受渡金額が両側に合成', () => {
+    const csv = [
+      PREAMBLE,
+      THIRD_HEADER,
+      '"2026/05/01","エンバイオHD","6092","東証",現引,"６ヵ月"," 特定 ","--",100,798.3,--,--,"2026/05/08","-79,885"',
+    ].join('\n');
+    const { executions, warnings } = parseSbiCsvText(csv);
+    expect(warnings).toEqual([]);
+    expect(executions).toHaveLength(2);
+    expect(executions[0].marginType).toBe('MARGIN_LONG');
+    expect(executions[0].side).toBe('SELL');
+    expect(executions[0].roleSuffix).toBe('close-margin|pnl=-79885');
+    expect(executions[1].marginType).toBe('CASH');
+    expect(executions[1].side).toBe('BUY');
+    expect(executions[1].roleSuffix).toBe('cash-receipt|pnl=-79885');
+    expect(makeDedupeHash(executions[0])).not.toBe(makeDedupeHash(executions[1]));
+  });
+
+  it('受渡金額が "--" の同自然キー 2 行は seq=2 で別ハッシュ', () => {
+    const csv = [
+      PREAMBLE,
+      THIRD_HEADER,
+      '"2026/05/11","住友ファーマ","4506","東証",信用返済売,"６ヵ月"," 特定 ","--",100,"1,666.8",--,--,"2026/05/13",--',
+      '"2026/05/11","住友ファーマ","4506","東証",信用返済売,"６ヵ月"," 特定 ","--",100,"1,666.8",--,--,"2026/05/13",--',
+    ].join('\n');
+    const { executions, warnings } = parseSbiCsvText(csv);
+    expect(warnings).toEqual([]);
+    expect(executions).toHaveLength(2);
+    expect(executions[0].roleSuffix).toBeUndefined();
+    expect(executions[1].roleSuffix).toBe('seq=2');
+    expect(makeDedupeHash(executions[0])).not.toBe(makeDedupeHash(executions[1]));
+  });
+
+  it('信用 4 区分すべてが分類される', () => {
+    const csv = [
+      PREAMBLE,
+      THIRD_HEADER,
+      '"2026/01/01","X","1000","東証",信用新規買,"６ヵ月"," 特定 ","--",100,1000,--,--,"2026/01/03",100000',
+      '"2026/01/02","X","1000","東証",信用返済売,"６ヵ月"," 特定 ","--",100,1100,--,--,"2026/01/06","10,000"',
+      '"2026/02/01","Y","2000","東証",信用新規売,"６ヵ月"," 特定 ","--",100,2000,--,--,"2026/02/03",200000',
+      '"2026/02/02","Y","2000","東証",信用返済買,"６ヵ月"," 特定 ","--",100,1900,--,--,"2026/02/06","10,000"',
+    ].join('\n');
+    const { executions, warnings } = parseSbiCsvText(csv);
+    expect(warnings).toEqual([]);
+    expect(executions).toHaveLength(4);
+    expect(executions[0]).toMatchObject({ side: 'BUY', marginType: 'MARGIN_LONG' });
+    expect(executions[1]).toMatchObject({ side: 'SELL', marginType: 'MARGIN_LONG' });
+    expect(executions[2]).toMatchObject({ side: 'SELL', marginType: 'MARGIN_SHORT' });
+    expect(executions[3]).toMatchObject({ side: 'BUY', marginType: 'MARGIN_SHORT' });
+  });
+});
+
+describe('ParseResult: format / earliestDate / latestDate', () => {
+  const NEW_HEADER =
+    '銘柄,銘柄,銘柄,取引区分,期限,預り区分,約定日,受渡日,株数,平均約定単価,手数料・諸経費等,課税額・譲渡益税,受渡金額・決済損益,受渡金額(日計り分)';
+  const THIRD_HEADER =
+    '約定日,銘柄,銘柄コード,市場,取引,期限,預り,課税,約定数量,約定単価,手数料/諸経費等,税額,受渡日,受渡金額/決済損益';
+  const THIRD_PREAMBLE = [
+    '',
+    '約定履歴照会 ',
+    '',
+    '商品指定,約定開始年月日,約定終了年月日,明細数,明細指定開始,明細指定終了',
+    '"すべての商品","2024年01月01日","2026年12月17日","6944","1","6944"',
+    '',
+  ].join('\n');
+
+  it('注文一覧_当日約定 (新フォーマット) は format=new-daily と earliest/latest を返す', () => {
+    const csv = [
+      NEW_HEADER,
+      '7203,トヨタ自動車,東P,信用返済売,６ヵ月,特定,2026/05/18,2026/05/20,100,"2,500",10,--,"1,000",--',
+      '9984,ソフトバンクＧ,東P,信用返済買,６ヵ月,特定,2026/05/18,2026/05/20,100,"8,000",10,--,"-500",--',
+    ].join('\n');
+    const result = parseSbiCsvText(csv);
+    expect(result.format).toBe('new-daily');
+    expect(result.executions).toHaveLength(2);
+    expect(result.earliestDate?.toISOString().startsWith('2026-05-18')).toBe(true);
+    expect(result.latestDate?.toISOString().startsWith('2026-05-18')).toBe(true);
+  });
+
+  it('約定履歴照会 (SaveFile_*.csv) は format=third-savefile と earliest/latest を返す', () => {
+    const csv = [
+      THIRD_PREAMBLE,
+      THIRD_HEADER,
+      '"2026/05/14","トヨタ","7203","東証",株式現物買,"--"," 特定 ","--",100,2500,--,--,"2026/05/16","-250,000"',
+      '"2026/05/18","トヨタ","7203","東証",株式現物売,"--"," 特定 ","--",100,2550,--,--,"2026/05/20","255,000"',
+    ].join('\n');
+    const result = parseSbiCsvText(csv);
+    expect(result.format).toBe('third-savefile');
+    expect(result.executions).toHaveLength(2);
+    expect(result.earliestDate?.toISOString().startsWith('2026-05-14')).toBe(true);
+    expect(result.latestDate?.toISOString().startsWith('2026-05-18')).toBe(true);
+  });
+
+  it('レガシー (約定時刻あり) は format=legacy', () => {
+    const result = parseSbiCsvText(CSV_BASIC);
+    expect(result.format).toBe('legacy');
+    expect(result.earliestDate?.toISOString().startsWith('2026-05-14')).toBe(true);
+    expect(result.latestDate?.toISOString().startsWith('2026-05-16')).toBe(true);
+  });
+
+  it('ヘッダなしは format=unknown で executions/dates が空', () => {
+    const result = parseSbiCsvText('aaa,bbb\n1,2\n');
+    expect(result.format).toBe('unknown');
+    expect(result.executions).toHaveLength(0);
+    expect(result.earliestDate).toBeNull();
+    expect(result.latestDate).toBeNull();
+  });
+});
+
 describe('parseSbiCsvBuffer: SJIS デコード', () => {
   it('CP932 でエンコードされた CSV を扱える', () => {
     const buf = iconv.encode(CSV_BASIC, 'cp932');

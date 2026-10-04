@@ -31,6 +31,9 @@ export type MoomooDeal = {
   jp_acc_type?: string;       // "JP_GENERAL" | "JP_TOKUTEI" | "JP_DERIVATIVE_LONG" | etc.
   deal_market?: string;       // "US" | ...
   status?: string;
+  // sidecar が order_fee_query で取得 → qty 按分した手数料 (native ccy)。
+  // OpenAPI の history_deal_list_query 本体には含まれず別経路で合流。
+  commission?: number | string;
 };
 
 // "US.MSFT260515C415000" を OCC 風メタに分解。米株 EQUITY なら null を返す。
@@ -135,6 +138,13 @@ export function dealsToNormalized(
       continue;
     }
 
+    // commission は sidecar が order_fee_query 経由で qty 按分したネイティブ通貨手数料。
+    // 値が来なければ 0 で保存し、後段で order_fee_query 失敗が分かるよう raw に保持される。
+    const fee =
+      d.commission !== undefined && d.commission !== null
+        ? normalizeNumeric(d.commission, 4)
+        : '0';
+
     executions.push({
       broker: 'MOOMOO',
       accountExternalId: uniCardNum,
@@ -144,7 +154,7 @@ export function dealsToNormalized(
       marginType: classifyMarginType(d.jp_acc_type, instrument.kind === 'OPTION_US'),
       qty: normalizeNumeric(d.qty, 8),
       price: normalizeNumeric(d.price, 6),
-      fee: '0',
+      fee,
       tax: '0',
       externalOrderId: d.order_id,
       externalFillId: String(d.deal_id),

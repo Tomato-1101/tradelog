@@ -6,6 +6,7 @@ from __future__ import annotations
 
 from datetime import date as date_t
 from datetime import timedelta
+from typing import Any
 
 from fastapi import APIRouter, HTTPException, Query
 
@@ -58,13 +59,57 @@ async def get_moomoo_deals(
     except Exception as e:
         raise HTTPException(status_code=502, detail=f"history_deal_list_query 失敗: {e}")
 
-    return {
+    # 手数料は history_deal_list_query には含まれないので order_fee_query を別途叩いて
+    # order_id 単位で取得し、同 order の deal 群に qty 按分で配分する。
+    order_ids: list[str] = []
+    seen: set[str] = set()
+    for d in deals:
+        oid = d.get("order_id")
+        if oid and oid not in seen:
+            seen.add(str(oid))
+            order_ids.append(str(oid))
+
+    fee_warnings: list[str] = []
+    if order_ids:
+        try:
+            order_fees = await moomoo_client.fetch_us_order_fees(acc_id, order_ids)
+        except Exception as e:
+            order_fees = {}
+            fee_warnings.append(f"order_fee_query 失敗 (手数料 0 で続行): {e}")
+
+        # 同 order の qty 合計を出して、deal ごとに fee_amount を qty 按分
+        order_total_qty: dict[str, float] = {}
+        for d in deals:
+            oid = str(d.get("order_id", ""))
+            try:
+                q = float(d.get("qty") or 0)
+            except (TypeError, ValueError):
+                q = 0.0
+            order_total_qty[oid] = order_total_qty.get(oid, 0.0) + q
+
+        for d in deals:
+            oid = str(d.get("order_id", ""))
+            total = order_fees.get(oid, 0.0)
+            tot_qty = order_total_qty.get(oid, 0.0)
+            if total and tot_qty > 0:
+                try:
+                    q = float(d.get("qty") or 0)
+                except (TypeError, ValueError):
+                    q = 0.0
+                d["commission"] = abs(total) * (q / tot_qty)
+            else:
+                d["commission"] = 0.0
+
+    payload: dict[str, Any] = {
         "uni_card_num": uni_card_num,
         "acc_id": acc_id,
         "start": start_d,
         "end": end_d,
         "deals": deals,
     }
+    if fee_warnings:
+        payload["fee_warnings"] = fee_warnings
+    return payload
 
 
 @router.get("/moomoo/orders")

@@ -8,19 +8,25 @@ import Stat from '@/components/ui/Stat';
 import Pill from '@/components/ui/Pill';
 import EquityCurve from '@/components/stats/EquityCurve';
 import MonthlyBars from '@/components/stats/MonthlyBars';
+import OpenPositions from '@/components/dashboard/OpenPositions';
 import PeriodFilter from '@/components/ui/PeriodFilter';
+import RoundFilterForm from '@/components/ui/RoundFilterForm';
 import { fmtMoney, fmtPercent } from '@/lib/format';
 import { parsePeriodParams, periodToRange } from '@/lib/period';
+import { getEffectiveRoundFilter, roundFilterToWhere } from '@/lib/round-filter';
 
 export const dynamic = 'force-dynamic';
 
-async function loadRounds(range: { gte?: Date; lte?: Date }): Promise<StatsRound[]> {
+async function loadRounds(
+  range: { gte?: Date; lte?: Date },
+  filterWhere: Record<string, unknown>,
+): Promise<StatsRound[]> {
   const closedAtFilter =
     range.gte || range.lte
       ? { closedAt: { not: null, ...(range.gte ? { gte: range.gte } : {}), ...(range.lte ? { lte: range.lte } : {}) } }
       : {};
   const rows = await prisma.round.findMany({
-    where: closedAtFilter,
+    where: { ...closedAtFilter, ...filterWhere },
     orderBy: { openedAt: 'asc' },
     include: { instrument: true },
   });
@@ -29,6 +35,10 @@ async function loadRounds(range: { gte?: Date; lte?: Date }): Promise<StatsRound
     instrumentId: r.instrumentId,
     symbol: r.instrument.symbol,
     instrumentName: r.instrument.name,
+    instrumentKind: r.instrument.kind as 'EQUITY_JP' | 'EQUITY_US' | 'OPTION_US',
+    expiry: r.instrument.expiry?.toISOString() ?? null,
+    strike: r.instrument.strike?.toString() ?? null,
+    right: (r.instrument.right ?? null) as 'CALL' | 'PUT' | null,
     ccy: r.instrument.ccy,
     marginType: r.marginType,
     direction: r.direction,
@@ -39,6 +49,7 @@ async function loadRounds(range: { gte?: Date; lte?: Date }): Promise<StatsRound
     realizedPnl: r.realizedPnl.toString(),
     realizedPnlJpy: r.realizedPnlJpy.toString(),
     feesTotal: r.feesTotal.toString(),
+    feesTotalJpy: r.feesTotalJpy.toString(),
     holdSeconds: r.holdSeconds,
   }));
 }
@@ -46,12 +57,21 @@ async function loadRounds(range: { gte?: Date; lte?: Date }): Promise<StatsRound
 export default async function Home({
   searchParams,
 }: {
-  searchParams: Promise<{ preset?: string; from?: string; to?: string }>;
+  searchParams: Promise<{
+    preset?: string;
+    from?: string;
+    to?: string;
+    broker?: string;
+    instKind?: string;
+    marginType?: string;
+  }>;
 }) {
   const sp = await searchParams;
   const period = parsePeriodParams(sp);
   const range = periodToRange(period);
-  const rounds = await loadRounds(range);
+  const filter = await getEffectiveRoundFilter(sp);
+  const filterWhere = roundFilterToWhere(filter);
+  const rounds = await loadRounds(range, filterWhere);
   const s = computeStats(rounds);
   const k = s.kpis;
 
@@ -78,20 +98,25 @@ export default async function Home({
         </div>
       </div>
 
-      <div className="mt-4">
+      <div className="mt-4 flex flex-wrap items-center gap-4">
         <Suspense fallback={null}>
           <PeriodFilter storageKey="dashboardPeriod" />
         </Suspense>
+        <RoundFilterForm
+          basePath="/"
+          filter={filter}
+          preserve={{ preset: sp.preset, from: sp.from, to: sp.to }}
+        />
       </div>
 
       <section className="mt-6 grid grid-cols-1 gap-4 md:grid-cols-4">
         <Card className="md:col-span-2">
           <CardBody>
             <Stat
-              label="総合損益 (JPY)"
-              value={fmtMoney(k.totalPnlJpy, 'JPY')}
-              tone={k.totalPnlJpy >= 0 ? 'pos' : 'neg'}
-              sub={`勝率 ${fmtPercent(k.winRate)} · ${k.wins}勝 ${k.losses}敗 ${k.flats}引分`}
+              label="総合損益 (JPY · 手数料控除後)"
+              value={fmtMoney(k.netPnlJpy, 'JPY')}
+              tone={k.netPnlJpy >= 0 ? 'pos' : 'neg'}
+              sub={`手数料前 ${fmtMoney(k.totalPnlJpy, 'JPY')} − 手数料 ${fmtMoney(k.totalFeesJpy, 'JPY')} · 勝率 ${fmtPercent(k.winRate)} · ${k.wins}勝 ${k.losses}敗 ${k.flats}引分`}
               size="lg"
             />
           </CardBody>
@@ -134,6 +159,21 @@ export default async function Home({
         </Card>
       </section>
 
+      <section className="mt-6">
+        <Suspense
+          fallback={
+            <Card>
+              <CardHeader title="保有ポジション (未クローズ)" subtitle="現在価格を取得中..." />
+              <CardBody>
+                <div className="py-6 text-center text-sm text-[var(--muted)]">読み込み中</div>
+              </CardBody>
+            </Card>
+          }
+        >
+          <OpenPositions />
+        </Suspense>
+      </section>
+
       <section className="mt-6 grid grid-cols-1 gap-4 md:grid-cols-2">
         <Card>
           <CardHeader title="銘柄別損益 (Top 5)" />
@@ -148,8 +188,8 @@ export default async function Home({
               </thead>
               <tbody>
                 {s.bySymbol.slice(0, 5).map((r) => (
-                  <tr key={r.symbol} className="border-t border-[var(--border)]">
-                    <td className="px-5 py-2 font-mono">{r.symbol}</td>
+                  <tr key={r.key} className="border-t border-[var(--border)]">
+                    <td className="px-5 py-2 font-mono">{r.label}</td>
                     <td className="px-5 py-2 text-right">{r.rounds}</td>
                     <td className={`px-5 py-2 text-right font-mono tabular-nums ${r.pnlJpy >= 0 ? 'text-[var(--pos)]' : 'text-[var(--neg)]'}`}>
                       {fmtMoney(r.pnlJpy, 'JPY')}

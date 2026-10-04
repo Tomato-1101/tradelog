@@ -2,6 +2,7 @@ import Link from 'next/link';
 import { notFound } from 'next/navigation';
 import { prisma } from '@/lib/db';
 import { fmtDate, fmtDuration, fmtMoney, fmtNumber } from '@/lib/format';
+import { isSbiCsvSource } from '@/lib/ingest/source';
 import ReviewChart, { type ChartExecution } from '@/components/chart/ReviewChart';
 import { Card, CardBody, CardHeader } from '@/components/ui/Card';
 import Pill from '@/components/ui/Pill';
@@ -38,7 +39,7 @@ export default async function RoundDetailPage({
 
   // SBI CSV は約定時刻が欠落しており UTC 00:00 (JST 09:00) 固定。
   // 分足は見れるようにするが、分足では取引マーカーを表示しない (時刻がデタラメになるため)。
-  const hasSbiSource = execs.some((e) => e.importBatch?.source === 'sbi-csv');
+  const hasSbiSource = execs.some((e) => isSbiCsvSource(e.importBatch?.source));
   const hideMarkersOnIntraday = round.instrument.kind === 'EQUITY_JP' && hasSbiSource;
 
   return (

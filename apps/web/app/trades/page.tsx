@@ -11,6 +11,7 @@ import Pill from '@/components/ui/Pill';
 import PeriodFilter from '@/components/ui/PeriodFilter';
 import ReviewChart, { type ChartExecution } from '@/components/chart/ReviewChart';
 import SymbolKpiPanel, { type SymbolKpis } from '@/components/trades/SymbolKpiPanel';
+import { isSbiCsvSource } from '@/lib/ingest/source';
 import { parsePeriodParams, periodToRange } from '@/lib/period';
 import { computeStats } from '@/lib/stats/compute';
 import type { StatsRound } from '@/lib/stats/types';
@@ -31,9 +32,12 @@ function parseSortKey(s: string | undefined): SortKey {
 }
 
 type Bucket = {
-  key: string; // `${kind}|${symbol}`
+  // OPTION_US は `${kind}|${symbol}|${expiry}|${strike}|${right}`、
+  // Equity は `${kind}|${symbol}`。同じ underlying でも option の契約条件が違えば別 bucket。
+  key: string;
   kind: 'EQUITY_JP' | 'EQUITY_US' | 'OPTION_US';
   symbol: string;
+  label: string; // 表示用 (OPTION は "NVDA 26-05-15 500C")
   instrumentName: string | null;
   ccy: string;
   rounds: number;
@@ -57,6 +61,7 @@ type RoundWithInst = {
   realizedPnl: { toString(): string };
   realizedPnlJpy: { toString(): string };
   feesTotal: { toString(): string };
+  feesTotalJpy: { toString(): string };
   holdSeconds: number | null;
   executionsJson: string;
   instrument: {
@@ -65,19 +70,42 @@ type RoundWithInst = {
     symbol: string;
     name: string | null;
     ccy: string;
+    expiry: Date | null;
+    strike: { toString(): string } | null;
+    right: 'CALL' | 'PUT' | null;
   };
 };
+
+function bucketKey(r: RoundWithInst): string {
+  if (r.instrument.kind === 'OPTION_US') {
+    const exp = r.instrument.expiry?.toISOString().slice(0, 10) ?? '?';
+    const strike = r.instrument.strike?.toString() ?? '?';
+    return `${r.instrument.kind}|${r.instrument.symbol}|${exp}|${strike}|${r.instrument.right ?? '?'}`;
+  }
+  return `${r.instrument.kind}|${r.instrument.symbol}`;
+}
+
+function bucketLabel(r: RoundWithInst): string {
+  if (r.instrument.kind === 'OPTION_US') {
+    const exp = r.instrument.expiry?.toISOString().slice(2, 10) ?? '?';
+    const strike = r.instrument.strike?.toString() ?? '?';
+    const rt = r.instrument.right === 'CALL' ? 'C' : r.instrument.right === 'PUT' ? 'P' : '?';
+    return `${r.instrument.symbol} ${exp} ${strike}${rt}`;
+  }
+  return r.instrument.symbol;
+}
 
 function bucketize(rounds: RoundWithInst[]): Bucket[] {
   const map = new Map<string, Bucket & { _instrumentCount: Map<number, number> }>();
   for (const r of rounds) {
-    const key = `${r.instrument.kind}|${r.instrument.symbol}`;
+    const key = bucketKey(r);
     let b = map.get(key);
     if (!b) {
       b = {
         key,
         kind: r.instrument.kind,
         symbol: r.instrument.symbol,
+        label: bucketLabel(r),
         instrumentName: r.instrument.name,
         ccy: r.instrument.ccy,
         rounds: 0,
@@ -139,6 +167,10 @@ function toStatsRound(r: RoundWithInst): StatsRound {
     instrumentId: r.instrumentId,
     symbol: r.instrument.symbol,
     instrumentName: r.instrument.name,
+    instrumentKind: r.instrument.kind as 'EQUITY_JP' | 'EQUITY_US' | 'OPTION_US',
+    expiry: r.instrument.expiry?.toISOString() ?? null,
+    strike: r.instrument.strike?.toString() ?? null,
+    right: (r.instrument.right ?? null) as 'CALL' | 'PUT' | null,
     ccy: r.instrument.ccy,
     marginType: r.marginType,
     direction: r.direction,
@@ -149,6 +181,7 @@ function toStatsRound(r: RoundWithInst): StatsRound {
     realizedPnl: r.realizedPnl.toString(),
     realizedPnlJpy: r.realizedPnlJpy.toString(),
     feesTotal: r.feesTotal.toString(),
+    feesTotalJpy: r.feesTotalJpy.toString(),
     holdSeconds: r.holdSeconds,
   };
 }
@@ -220,9 +253,14 @@ export default async function TradesPage({
     preset?: string;
     from?: string;
     to?: string;
+    // 旧形式 (symbol+kind) は互換維持のため残置。OPTION_US は instId を優先採用。
     symbol?: string;
     kind?: string;
+    instId?: string;
     sort?: string;
+    broker?: string;
+    instKind?: string;
+    marginType?: string;
   }>;
 }) {
   const sp = await searchParams;
@@ -230,9 +268,24 @@ export default async function TradesPage({
   const range = periodToRange(period);
   const sort = parseSortKey(sp.sort);
 
+  // 絞り込みフィルタ (ブローカー / 商品種別 / 取引区分)。すべて Round.findMany の where に流す。
+  const VALID_KIND = new Set(['EQUITY_JP', 'EQUITY_US', 'OPTION_US']);
+  const VALID_MARGIN = new Set(['CASH', 'MARGIN_LONG', 'MARGIN_SHORT']);
+  const VALID_BROKER = new Set(['SBI', 'MOOMOO']);
+  const brokerFilter = sp.broker && VALID_BROKER.has(sp.broker) ? (sp.broker as 'SBI' | 'MOOMOO') : undefined;
+  const instKindFilter = sp.instKind && VALID_KIND.has(sp.instKind)
+    ? (sp.instKind as 'EQUITY_JP' | 'EQUITY_US' | 'OPTION_US')
+    : undefined;
+  const marginFilter = sp.marginType && VALID_MARGIN.has(sp.marginType)
+    ? (sp.marginType as 'CASH' | 'MARGIN_LONG' | 'MARGIN_SHORT')
+    : undefined;
+
   // 期間内のクローズ済 Round を取得
   const closedAtFilter = {
     closedAt: { not: null, ...(range.gte ? { gte: range.gte } : {}), ...(range.lte ? { lte: range.lte } : {}) },
+    ...(brokerFilter ? { account: { broker: { code: brokerFilter } } } : {}),
+    ...(instKindFilter ? { instrument: { kind: instKindFilter } } : {}),
+    ...(marginFilter ? { marginType: marginFilter } : {}),
   };
   const rounds = (await prisma.round.findMany({
     where: closedAtFilter,
@@ -242,9 +295,12 @@ export default async function TradesPage({
 
   const buckets = sortBuckets(bucketize(rounds), sort);
 
-  // 選択銘柄
-  const selectedKey = sp.symbol && sp.kind ? `${sp.kind}|${sp.symbol}` : buckets[0]?.key;
-  const selected = buckets.find((b) => b.key === selectedKey) ?? buckets[0];
+  // 選択銘柄。instId があれば最優先 (OPTION_US で同 underlying の別契約を区別するため)。
+  // なければ旧形式 (kind|symbol) でフォールバック。
+  const selected =
+    (sp.instId && buckets.find((b) => b.bestInstrumentId === Number(sp.instId))) ||
+    (sp.symbol && sp.kind && buckets.find((b) => b.key === `${sp.kind}|${sp.symbol}`)) ||
+    buckets[0];
 
   // 選択銘柄の全 Round と全 Execution を取得 (チャート用)
   let executions: Array<{
@@ -258,7 +314,7 @@ export default async function TradesPage({
   }> = [];
   let selectedRounds: RoundWithInst[] = [];
   if (selected) {
-    selectedRounds = rounds.filter((r) => `${r.instrument.kind}|${r.instrument.symbol}` === selected.key);
+    selectedRounds = rounds.filter((r) => bucketKey(r) === selected.key);
     // OPTION_US は同 symbol の中に複数 strike/expiry の Instrument がぶら下がる。
     // チャートは bestInstrumentId 1 つを描画するので、混在防止に Execution 集合も
     // bestInstrumentId に紐づくラウンドだけに絞る (他 strike の点が別 OHLC スケールに浮かんで見える問題対策)。
@@ -294,7 +350,7 @@ export default async function TradesPage({
     }
   }
 
-  const hasSbiSource = executions.some((e) => e.importBatchSource === 'sbi-csv');
+  const hasSbiSource = executions.some((e) => isSbiCsvSource(e.importBatchSource));
   const hideMarkersOnIntraday = selected?.kind === 'EQUITY_JP' && hasSbiSource;
 
   // OPTION_US の場合、サーバー API に渡す OCC コードを引く (チャート本体取得用)
@@ -327,6 +383,69 @@ export default async function TradesPage({
         <Suspense fallback={null}>
           <PeriodFilter storageKey="tradesPeriod" />
         </Suspense>
+        {/*
+          GET フォームで /trades に絞り込みを送り直す。フィルタを切り替えると銘柄選択
+          (symbol, kind) は維持しない方が自然なので、hidden で preset/from/to/sort
+          だけ引き継いで symbol/kind は捨てる。
+        */}
+        <form className="flex flex-wrap items-end gap-2 text-xs">
+          {sp.preset && <input type="hidden" name="preset" value={sp.preset} />}
+          {sp.from && <input type="hidden" name="from" value={sp.from} />}
+          {sp.to && <input type="hidden" name="to" value={sp.to} />}
+          {sp.sort && <input type="hidden" name="sort" value={sp.sort} />}
+          <label className="font-medium text-[var(--muted)]">
+            <span className="block">ブローカー</span>
+            <select
+              name="broker"
+              defaultValue={brokerFilter ?? ''}
+              className="mt-0.5 rounded-md border border-[var(--border)] bg-[var(--surface)] px-2 py-1 text-sm"
+            >
+              <option value="">すべて</option>
+              <option value="SBI">SBI</option>
+              <option value="MOOMOO">MOOMOO</option>
+            </select>
+          </label>
+          <label className="font-medium text-[var(--muted)]">
+            <span className="block">商品種別</span>
+            <select
+              name="instKind"
+              defaultValue={instKindFilter ?? ''}
+              className="mt-0.5 rounded-md border border-[var(--border)] bg-[var(--surface)] px-2 py-1 text-sm"
+            >
+              <option value="">すべて</option>
+              <option value="EQUITY_JP">日本株</option>
+              <option value="EQUITY_US">米株</option>
+              <option value="OPTION_US">米株オプション</option>
+            </select>
+          </label>
+          <label className="font-medium text-[var(--muted)]">
+            <span className="block">取引区分</span>
+            <select
+              name="marginType"
+              defaultValue={marginFilter ?? ''}
+              className="mt-0.5 rounded-md border border-[var(--border)] bg-[var(--surface)] px-2 py-1 text-sm"
+            >
+              <option value="">すべて</option>
+              <option value="CASH">現物</option>
+              <option value="MARGIN_LONG">信用買</option>
+              <option value="MARGIN_SHORT">信用売</option>
+            </select>
+          </label>
+          <button
+            type="submit"
+            className="rounded-md bg-[var(--primary)] px-3 py-1.5 text-xs font-medium text-[var(--primary-foreground)] hover:opacity-90"
+          >
+            絞り込み
+          </button>
+          {(brokerFilter || instKindFilter || marginFilter) && (
+            <Link
+              href={buildLink(sp, { broker: '', instKind: '', marginType: '', symbol: '', kind: '' })}
+              className="rounded-md border border-[var(--border)] bg-[var(--surface)] px-3 py-1.5 text-xs hover:bg-[var(--surface-muted)]"
+            >
+              クリア
+            </Link>
+          )}
+        </form>
         <div className="ml-auto flex items-center gap-1 text-xs text-[var(--muted)]">
           並び替え:
           {(Object.keys(SORT_LABELS) as SortKey[]).map((k) => (
@@ -363,7 +482,11 @@ export default async function TradesPage({
                     return (
                       <li key={b.key}>
                         <Link
-                          href={buildLink(sp, { symbol: b.symbol, kind: b.kind })}
+                          href={buildLink(sp, {
+                            symbol: '',
+                            kind: '',
+                            instId: String(b.bestInstrumentId),
+                          })}
                           className={`flex flex-col gap-1 px-4 py-3 transition ${
                             isSelected
                               ? 'bg-[var(--primary-soft)]'
@@ -372,7 +495,7 @@ export default async function TradesPage({
                         >
                           <div className="flex items-baseline justify-between gap-2">
                             <div className="flex items-baseline gap-2">
-                              <span className="font-mono font-medium text-sm">{b.symbol}</span>
+                              <span className="font-mono font-medium text-sm">{b.label}</span>
                               {b.kind === 'OPTION_US' && <Pill tone="primary">opt</Pill>}
                               {b.kind === 'EQUITY_US' && <Pill tone="neutral">US</Pill>}
                               {b.kind === 'EQUITY_JP' && <Pill tone="neutral">JP</Pill>}
@@ -390,7 +513,7 @@ export default async function TradesPage({
                             </span>
                             <svg width={80} height={20} viewBox="0 0 80 20">
                               <path
-                                d={sparkPath(rounds.filter((r) => `${r.instrument.kind}|${r.instrument.symbol}` === b.key), 80, 20)}
+                                d={sparkPath(rounds.filter((r) => bucketKey(r) === b.key), 80, 20)}
                                 fill="none"
                                 stroke={b.totalPnlJpy >= 0 ? 'var(--pos)' : 'var(--neg)'}
                                 strokeWidth={1.2}
@@ -412,10 +535,10 @@ export default async function TradesPage({
             <>
               <Card>
                 <CardHeader
-                  title={`チャート: ${selected.symbol}`}
+                  title={`チャート: ${selected.label}`}
                   subtitle={
                     selected.kind === 'OPTION_US'
-                      ? `オプション銘柄 · 同 underlying ${selectedRounds.length} ラウンドのうち、最多契約 (instrument ${selected.bestInstrumentId}) の OHLC とマーカーを表示`
+                      ? `オプション契約 · ${selectedRounds.length} ラウンドの約定マーカー (instrument ${selected.bestInstrumentId})`
                       : `${selectedRounds.length} ラウンド分の約定マーカー`
                   }
                 />
@@ -439,7 +562,7 @@ export default async function TradesPage({
                   />
                 </CardBody>
               </Card>
-              <SymbolKpiPanel kpis={kpis} symbol={selected.symbol} />
+              <SymbolKpiPanel kpis={kpis} symbol={selected.label} />
             </>
           ) : (
             <Card>

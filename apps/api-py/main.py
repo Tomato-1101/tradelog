@@ -5,6 +5,7 @@ Next.js から HTTP で叩かれる。OpenD (moomoo) と yfinance への薄い�
 """
 from __future__ import annotations
 
+import asyncio
 import os
 
 from fastapi import FastAPI
@@ -34,10 +35,17 @@ app.include_router(moomoo_history.router)
 
 @app.get("/healthz")
 async def healthz() -> dict:
-    od = await moomoo_client.opend_status()
+    # OpenD 未起動時は futu SDK の接続リトライで数十秒ブロックしうるので、
+    # ヘルスチェックは待たずに "unknown" を返す (即応答が本エンドポイントの要件)。
+    try:
+        od = await asyncio.wait_for(moomoo_client.opend_status(), timeout=1.5)
+        opend = "connected" if od.get("connected") else "disconnected"
+    except asyncio.TimeoutError:
+        od = {"connected": False, "error": "timeout"}
+        opend = "unknown"
     return {
         "ok": True,
-        "opend": "connected" if od.get("connected") else "disconnected",
+        "opend": opend,
         "opend_detail": od,
         "yfinance": "ok",
         "version": app.version,

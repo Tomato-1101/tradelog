@@ -12,8 +12,25 @@ import type {
   NormalizedInstrument,
   ParseResult,
   ParseWarning,
+  SbiCsvFormat,
   Side,
 } from './types';
+
+// 各 parse 経路の return に format と executions の date 範囲を埋め込む。
+// import 経路で「全期間 CSV を投入したとき同期間の daily 由来を削除→再 INSERT」する
+// 上書きロジックに earliestDate を渡すために必要。
+function withFormatMeta(
+  result: { executions: NormalizedExecution[]; warnings: ParseWarning[] },
+  format: SbiCsvFormat,
+): ParseResult {
+  let earliest: Date | null = null;
+  let latest: Date | null = null;
+  for (const e of result.executions) {
+    if (!earliest || e.executedAt < earliest) earliest = e.executedAt;
+    if (!latest || e.executedAt > latest) latest = e.executedAt;
+  }
+  return { ...result, format, earliestDate: earliest, latestDate: latest };
+}
 
 type ColumnKey =
   | 'tradeDate'      // 約定日
@@ -68,6 +85,19 @@ function classifyKind(label: string): { side: Side; marginType: MarginType } | n
     if (p.re.test(label)) return { side: p.side, marginType: p.marginType };
   }
   return null;
+}
+
+// 損益計算対象外の取引区分。約定履歴照会 CSV には MRF (証券総合口座の自動運用) や
+// 投信買付・解約、株式の預り入出庫が混ざる。これらは Execution として落としても
+// Round 集計に乗らない (現物 fill ではない / 自動連動) ので、警告氾濫を避けるため静かに skip。
+const SKIP_KIND_PATTERNS: RegExp[] = [
+  /^MRF/,           // MRF解約 / MRF買付 / MRF再投資
+  /^投信/,          // 投信金額買付 / 投信金額解約
+  /預り(入庫|出庫)/, // 株式の入出庫
+];
+
+function shouldSkipKind(label: string): boolean {
+  return SKIP_KIND_PATTERNS.some((re) => re.test(label));
 }
 
 // 現引/現渡 は 1 行で 2 つのポジション変化が起きる。
@@ -145,6 +175,183 @@ export function parseSbiCsvBuffer(
 }
 
 /**
+ * 第 3 フォーマット (約定履歴照会 / SaveFile_*.csv): ヘッダが
+ *   約定日,銘柄,銘柄コード,市場,取引,期限,預り,課税,約定数量,約定単価,手数料/諸経費等,税額,受渡日,受渡金額/決済損益
+ * の 14 列前後。約定時刻なし、注文番号/約定番号なし、複数年に跨る長期エクスポート想定。
+ * 取引区分カラム名が「取引」(他フォーマットは「取引区分」) なのが識別キー。
+ */
+function findThirdFormatHeader(lines: string[]): number {
+  for (let i = 0; i < lines.length; i++) {
+    const row = splitCsvRow(lines[i]).map((c) => c.trim());
+    if (row.length < 10) continue;
+    if (
+      row[0] === '約定日' &&
+      row[1] === '銘柄' &&
+      row[2] === '銘柄コード' &&
+      row[4] === '取引' &&
+      row.some((c) => c.includes('約定数量')) &&
+      row.some((c) => c.includes('約定単価'))
+    ) {
+      return i;
+    }
+  }
+  return -1;
+}
+
+function parseThirdFormatRows(
+  rawLines: string[],
+  headerIdx: number,
+  accountExternalId: string,
+): ParseResult {
+  const warnings: ParseWarning[] = [];
+  const executions: NormalizedExecution[] = [];
+  const header = splitCsvRow(rawLines[headerIdx]).map((c) => c.trim());
+
+  const idxDate = 0;
+  const idxName = 1;
+  const idxCode = 2;
+  const idxExchange = 3;
+  const idxKind = 4;
+  const idxQty = header.findIndex((h) => h.includes('約定数量'));
+  const idxPrice = header.findIndex((h) => h.includes('約定単価'));
+  const idxFee = header.findIndex((h) => h.includes('手数料'));
+  const idxTax = header.findIndex((h) => h === '税額' || h.includes('税額'));
+  // 受渡金額/決済損益: 区分により意味が変わる (現物=約定額、信用返済=実損益、現引=支払額)。
+  // 値があれば一律 roleSuffix の pnl= に乗せて dedupe を効かせる。
+  const idxSettlement = header.findIndex(
+    (h) => h.includes('受渡金額') && (h.includes('決済損益') || h.includes('/決済損益')),
+  );
+
+  if (idxQty < 0 || idxPrice < 0) {
+    return withFormatMeta({
+      executions: [],
+      warnings: [{
+        line: headerIdx + 1,
+        code: 'missing-columns',
+        message: '約定履歴照会フォーマット必須カラム不足 (約定数量 / 約定単価)',
+      }],
+    }, 'third-savefile');
+  }
+
+  const seqByKey = new Map<string, number>();
+  const composeRoleSuffix = (
+    base: string | undefined,
+    pnl: string | null,
+    naturalKey: string,
+  ): string | undefined => {
+    const parts: string[] = [];
+    if (base) parts.push(base);
+    if (pnl) parts.push(`pnl=${pnl}`);
+    const probe = parts.join('|');
+    const fullKey = `${naturalKey}|${probe}`;
+    const n = (seqByKey.get(fullKey) ?? 0) + 1;
+    seqByKey.set(fullKey, n);
+    if (n > 1) parts.push(`seq=${n}`);
+    return parts.length ? parts.join('|') : undefined;
+  };
+
+  for (let i = headerIdx + 1; i < rawLines.length; i++) {
+    const line = rawLines[i];
+    if (!line.trim()) continue;
+    const row = splitCsvRow(line);
+    if (row.every((c) => !c.trim())) continue;
+
+    const kindLabel = (row[idxKind] ?? '').trim();
+    if (!kindLabel) continue; // 体裁行・空 kind
+    if (shouldSkipKind(kindLabel)) continue; // MRF / 投信 / 入出庫
+
+    const dateRaw = (row[idxDate] ?? '').trim();
+    const date = parseJpDate(dateRaw);
+    if (!date) {
+      warnings.push({ line: i + 1, code: 'bad-date', message: `約定日のパース失敗: "${dateRaw}"` });
+      continue;
+    }
+
+    const split = expandSplitKind(kindLabel);
+    const classified = split ? null : classifyKind(kindLabel);
+    if (!split && !classified) {
+      warnings.push({ line: i + 1, code: 'unknown-kind', message: `取引区分を解釈できません: "${kindLabel}"` });
+      continue;
+    }
+
+    const symbol = (row[idxCode] ?? '').trim();
+    if (!symbol) {
+      warnings.push({ line: i + 1, code: 'no-symbol', message: `銘柄コードが空 (取引区分=${kindLabel})` });
+      continue;
+    }
+    const name = (row[idxName] ?? '').trim();
+    const exchangeRaw = (row[idxExchange] ?? '').trim();
+    const exchange = exchangeRaw && exchangeRaw !== '--' ? exchangeRaw : undefined;
+
+    const instrument: NormalizedInstrument = {
+      kind: 'EQUITY_JP',
+      symbol,
+      exchange,
+      name: name || undefined,
+      ccy: 'JPY',
+    };
+
+    const qty = normalizeNumber(row[idxQty]);
+    const price = normalizeNumber(row[idxPrice]);
+    const feeRaw = idxFee >= 0 ? (row[idxFee] ?? '').trim() : '';
+    const taxRaw = idxTax >= 0 ? (row[idxTax] ?? '').trim() : '';
+    const fee = feeRaw && feeRaw !== '--' ? normalizeNumber(feeRaw) : '0';
+    const tax = taxRaw && taxRaw !== '--' ? normalizeNumber(taxRaw) : '0';
+
+    const settlementRaw = idxSettlement >= 0 ? (row[idxSettlement] ?? '').trim() : '';
+    const settlementPnl =
+      settlementRaw && settlementRaw !== '--' ? normalizeNumber(settlementRaw) : null;
+
+    const rawRow = Object.fromEntries(header.map((h, idx) => [h, row[idx] ?? '']));
+
+    if (split) {
+      for (let k = 0; k < split.length; k++) {
+        const s = split[k];
+        const naturalKey = `${date.toISOString()}|${symbol}|${s.marginType}|${s.side}|${qty}|${price}`;
+        const roleSuffix = composeRoleSuffix(s.roleSuffix, settlementPnl, naturalKey);
+        executions.push({
+          broker: 'SBI',
+          accountExternalId,
+          instrument,
+          executedAt: date,
+          side: s.side,
+          marginType: s.marginType,
+          qty,
+          price,
+          fee: k === 0 ? fee : '0',
+          tax: k === 0 ? tax : '0',
+          externalOrderId: undefined,
+          externalFillId: undefined,
+          roleSuffix,
+          raw: { ...rawRow, _roleSuffix: roleSuffix ?? '' },
+        });
+      }
+      continue;
+    }
+
+    const naturalKey = `${date.toISOString()}|${symbol}|${classified!.marginType}|${classified!.side}|${qty}|${price}`;
+    const roleSuffix = composeRoleSuffix(undefined, settlementPnl, naturalKey);
+    executions.push({
+      broker: 'SBI',
+      accountExternalId,
+      instrument,
+      executedAt: date,
+      side: classified!.side,
+      marginType: classified!.marginType,
+      qty,
+      price,
+      fee,
+      tax,
+      externalOrderId: undefined,
+      externalFillId: undefined,
+      roleSuffix,
+      raw: roleSuffix ? { ...rawRow, _roleSuffix: roleSuffix } : rawRow,
+    });
+  }
+  return withFormatMeta({ executions, warnings }, 'third-savefile');
+}
+
+/**
  * 新フォーマット (注文一覧_当日約定): ヘッダの先頭が「銘柄,銘柄,銘柄」と 3 列連続し、
  * 「平均約定単価」が含まれる。1=コード, 2=名称, 3=市場、約定時刻なし、手数料/税が "--" のことあり。
  */
@@ -194,10 +401,10 @@ function parseNewFormatRows(
   if (idxQty < 0) missing.push('株数');
   if (idxPrice < 0) missing.push('平均約定単価');
   if (missing.length) {
-    return {
+    return withFormatMeta({
       executions: [],
       warnings: [{ line: headerIdx + 1, code: 'missing-columns', message: `新フォーマット必須カラム不足: ${missing.join(', ')}` }],
-    };
+    }, 'new-daily');
   }
 
   // 同自然キー (executedAt+symbol+marginType+side+qty+price+roleSuffix) の出現回数を
@@ -317,7 +524,7 @@ function parseNewFormatRows(
       raw: roleSuffix ? { ...rawRow, _roleSuffix: roleSuffix } : rawRow,
     });
   }
-  return { executions, warnings };
+  return withFormatMeta({ executions, warnings }, 'new-daily');
 }
 
 export function parseSbiCsvText(
@@ -332,7 +539,13 @@ export function parseSbiCsvText(
   const cleaned = text.replace(/^﻿/, '').replace(/\r\n?/g, '\n');
   const rawLines = cleaned.split('\n');
 
-  // 新フォーマット (注文一覧_当日約定) を先に試す
+  // 約定履歴照会 (SaveFile_*.csv) を最初に試す — 14 列、約定時刻なし、長期エクスポート
+  const thirdIdx = findThirdFormatHeader(rawLines);
+  if (thirdIdx >= 0) {
+    return parseThirdFormatRows(rawLines, thirdIdx, accountExternalId);
+  }
+
+  // 新フォーマット (注文一覧_当日約定) を次に試す
   const newIdx = findNewFormatHeader(rawLines);
   if (newIdx >= 0) {
     return parseNewFormatRows(rawLines, newIdx, accountExternalId);
@@ -340,10 +553,10 @@ export function parseSbiCsvText(
 
   const headerIdx = findHeaderLine(rawLines);
   if (headerIdx < 0) {
-    return {
+    return withFormatMeta({
       executions: [],
       warnings: [{ line: 0, code: 'no-header', message: 'ヘッダ行を検出できません (約定日/銘柄コード/数量 を含む行が必要)' }],
-    };
+    }, 'unknown');
   }
   const headerRow = splitCsvRow(rawLines[headerIdx]);
   const cols = buildColumnMap(headerRow);
@@ -351,10 +564,10 @@ export function parseSbiCsvText(
   const required: ColumnKey[] = ['tradeDate', 'symbol', 'kind', 'qty', 'price'];
   const missing = required.filter((k) => cols[k] == null);
   if (missing.length) {
-    return {
+    return withFormatMeta({
       executions: [],
       warnings: [{ line: headerIdx + 1, code: 'missing-columns', message: `必須カラム不足: ${missing.join(', ')}` }],
-    };
+    }, 'legacy');
   }
 
   for (let i = headerIdx + 1; i < rawLines.length; i++) {
@@ -446,5 +659,5 @@ export function parseSbiCsvText(
     });
   }
 
-  return { executions, warnings };
+  return withFormatMeta({ executions, warnings }, 'legacy');
 }

@@ -84,6 +84,7 @@ export async function reaggregateGroups(groups: RoundGroupKey[]): Promise<{ roun
             realizedPnl: d.realizedPnl,
             realizedPnlJpy: d.realizedPnlJpy,
             feesTotal: d.feesTotal,
+            feesTotalJpy: d.feesTotalJpy,
             holdSeconds: d.holdSeconds,
             executionsJson: JSON.stringify(d.executions),
           },

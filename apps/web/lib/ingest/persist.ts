@@ -75,6 +75,8 @@ export async function previewImport(
   broker: BrokerCode,
   accountExternalId: string,
   execs: NormalizedExecution[],
+  /** 同一コミット内で削除予定 (supersede 対象) の dedupeHash。既存扱いせず新規として通す。 */
+  ignoreExistingHashes?: ReadonlySet<string>,
 ): Promise<Preview> {
   const { brokerId, accountId } = await resolveBrokerAndAccount(broker, accountExternalId);
   const items: PreviewItem[] = execs.map((e, idx) => ({
@@ -91,30 +93,86 @@ export async function previewImport(
     where: { dedupeHash: { in: hashes } },
     select: { dedupeHash: true },
   });
-  const existingSet = new Set(existing.map((e) => e.dedupeHash));
+  const existingSet = new Set(
+    existing.map((e) => e.dedupeHash).filter((h) => !ignoreExistingHashes?.has(h)),
+  );
+  // 同一ファイル内の重複行も dup 扱いにする。2 件目以降を INSERT すると
+  // dedupeHash の一意制約違反 (P2002) で取り込み全体が例外になるため。
+  const seenInFile = new Set<string>();
   let newCount = 0;
   let dupCount = 0;
   for (const it of items) {
-    if (existingSet.has(it.dedupeHash)) {
+    if (existingSet.has(it.dedupeHash) || seenInFile.has(it.dedupeHash)) {
       it.status = 'dup';
       dupCount++;
     } else {
+      seenInFile.add(it.dedupeHash);
       newCount++;
     }
   }
   return { brokerId, accountId, newCount, dupCount, items };
 }
 
+// SBI CSV の 2 経路マージ用オプション。
+//   supersedeDailyFrom: 指定日以降 (UTC) の Execution で
+//     source='sbi-csv-daily' のものを **物理削除** してから INSERT する。
+//     全期間 CSV (`sbi-csv-savefile`) を投入したとき、当日 CSV で先に取り込まれた
+//     未確定 (受渡損益 '--') の Execution が dedupeHash の差異により重複検出されず
+//     2 重 INSERT になるのを防ぐため。
+export type CommitImportOptions = {
+  supersedeDailyFrom?: Date;
+};
+
+export type ImportSource =
+  | 'sbi-csv'
+  | 'sbi-csv-daily'
+  | 'sbi-csv-savefile'
+  | 'moomoo-api'
+  | 'moomoo-csv';
+
 /** 確定: 新規分を DB に INSERT し、ImportBatch を作成、影響範囲を再集計 */
 export async function commitImport(
   broker: BrokerCode,
   accountExternalId: string,
-  source: 'sbi-csv' | 'moomoo-api' | 'moomoo-csv',
+  source: ImportSource,
   fileName: string | null,
   fileBuf: Buffer | null,
   execs: NormalizedExecution[],
-): Promise<{ batchId: string; newCount: number; dupCount: number; roundsRebuilt: number }> {
-  const preview = await previewImport(broker, accountExternalId, execs);
+  opts: CommitImportOptions = {},
+): Promise<{ batchId: string; newCount: number; dupCount: number; roundsRebuilt: number; supersededCount: number }> {
+  // 全期間 CSV による daily 上書き: 削除対象の select だけ先に行い、実際の deleteMany は
+  // 下のトランザクション内 (INSERT と同一原子単位) で実行する。
+  // 影響範囲は `supersededAffected` に集めて後段の reaggregate に流す。
+  const supersededAffected: RoundGroupKey[] = [];
+  let supersededIds: number[] = [];
+  // 削除予定の hash は preview の「既存」判定から除外する
+  // (除外しないと savefile 側の同一約定が dup 扱いで INSERT されず、削除だけが残る)。
+  let supersededHashes: Set<string> = new Set();
+  if (opts.supersedeDailyFrom) {
+    const targets = await prisma.execution.findMany({
+      where: {
+        executedAt: { gte: opts.supersedeDailyFrom },
+        importBatch: { source: 'sbi-csv-daily' },
+        account: {
+          externalId: accountExternalId,
+          broker: { code: broker },
+        },
+      },
+      select: { id: true, instrumentId: true, accountId: true, marginType: true, dedupeHash: true },
+    });
+    for (const t of targets) {
+      supersededAffected.push({
+        instrumentId: t.instrumentId,
+        accountId: t.accountId,
+        marginType: t.marginType as RoundGroupKey['marginType'],
+      });
+    }
+    supersededIds = targets.map((t) => t.id);
+    supersededHashes = new Set(targets.map((t) => t.dedupeHash));
+  }
+  const supersededCount = supersededIds.length;
+
+  const preview = await previewImport(broker, accountExternalId, execs, supersededHashes);
   const fileSha256 = fileBuf ? sha256OfBuffer(fileBuf) : null;
 
   // 新規分について FX レートを事前取得 (トランザクション内で外部 IO しないため)
@@ -126,15 +184,21 @@ export async function commitImport(
     const day = it.exec.executedAt.toISOString().slice(0, 10);
     fxNeeded.set(`${ccy}|${day}`, { ccy, date: it.exec.executedAt });
   }
-  const fxMap = new Map<string, string>();
-  for (const [key, v] of fxNeeded) {
-    fxMap.set(key, await getFxRateToJpy(v.ccy, v.date));
-  }
+  // 日付数ぶんの sidecar 往復を直列に回すと数十秒待たされるので並列で取る
+  const fxEntries = await Promise.all(
+    [...fxNeeded].map(async ([key, v]) => [key, await getFxRateToJpy(v.ccy, v.date)] as const),
+  );
+  const fxMap = new Map<string, string>(fxEntries);
 
   // 影響を受ける (instrumentId, accountId, marginType) を新規分から集める
   const affected: RoundGroupKey[] = [];
 
   const batch = await prisma.$transaction(async (tx) => {
+    // 上書き対象の削除は INSERT と同一トランザクションで行う (途中失敗で元データを失わないため)
+    if (supersededIds.length) {
+      await tx.execution.deleteMany({ where: { id: { in: supersededIds } } });
+    }
+
     const ib = await tx.importBatch.create({
       data: {
         accountId: preview.accountId,
@@ -195,7 +259,7 @@ export async function commitImport(
     return { id: ib.id, newCount, dupCount };
   });
 
-  const uniqueGroups = distinctGroups(affected);
+  const uniqueGroups = distinctGroups([...supersededAffected, ...affected]);
   const { rounds } = await reaggregateGroups(uniqueGroups);
 
   return {
@@ -203,5 +267,6 @@ export async function commitImport(
     newCount: batch.newCount,
     dupCount: batch.dupCount,
     roundsRebuilt: rounds,
+    supersededCount,
   };
 }

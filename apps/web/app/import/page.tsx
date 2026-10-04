@@ -3,7 +3,7 @@ import { revalidatePath } from 'next/cache';
 import { redirect } from 'next/navigation';
 import { prisma } from '@/lib/db';
 import { parseSbiCsvBuffer } from '@/lib/ingest/sbi-csv';
-import { commitImport } from '@/lib/ingest/persist';
+import { commitImport, type ImportSource, type CommitImportOptions } from '@/lib/ingest/persist';
 import { dealsToNormalized, fetchMoomooDeals } from '@/lib/ingest/moomoo-history';
 import { distinctGroups, reaggregateGroups } from '@/lib/rounds/reaggregate';
 import { Card, CardBody, CardHeader } from '@/components/ui/Card';
@@ -19,7 +19,7 @@ async function importSbi(formData: FormData) {
     redirect('/import?error=' + encodeURIComponent('CSV ファイルが指定されていません'));
   }
   const buf = Buffer.from(await file.arrayBuffer());
-  const { executions, warnings } = parseSbiCsvBuffer(buf);
+  const { executions, warnings, format, earliestDate } = parseSbiCsvBuffer(buf);
   if (executions.length === 0) {
     redirect(
       '/import?error=' +
@@ -28,12 +28,25 @@ async function importSbi(formData: FormData) {
         ),
     );
   }
-  const result = await commitImport('SBI', 'default', 'sbi-csv', file.name, buf, executions);
+  // フォーマット種別ごとに source を切り替える。全期間 CSV (third-savefile) は
+  // 当日 CSV を権威ソースで上書きするため supersedeDailyFrom を渡す。
+  let source: ImportSource = 'sbi-csv';
+  const opts: CommitImportOptions = {};
+  if (format === 'new-daily') {
+    source = 'sbi-csv-daily';
+  } else if (format === 'third-savefile') {
+    source = 'sbi-csv-savefile';
+    if (earliestDate) opts.supersedeDailyFrom = earliestDate;
+  }
+  const result = await commitImport('SBI', 'default', source, file.name, buf, executions, opts);
   revalidatePath('/import');
   revalidatePath('/trades');
+  revalidatePath('/stats');
+  revalidatePath('/');
+  const supersededMsg = result.supersededCount > 0 ? ` / 上書き ${result.supersededCount}` : '';
   redirect(
     `/import?ok=${encodeURIComponent(
-      `取り込み完了: 新規 ${result.newCount} 件 / 重複 ${result.dupCount} 件 / Round ${result.roundsRebuilt} 再生成`,
+      `取り込み完了 [${format ?? 'unknown'}]: 新規 ${result.newCount} 件 / 重複 ${result.dupCount} 件${supersededMsg} / Round ${result.roundsRebuilt} 再生成`,
     )}`,
   );
 }
@@ -98,73 +111,122 @@ async function importMoomoo(_formData: FormData) {
   );
 }
 
-async function fetchRecent() {
-  return prisma.importBatch.findMany({
-    take: 30,
+// 表示用エントリ。CSV 系 (sbi-csv*) は ImportBatch 1 件 = 1 エントリ。
+// moomoo API (source='moomoo-api') は (broker × source) で集約し、
+// 内部の複数 batchId と合計 new/dup・最新 importedAt を持つ。
+type ImportEntry = {
+  key: string;
+  brokerCode: string;
+  source: string;
+  fileNames: string[];
+  batchIds: string[];
+  newCount: number;
+  dupCount: number;
+  hidden: boolean;
+  importedAt: Date;
+  count: number;
+};
+
+async function fetchRecent(): Promise<ImportEntry[]> {
+  const batches = await prisma.importBatch.findMany({
+    take: 100,
     orderBy: { importedAt: 'desc' },
     include: { account: { include: { broker: true } } },
   });
+
+  const csvEntries: ImportEntry[] = [];
+  const apiGroups = new Map<string, ImportEntry>();
+  for (const b of batches) {
+    if (b.source === 'moomoo-api') {
+      const key = `${b.account.broker.code}|moomoo-api`;
+      const existing = apiGroups.get(key);
+      if (existing) {
+        existing.batchIds.push(b.id);
+        existing.newCount += b.newCount;
+        existing.dupCount += b.dupCount;
+        if (b.importedAt > existing.importedAt) existing.importedAt = b.importedAt;
+        // hidden は全 batch が hidden の場合のみ true 扱い
+        existing.hidden = existing.hidden && b.hidden;
+        existing.count++;
+      } else {
+        apiGroups.set(key, {
+          key,
+          brokerCode: b.account.broker.code,
+          source: 'moomoo-api',
+          fileNames: [],
+          batchIds: [b.id],
+          newCount: b.newCount,
+          dupCount: b.dupCount,
+          hidden: b.hidden,
+          importedAt: b.importedAt,
+          count: 1,
+        });
+      }
+    } else {
+      csvEntries.push({
+        key: b.id,
+        brokerCode: b.account.broker.code,
+        source: b.source,
+        fileNames: b.fileName ? [b.fileName] : [],
+        batchIds: [b.id],
+        newCount: b.newCount,
+        dupCount: b.dupCount,
+        hidden: b.hidden,
+        importedAt: b.importedAt,
+        count: 1,
+      });
+    }
+  }
+
+  return [...csvEntries, ...apiGroups.values()]
+    .sort((a, b) => b.importedAt.getTime() - a.importedAt.getTime())
+    .slice(0, 50);
 }
 
-// ImportBatch に含まれる Execution の (instrumentId, accountId, marginType) 集合を返す。
-// hide/unhide/delete のあと、これらの group だけ Round を再構築する。
-async function affectedGroupsOf(batchId: string) {
+// 複数 ImportBatch に含まれる Execution の (instrumentId, accountId, marginType) 集合を返す。
+async function affectedGroupsOf(batchIds: string[]) {
   const execs = await prisma.execution.findMany({
-    where: { importBatchId: batchId },
+    where: { importBatchId: { in: batchIds } },
     select: { instrumentId: true, accountId: true, marginType: true },
   });
   return distinctGroups(execs);
 }
 
+function parseBatchIds(raw: string): string[] {
+  return raw.split(',').map((s) => s.trim()).filter(Boolean);
+}
+
 async function setHidden(formData: FormData) {
   'use server';
-  const batchId = String(formData.get('batchId') ?? '');
+  const batchIds = parseBatchIds(String(formData.get('batchIds') ?? ''));
+  if (batchIds.length === 0) return;
   const hiddenStr = String(formData.get('hidden') ?? '');
-  if (!batchId) redirect('/import?error=' + encodeURIComponent('batchId が空'));
   const hidden = hiddenStr === 'true';
-  const groups = await affectedGroupsOf(batchId);
-  await prisma.importBatch.update({ where: { id: batchId }, data: { hidden } });
-  const { rounds } = await reaggregateGroups(groups);
+  const groups = await affectedGroupsOf(batchIds);
+  await prisma.importBatch.updateMany({ where: { id: { in: batchIds } }, data: { hidden } });
+  await reaggregateGroups(groups);
   revalidatePath('/import');
   revalidatePath('/trades');
   revalidatePath('/trades/list');
   revalidatePath('/stats');
   revalidatePath('/');
-  redirect(
-    '/import?ok=' +
-      encodeURIComponent(
-        `${hidden ? '非表示' : '再表示'}: ${groups.length} グループ / Round ${rounds} 再生成`,
-      ),
-  );
 }
 
 async function deleteBatch(formData: FormData) {
   'use server';
-  const batchId = String(formData.get('batchId') ?? '');
-  if (!batchId) redirect('/import?error=' + encodeURIComponent('batchId が空'));
-  const confirm = String(formData.get('confirm') ?? '');
-  if (confirm !== 'yes') {
-    redirect('/import?error=' + encodeURIComponent('削除確認が取れていません'));
-  }
-  const groups = await affectedGroupsOf(batchId);
-  let deletedExecs = 0;
+  const batchIds = parseBatchIds(String(formData.get('batchIds') ?? ''));
+  if (batchIds.length === 0) return;
+  const groups = await affectedGroupsOf(batchIds);
   await prisma.$transaction(async (tx) => {
-    const r = await tx.execution.deleteMany({ where: { importBatchId: batchId } });
-    deletedExecs = r.count;
-    await tx.importBatch.delete({ where: { id: batchId } });
+    await tx.execution.deleteMany({ where: { importBatchId: { in: batchIds } } });
+    await tx.importBatch.deleteMany({ where: { id: { in: batchIds } } });
   });
-  const { rounds } = await reaggregateGroups(groups);
+  await reaggregateGroups(groups);
   revalidatePath('/import');
   revalidatePath('/trades');
   revalidatePath('/trades/list');
   revalidatePath('/stats');
   revalidatePath('/');
-  redirect(
-    '/import?ok=' +
-      encodeURIComponent(
-        `削除: Execution ${deletedExecs} 件 / ${groups.length} グループ / Round ${rounds} 再生成`,
-      ),
-  );
 }
 
 export default async function ImportPage({
@@ -253,37 +315,40 @@ export default async function ImportPage({
             <div className="px-5 py-6 text-center text-sm text-[var(--muted)]">まだありません。</div>
           ) : (
             <ul className="divide-y divide-[var(--border)] text-sm">
-              {recent.map((b) => (
+              {recent.map((e) => (
                 <li
-                  key={b.id}
+                  key={e.key}
                   className={`flex flex-col gap-2 px-5 py-3 sm:flex-row sm:items-center sm:justify-between ${
-                    b.hidden ? 'opacity-60' : ''
+                    e.hidden ? 'opacity-60' : ''
                   }`}
                 >
                   <div className="min-w-0">
-                    <div className="font-mono text-xs text-[var(--muted)]">{b.id}</div>
                     <div className="flex flex-wrap items-center gap-2">
-                      <Pill tone="primary">{b.account.broker.code}</Pill>
-                      <span className="text-[var(--muted-strong)]">{b.source}</span>
-                      <span className="truncate">{b.fileName ?? '(no file)'}</span>
-                      {b.hidden && <Pill tone="neutral">非表示中</Pill>}
+                      <Pill tone="primary">{e.brokerCode}</Pill>
+                      <span className="text-[var(--muted-strong)]">{e.source}</span>
+                      {e.fileNames.length > 0 && (
+                        <span className="truncate">{e.fileNames.join(' / ')}</span>
+                      )}
+                      {e.source === 'moomoo-api' && (
+                        <span className="text-xs text-[var(--muted)]">×{e.count} 回</span>
+                      )}
+                      {e.hidden && <Pill tone="neutral">非表示中</Pill>}
                     </div>
                   </div>
                   <div className="flex items-center gap-3">
                     <div className="text-right">
                       <div>
-                        <Pill tone="pos">新規 {b.newCount}</Pill>
+                        <Pill tone="pos">新規 {e.newCount}</Pill>
                         <span className="mx-1" />
-                        <Pill tone="neutral">重複 {b.dupCount}</Pill>
+                        <Pill tone="neutral">重複 {e.dupCount}</Pill>
                       </div>
                       <div className="mt-1 text-xs text-[var(--muted)]">
-                        {b.importedAt.toLocaleString('ja-JP')}
+                        {e.importedAt.toLocaleString('ja-JP')}
                       </div>
                     </div>
                     <ImportBatchActions
-                      batchId={b.id}
-                      hidden={b.hidden}
-                      newCount={b.newCount}
+                      batchIds={e.batchIds}
+                      hidden={e.hidden}
                       setHiddenAction={setHidden}
                       deleteAction={deleteBatch}
                     />

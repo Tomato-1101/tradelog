@@ -26,7 +26,7 @@ function avg(xs: number[]): number | null {
 function kpiOf(rounds: StatsRound[]): Kpis {
   const closed = rounds.filter((r) => r.closedAt);
   const pnls = closed.map((r) => num(r.realizedPnlJpy));
-  const feesJpy = closed.map((r) => num(r.feesTotal)); // 注: ccy ごちゃ混ぜの概算
+  const feesJpy = closed.map((r) => num(r.feesTotalJpy));
   const wins = pnls.filter((p) => p > 0);
   const losses = pnls.filter((p) => p < 0);
   const flats = pnls.filter((p) => p === 0);
@@ -132,16 +132,24 @@ function equityOf(rounds: StatsRound[]): EquityPoint[] {
   let cumNet = 0;
   return closed.map((r) => {
     cum += num(r.realizedPnlJpy);
-    cumNet += num(r.realizedPnlJpy) - num(r.feesTotal);
+    cumNet += num(r.realizedPnlJpy) - num(r.feesTotalJpy);
     return { t: r.closedAt!, cum, cumNet };
   });
 }
 
 function monthlyOf(rounds: StatsRound[]): MonthlyPnl[] {
+  // 日次カレンダー (dailyOf) と月の境界を揃えるため JST 基準で yyyy-mm を作る。
+  // ISO 文字列 (UTC) のままだと米株の深夜クローズが前月に落ちて日次合計と食い違う。
+  const jstFmt = new Intl.DateTimeFormat('en-CA', {
+    timeZone: 'Asia/Tokyo',
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+  });
   const map = new Map<string, { pnlJpy: number; rounds: number }>();
   for (const r of rounds) {
     if (!r.closedAt) continue;
-    const ym = r.closedAt.slice(0, 7);
+    const ym = jstFmt.format(new Date(r.closedAt)).slice(0, 7);
     const cur = map.get(ym) ?? { pnlJpy: 0, rounds: 0 };
     cur.pnlJpy += num(r.realizedPnlJpy);
     cur.rounds += 1;
@@ -152,21 +160,46 @@ function monthlyOf(rounds: StatsRound[]): MonthlyPnl[] {
     .sort((a, b) => a.ym.localeCompare(b.ym));
 }
 
+// OPTION_US は同じ underlying でも expiry/strike/right が違えば別物として集計する。
+// Equity は symbol だけで集約。
+function aggregationKey(r: StatsRound): string {
+  if (r.instrumentKind === 'OPTION_US') {
+    const exp = r.expiry ? r.expiry.slice(0, 10) : '?';
+    return `${r.symbol}|${exp}|${r.strike ?? '?'}|${r.right ?? '?'}`;
+  }
+  return r.symbol;
+}
+
+function aggregationLabel(r: StatsRound): string {
+  if (r.instrumentKind === 'OPTION_US') {
+    const exp = r.expiry ? r.expiry.slice(2, 10).replace(/-/g, '-') : '?';
+    const rt = r.right === 'CALL' ? 'C' : r.right === 'PUT' ? 'P' : '?';
+    return `${r.symbol} ${exp} ${r.strike ?? '?'}${rt}`;
+  }
+  return r.symbol;
+}
+
 function bySymbolOf(rounds: StatsRound[]): SymbolPnl[] {
-  const map = new Map<string, { instrumentName: string | null; rounds: number; pnlJpy: number }>();
+  const map = new Map<
+    string,
+    { label: string; symbol: string; instrumentName: string | null; rounds: number; pnlJpy: number }
+  >();
   for (const r of rounds) {
     if (!r.closedAt) continue;
-    const cur = map.get(r.symbol) ?? {
+    const key = aggregationKey(r);
+    const cur = map.get(key) ?? {
+      label: aggregationLabel(r),
+      symbol: r.symbol,
       instrumentName: r.instrumentName,
       rounds: 0,
       pnlJpy: 0,
     };
     cur.rounds += 1;
     cur.pnlJpy += num(r.realizedPnlJpy);
-    map.set(r.symbol, cur);
+    map.set(key, cur);
   }
   return [...map.entries()]
-    .map(([symbol, v]) => ({ symbol, ...v }))
+    .map(([key, v]) => ({ key, ...v }))
     .sort((a, b) => b.pnlJpy - a.pnlJpy);
 }
 

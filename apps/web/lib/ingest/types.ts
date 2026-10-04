@@ -54,7 +54,17 @@ export type ParseWarning = {
   message: string;
 };
 
+// SBI CSV のフォーマット種別。全期間 CSV と当日約定 CSV を import 側で見分け、
+// 全期間 CSV 受領時に daily 由来 Execution を物理削除→上書きするために必要。
+// 旧 (注文一覧_約定履歴) と未判定はまとめて 'legacy' / 'unknown'。
+export type SbiCsvFormat = 'third-savefile' | 'new-daily' | 'legacy' | 'unknown';
+
 export type ParseResult = {
   executions: NormalizedExecution[];
   warnings: ParseWarning[];
+  // 検出されたフォーマット。SBI 以外 (moomoo) では 'unknown'。
+  format?: SbiCsvFormat;
+  // executions の executedAt の範囲。daily 上書き時の削除範囲決定に使う。
+  earliestDate?: Date | null;
+  latestDate?: Date | null;
 };

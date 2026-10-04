@@ -54,6 +54,8 @@ export default async function TradesListPage({
   searchParams: Promise<{
     sort?: string;
     broker?: string;
+    instKind?: string;
+    marginType?: string;
     symbol?: string;
     openOnly?: string;
     page?: string;
@@ -62,10 +64,17 @@ export default async function TradesListPage({
   const sp = await searchParams;
   const sort = parseSort(sp.sort);
   const broker = sp.broker?.trim() || undefined;
+  const instKind = sp.instKind?.trim() || undefined;
+  const marginType = sp.marginType?.trim() || undefined;
   const symbol = sp.symbol?.trim() || undefined;
   const openOnly = sp.openOnly === '1';
   const pageSize = 50;
   const page = Math.max(1, Number(sp.page) || 1);
+
+  const VALID_KIND = new Set(['EQUITY_JP', 'EQUITY_US', 'OPTION_US']);
+  const VALID_MARGIN = new Set(['CASH', 'MARGIN_LONG', 'MARGIN_SHORT']);
+  const kindFilter = instKind && VALID_KIND.has(instKind) ? (instKind as 'EQUITY_JP' | 'EQUITY_US' | 'OPTION_US') : undefined;
+  const marginFilter = marginType && VALID_MARGIN.has(marginType) ? (marginType as 'CASH' | 'MARGIN_LONG' | 'MARGIN_SHORT') : undefined;
 
   const where = {
     ...(openOnly ? { closedAt: null } : {}),
@@ -73,6 +82,8 @@ export default async function TradesListPage({
     ...(broker
       ? { account: { broker: { code: broker as 'SBI' | 'MOOMOO' } } }
       : {}),
+    ...(kindFilter ? { instrument: { ...(symbol ? { symbol: { contains: symbol } } : {}), kind: kindFilter } } : {}),
+    ...(marginFilter ? { marginType: marginFilter } : {}),
   };
 
   const [rounds, total] = await Promise.all([
@@ -110,7 +121,7 @@ export default async function TradesListPage({
       <Card className="mt-6">
         <CardHeader title="フィルタ" />
         <CardBody>
-          <form className="grid grid-cols-1 gap-3 md:grid-cols-5">
+          <form className="grid grid-cols-1 gap-3 md:grid-cols-6">
             <label className="text-xs font-medium text-[var(--muted)]">
               ブローカー
               <select
@@ -121,6 +132,32 @@ export default async function TradesListPage({
                 <option value="">すべて</option>
                 <option value="SBI">SBI</option>
                 <option value="MOOMOO">MOOMOO</option>
+              </select>
+            </label>
+            <label className="text-xs font-medium text-[var(--muted)]">
+              商品種別
+              <select
+                name="instKind"
+                defaultValue={instKind ?? ''}
+                className="mt-1 w-full rounded-md border border-[var(--border)] bg-[var(--surface)] px-2 py-1.5 text-sm"
+              >
+                <option value="">すべて</option>
+                <option value="EQUITY_JP">日本株</option>
+                <option value="EQUITY_US">米株</option>
+                <option value="OPTION_US">米株オプション</option>
+              </select>
+            </label>
+            <label className="text-xs font-medium text-[var(--muted)]">
+              取引区分
+              <select
+                name="marginType"
+                defaultValue={marginType ?? ''}
+                className="mt-1 w-full rounded-md border border-[var(--border)] bg-[var(--surface)] px-2 py-1.5 text-sm"
+              >
+                <option value="">すべて</option>
+                <option value="CASH">現物</option>
+                <option value="MARGIN_LONG">信用買</option>
+                <option value="MARGIN_SHORT">信用売</option>
               </select>
             </label>
             <label className="text-xs font-medium text-[var(--muted)]">
@@ -269,6 +306,8 @@ function buildQuery(sp: Record<string, string | undefined>, page: number): strin
   const usp = new URLSearchParams();
   if (sp.sort) usp.set('sort', sp.sort);
   if (sp.broker) usp.set('broker', sp.broker);
+  if (sp.instKind) usp.set('instKind', sp.instKind);
+  if (sp.marginType) usp.set('marginType', sp.marginType);
   if (sp.symbol) usp.set('symbol', sp.symbol);
   if (sp.openOnly) usp.set('openOnly', sp.openOnly);
   usp.set('page', String(page));

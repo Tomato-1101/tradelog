@@ -5,6 +5,11 @@ export type StatsRound = {
   instrumentId: number;
   symbol: string;
   instrumentName: string | null;
+  // 集約キー区別用。OPTION_US は同じ underlying でも expiry/strike/right が違えば別物として扱う。
+  instrumentKind: 'EQUITY_JP' | 'EQUITY_US' | 'OPTION_US';
+  expiry: string | null;
+  strike: string | null;
+  right: 'CALL' | 'PUT' | null;
   ccy: string;
   marginType: 'CASH' | 'MARGIN_LONG' | 'MARGIN_SHORT';
   direction: 'BUY' | 'SELL';
@@ -15,6 +20,7 @@ export type StatsRound = {
   realizedPnl: string;
   realizedPnlJpy: string;
   feesTotal: string;
+  feesTotalJpy: string;
   holdSeconds: number | null;
 };
 
@@ -26,7 +32,7 @@ export type Kpis = {
   flats: number;
   winRate: number;        // 0..1
   totalPnlJpy: number;
-  totalFeesJpy: number;   // 概算 (ccy 別 fees を fxRate で換算しない簡易版)
+  totalFeesJpy: number;   // 各約定の fxRateToJpy で按分済み (Round.feesTotalJpy の合計)
   netPnlJpy: number;
   avgWin: number;
   avgLoss: number;        // 負値 (損失なので負)
@@ -59,6 +65,10 @@ export type MonthlyPnl = {
 };
 
 export type SymbolPnl = {
+  // 集約キー (OPTION_US は "NVDA|2026-05-15|500|CALL" のように合成、Equity は symbol)
+  key: string;
+  // 表示用ラベル (OPTION_US は "NVDA 26-05-15 500C")
+  label: string;
   symbol: string;
   instrumentName: string | null;
   rounds: number;

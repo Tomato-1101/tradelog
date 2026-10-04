@@ -16,6 +16,8 @@ function signedQty(side: Side, qty: Decimal): Decimal {
 }
 
 function newDraft(e: ExecForRound, firstSigned: Decimal): RoundDraft {
+  const feeSum = new Decimal(e.fee).plus(e.tax);
+  const fxRate = new Decimal(e.fxRateToJpy);
   return {
     instrumentId: e.instrumentId,
     accountId: e.accountId,
@@ -27,7 +29,8 @@ function newDraft(e: ExecForRound, firstSigned: Decimal): RoundDraft {
     avgEntryPrice: e.price,
     realizedPnl: '0',
     realizedPnlJpy: '0',
-    feesTotal: addStr(e.fee, e.tax),
+    feesTotal: feeSum.toString(),
+    feesTotalJpy: feeSum.times(fxRate).toString(),
     holdSeconds: null,
     executions: [],
   };
@@ -87,6 +90,7 @@ export function buildRoundsForGroup(execs: ExecForRound[]): RoundDraft[] {
       pushRole('SCALE_IN', e.id);
       cur!.qtyOpened = new Decimal(cur!.qtyOpened).plus(sQty.abs()).toString();
       cur!.feesTotal = new Decimal(cur!.feesTotal).plus(feeSum).toString();
+      cur!.feesTotalJpy = new Decimal(cur!.feesTotalJpy).plus(feeSum.times(fxRate)).toString();
       cur!.avgEntryPrice = avgPx.toString();
       continue;
     }
@@ -104,6 +108,7 @@ export function buildRoundsForGroup(execs: ExecForRound[]): RoundDraft[] {
       .plus(pnl.times(fxRate))
       .toString();
     cur!.feesTotal = new Decimal(cur!.feesTotal).plus(feeSum).toString();
+    cur!.feesTotalJpy = new Decimal(cur!.feesTotalJpy).plus(feeSum.times(fxRate)).toString();
     pushRole('SCALE_OUT', e.id);
 
     // closeSign は pos を 0 に近づける向きの符号付き量。
@@ -132,6 +137,7 @@ export function buildRoundsForGroup(execs: ExecForRound[]): RoundDraft[] {
         // FLIP の場合 newDraft が feeSum 加算済みなのを取り消し、後段で扱わない
         // (反対売買時にすでに加算済み)
         cur.feesTotal = '0';
+        cur.feesTotalJpy = '0';
         cur.executions.push({ id: e.id, role: 'FLIP' });
       }
     }

@@ -61,9 +61,7 @@ export default function MonthlyBars({
         return (
           <g key={m.ym}>
             <rect x={x(i)} y={top} width={barW} height={h} fill={color} opacity={0.85}>
-              <title>
-                {m.ym} {Math.round(m.pnlJpy).toLocaleString()} JPY · {m.rounds} ラウンド
-              </title>
+              <title>{`${m.ym} ${Math.round(m.pnlJpy).toLocaleString()} JPY · ${m.rounds} ラウンド`}</title>
             </rect>
             {i % Math.max(1, Math.ceil(months.length / 12)) === 0 && (
               <text

@@ -47,6 +47,8 @@ export type RoundDraft = {
   realizedPnlJpy: string;
   /** 手数料 + 税金の合計 (取引通貨ベース) */
   feesTotal: string;
+  /** 手数料 + 税金の JPY 換算合計 (各約定の fxRateToJpy で按分) */
+  feesTotalJpy: string;
   /** holdSeconds: closedAt - openedAt 秒 */
   holdSeconds: number | null;
   /** 構成 Execution の id + ロール */

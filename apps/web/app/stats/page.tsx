@@ -10,24 +10,35 @@ import MoomooAccountSummary from '@/components/dashboard/MoomooAccountSummary';
 import { Card, CardBody, CardHeader } from '@/components/ui/Card';
 import Stat from '@/components/ui/Stat';
 import PeriodFilter from '@/components/ui/PeriodFilter';
+import RoundFilterForm from '@/components/ui/RoundFilterForm';
 import { parsePeriodParams, periodToRange } from '@/lib/period';
+import { getEffectiveRoundFilter, roundFilterToWhere } from '@/lib/round-filter';
 
 export const dynamic = 'force-dynamic';
 
 export default async function StatsPage({
   searchParams,
 }: {
-  searchParams: Promise<{ preset?: string; from?: string; to?: string }>;
+  searchParams: Promise<{
+    preset?: string;
+    from?: string;
+    to?: string;
+    broker?: string;
+    instKind?: string;
+    marginType?: string;
+  }>;
 }) {
   const sp = await searchParams;
   const period = parsePeriodParams(sp);
   const range = periodToRange(period);
+  const filter = await getEffectiveRoundFilter(sp);
+  const filterWhere = roundFilterToWhere(filter);
   const closedAtFilter =
     range.gte || range.lte
       ? { closedAt: { not: null, ...(range.gte ? { gte: range.gte } : {}), ...(range.lte ? { lte: range.lte } : {}) } }
       : {};
   const rows = await prisma.round.findMany({
-    where: closedAtFilter,
+    where: { ...closedAtFilter, ...filterWhere },
     orderBy: { openedAt: 'asc' },
     include: { instrument: true },
   });
@@ -37,6 +48,10 @@ export default async function StatsPage({
     instrumentId: r.instrumentId,
     symbol: r.instrument.symbol,
     instrumentName: r.instrument.name,
+    instrumentKind: r.instrument.kind as 'EQUITY_JP' | 'EQUITY_US' | 'OPTION_US',
+    expiry: r.instrument.expiry?.toISOString() ?? null,
+    strike: r.instrument.strike?.toString() ?? null,
+    right: (r.instrument.right ?? null) as 'CALL' | 'PUT' | null,
     ccy: r.instrument.ccy,
     marginType: r.marginType,
     direction: r.direction,
@@ -47,6 +62,7 @@ export default async function StatsPage({
     realizedPnl: r.realizedPnl.toString(),
     realizedPnlJpy: r.realizedPnlJpy.toString(),
     feesTotal: r.feesTotal.toString(),
+    feesTotalJpy: r.feesTotalJpy.toString(),
     holdSeconds: r.holdSeconds,
   }));
 
@@ -69,10 +85,15 @@ export default async function StatsPage({
         </p>
       </div>
 
-      <div className="mt-4">
+      <div className="mt-4 flex flex-wrap items-center gap-4">
         <Suspense fallback={null}>
           <PeriodFilter storageKey="statsPeriod" />
         </Suspense>
+        <RoundFilterForm
+          basePath="/stats"
+          filter={filter}
+          preserve={{ preset: sp.preset, from: sp.from, to: sp.to }}
+        />
       </div>
 
       <Suspense fallback={null}>
@@ -164,8 +185,8 @@ export default async function StatsPage({
                   </tr>
                 )}
                 {s.bySymbol.map((row) => (
-                  <tr key={row.symbol} className="border-t border-[var(--border)]">
-                    <td className="px-5 py-2 font-mono">{row.symbol}</td>
+                  <tr key={row.key} className="border-t border-[var(--border)]">
+                    <td className="px-5 py-2 font-mono">{row.label}</td>
                     <td className="px-5 py-2 text-[var(--muted-strong)]">{row.instrumentName ?? '—'}</td>
                     <td className="px-5 py-2 text-right">{row.rounds}</td>
                     <td className={`px-5 py-2 text-right font-mono tabular-nums ${row.pnlJpy >= 0 ? 'text-[var(--pos)]' : 'text-[var(--neg)]'}`}>

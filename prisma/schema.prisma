@@ -147,6 +147,9 @@ model Round {
   realizedPnl     Decimal
   realizedPnlJpy  Decimal
   feesTotal       Decimal
+  // 手数料+税の JPY 換算合計。各約定の fxRateToJpy で按分済み。
+  // ccy 混在ラウンドの netPnlJpy 計算用 (USD 手数料を JPY pnl から引いてしまう事故を防ぐ)。
+  feesTotalJpy    Decimal    @default(0)
   holdSeconds     Int?
   rMultiple       Decimal?
   executionsJson  String // 構成 Execution の id 配列と role: [{ id, role }]

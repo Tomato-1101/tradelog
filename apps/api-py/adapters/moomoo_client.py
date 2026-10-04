@@ -429,6 +429,38 @@ async def fetch_us_history_orders(acc_id: int, start: str, end: str) -> list[dic
     return await asyncio.to_thread(fetch_us_history_orders_sync, acc_id, start, end)
 
 
+def fetch_us_order_fees_sync(acc_id: int, order_id_list: list[str]) -> dict[str, float]:
+    """order_id ごとの手数料合計 (fee_amount) を返す。
+    history_deal_list_query は手数料を返さないため別経路 (order_fee_query) で取得する必要がある。
+    OpenAPI は一度に渡せる order_id 数に制限 (ドキュメント上 100 程度) があるため 100 件ずつバッチ分割。"""
+    if not order_id_list:
+        return {}
+    ctx = _get_trade_ctx_us()
+    fees: dict[str, float] = {}
+    BATCH = 100
+    for i in range(0, len(order_id_list), BATCH):
+        chunk = order_id_list[i : i + BATCH]
+        ret, data = ctx.order_fee_query(
+            order_id_list=chunk,
+            trd_env=TrdEnv.REAL,
+            acc_id=acc_id,
+        )
+        if ret != RET_OK:
+            raise RuntimeError(f"order_fee_query failed: {data}")
+        for _, row in data.iterrows():
+            oid = str(row["order_id"])
+            amt_raw = row["fee_amount"]
+            try:
+                fees[oid] = float(amt_raw) if amt_raw not in (None, "", "N/A") else 0.0
+            except (TypeError, ValueError):
+                fees[oid] = 0.0
+    return fees
+
+
+async def fetch_us_order_fees(acc_id: int, order_id_list: list[str]) -> dict[str, float]:
+    return await asyncio.to_thread(fetch_us_order_fees_sync, acc_id, order_id_list)
+
+
 # ------- ヘルパ -------
 
 def default_lookback(days: int = 90) -> tuple[str, str]:
