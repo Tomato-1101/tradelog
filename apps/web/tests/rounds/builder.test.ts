@@ -1,252 +1,317 @@
 import { describe, expect, it } from 'vitest';
-import {
-  buildRoundsForGroup,
-  buildRoundsFromExecutions,
-} from '@/lib/rounds/builder';
+import Decimal from 'decimal.js';
+import { buildPaperRounds, buildSbiRounds, compareExecs } from '@/lib/rounds/builder';
 import type { ExecForRound } from '@/lib/rounds/types';
 
 let nextId = 1;
-function ex(partial: Partial<ExecForRound>): ExecForRound {
+function ex(p: Partial<ExecForRound>): ExecForRound {
+  const id = p.id ?? `e${String(nextId++).padStart(4, '0')}`;
   return {
-    id: partial.id ?? nextId++,
-    instrumentId: partial.instrumentId ?? 1,
-    accountId: partial.accountId ?? 1,
-    marginType: partial.marginType ?? 'CASH',
-    executedAt: partial.executedAt ?? new Date('2026-05-14T00:00:00Z'),
-    side: partial.side ?? 'BUY',
-    qty: partial.qty ?? '100',
-    price: partial.price ?? '100',
-    fee: partial.fee ?? '0',
-    tax: partial.tax ?? '0',
-    fxRateToJpy: partial.fxRateToJpy ?? '1',
-    multiplier: partial.multiplier,
+    id,
+    source: p.source ?? 'SBI',
+    instrumentId: p.instrumentId ?? 1,
+    account: p.account ?? 'default',
+    marginType: p.marginType === undefined ? 'CASH' : p.marginType,
+    positionId: p.positionId ?? null,
+    executedAt: p.executedAt ?? new Date('2026-05-14T00:00:00Z'),
+    timePrecision: p.timePrecision ?? 'ms',
+    seq: p.seq ?? 0,
+    side: p.side ?? 'BUY',
+    qty: p.qty ?? '100',
+    price: p.price === undefined ? '100' : p.price,
+    fee: p.fee ?? '0',
+    priceStatus: p.priceStatus ?? 'CONFIRMED',
+    dedupeHash: p.dedupeHash === undefined ? `hash-${id}-0123456789abcdef` : p.dedupeHash,
   };
 }
+const t = (hhmm: string, day = '2026-05-14') => new Date(`${day}T${hhmm}:00+09:00`);
 
-describe('buildRoundsForGroup: 基本ケース', () => {
+describe('SBI: 基本ケース（旧テストの移植）', () => {
   it('long-simple: BUY 100 / SELL 100 → 1 ラウンド CLOSE', () => {
-    const rounds = buildRoundsForGroup([
-      ex({ side: 'BUY', qty: '100', price: '100', executedAt: new Date('2026-05-14T00:00:00Z') }),
-      ex({ side: 'SELL', qty: '100', price: '110', executedAt: new Date('2026-05-14T01:00:00Z') }),
+    const rounds = buildSbiRounds([
+      ex({ side: 'BUY', price: '100', executedAt: t('09:00') }),
+      ex({ side: 'SELL', price: '110', executedAt: t('10:00') }),
     ]);
     expect(rounds).toHaveLength(1);
     const r = rounds[0];
-    expect(r.direction).toBe('BUY');
+    expect(r.direction).toBe('LONG');
+    expect(r.status).toBe('CLOSED');
     expect(r.closedAt?.toISOString()).toBe('2026-05-14T01:00:00.000Z');
     expect(r.qtyOpened).toBe('100');
+    expect(r.remainingQty).toBe('0');
     expect(r.avgEntryPrice).toBe('100');
-    expect(r.realizedPnl).toBe('1000'); // (110-100)*100
+    expect(r.avgExitPrice).toBe('110');
+    expect(r.realizedPnl).toBe('1000');
+    expect(r.netPnl).toBe('1000');
     expect(r.holdSeconds).toBe(3600);
     expect(r.executions.map((e) => e.role)).toEqual(['OPEN', 'CLOSE']);
   });
 
   it('long-partial: BUY 1.0 / SELL 0.5 / SELL 0.5 → SCALE_OUT + CLOSE', () => {
-    const rounds = buildRoundsForGroup([
-      ex({ side: 'BUY', qty: '1', price: '100' }),
-      ex({ side: 'SELL', qty: '0.5', price: '110' }),
-      ex({ side: 'SELL', qty: '0.5', price: '120' }),
+    const [r] = buildSbiRounds([
+      ex({ side: 'BUY', qty: '1', price: '100', executedAt: t('09:00') }),
+      ex({ side: 'SELL', qty: '0.5', price: '110', executedAt: t('09:01') }),
+      ex({ side: 'SELL', qty: '0.5', price: '120', executedAt: t('09:02') }),
     ]);
-    expect(rounds).toHaveLength(1);
-    const r = rounds[0];
-    expect(r.realizedPnl).toBe('15'); // (110-100)*0.5 + (120-100)*0.5
+    expect(r.realizedPnl).toBe('15');
+    expect(r.avgExitPrice).toBe('115');
     expect(r.executions.map((e) => e.role)).toEqual(['OPEN', 'SCALE_OUT', 'CLOSE']);
     expect(r.qtyOpened).toBe('1');
   });
 
   it('long-scaled-in: BUY 0.5 / BUY 0.5 / SELL 1.0 → 加重平均', () => {
-    const rounds = buildRoundsForGroup([
-      ex({ side: 'BUY', qty: '0.5', price: '100' }),
-      ex({ side: 'BUY', qty: '0.5', price: '120' }),
-      ex({ side: 'SELL', qty: '1', price: '130' }),
+    const [r] = buildSbiRounds([
+      ex({ side: 'BUY', qty: '0.5', price: '100', executedAt: t('09:00') }),
+      ex({ side: 'BUY', qty: '0.5', price: '120', executedAt: t('09:01') }),
+      ex({ side: 'SELL', qty: '1', price: '130', executedAt: t('09:02') }),
     ]);
-    expect(rounds).toHaveLength(1);
-    const r = rounds[0];
-    expect(r.avgEntryPrice).toBe('110'); // (0.5*100 + 0.5*120) / 1
-    expect(r.realizedPnl).toBe('20'); // (130-110)*1
-    expect(r.qtyOpened).toBe('1');
+    expect(r.avgEntryPrice).toBe('110');
+    expect(r.realizedPnl).toBe('20');
     expect(r.executions.map((e) => e.role)).toEqual(['OPEN', 'SCALE_IN', 'CLOSE']);
   });
 
   it('same-day-restart: BUY/SELL/BUY/SELL → 2 ラウンド', () => {
-    const rounds = buildRoundsForGroup([
-      ex({ side: 'BUY', qty: '100', price: '100', executedAt: new Date('2026-05-14T00:00:00Z') }),
-      ex({ side: 'SELL', qty: '100', price: '110', executedAt: new Date('2026-05-14T01:00:00Z') }),
-      ex({ side: 'BUY', qty: '100', price: '105', executedAt: new Date('2026-05-14T02:00:00Z') }),
-      ex({ side: 'SELL', qty: '100', price: '108', executedAt: new Date('2026-05-14T03:00:00Z') }),
+    const rounds = buildSbiRounds([
+      ex({ side: 'BUY', price: '100', executedAt: t('09:00') }),
+      ex({ side: 'SELL', price: '110', executedAt: t('10:00') }),
+      ex({ side: 'BUY', price: '105', executedAt: t('11:00') }),
+      ex({ side: 'SELL', price: '108', executedAt: t('13:00') }),
+    ]);
+    expect(rounds.map((r) => r.realizedPnl)).toEqual(['1000', '300']);
+    expect(new Set(rounds.map((r) => r.id)).size).toBe(2);
+  });
+
+  it('short-simple: SELL 100 / BUY 100 → ショート', () => {
+    const [r] = buildSbiRounds([
+      ex({ side: 'SELL', price: '100', executedAt: t('09:00') }),
+      ex({ side: 'BUY', price: '90', executedAt: t('09:10') }),
+    ]);
+    expect(r.direction).toBe('SHORT');
+    expect(r.realizedPnl).toBe('1000');
+  });
+
+  it('short-scaled-out: SELL 1.0 / BUY 0.4 / BUY 0.6', () => {
+    const [r] = buildSbiRounds([
+      ex({ side: 'SELL', qty: '1', price: '100', executedAt: t('09:00') }),
+      ex({ side: 'BUY', qty: '0.4', price: '90', executedAt: t('09:01') }),
+      ex({ side: 'BUY', qty: '0.6', price: '80', executedAt: t('09:02') }),
+    ]);
+    expect(r.realizedPnl).toBe('16');
+  });
+
+  it('flip-overfill: BUY 100 / SELL 150 → ロング CLOSE + ショート OPEN（ID は別）', () => {
+    const rounds = buildSbiRounds([
+      ex({ side: 'BUY', price: '100', executedAt: t('09:00') }),
+      ex({ side: 'SELL', qty: '150', price: '110', executedAt: t('10:00') }),
     ]);
     expect(rounds).toHaveLength(2);
+    expect(rounds[0].direction).toBe('LONG');
     expect(rounds[0].realizedPnl).toBe('1000');
-    expect(rounds[1].realizedPnl).toBe('300');
-  });
-});
-
-describe('buildRoundsForGroup: ショート', () => {
-  it('short-simple: SELL 100 / BUY 100 → 1 ショートラウンド', () => {
-    const rounds = buildRoundsForGroup([
-      ex({ side: 'SELL', qty: '100', price: '100' }),
-      ex({ side: 'BUY', qty: '100', price: '90' }),
-    ]);
-    expect(rounds).toHaveLength(1);
-    expect(rounds[0].direction).toBe('SELL');
-    expect(rounds[0].realizedPnl).toBe('1000'); // (100-90)*100
-  });
-
-  it('short-scaled-out: SELL 1.0 / BUY 0.4 / BUY 0.6 → 1 ラウンド', () => {
-    const rounds = buildRoundsForGroup([
-      ex({ side: 'SELL', qty: '1', price: '100' }),
-      ex({ side: 'BUY', qty: '0.4', price: '90' }),
-      ex({ side: 'BUY', qty: '0.6', price: '80' }),
-    ]);
-    expect(rounds).toHaveLength(1);
-    // (100-90)*0.4 + (100-80)*0.6 = 4 + 12 = 16
-    expect(rounds[0].realizedPnl).toBe('16');
-  });
-});
-
-describe('buildRoundsForGroup: 反対売買 / オーバーフィル', () => {
-  it('flip-overfill: BUY 100 / SELL 150 → 1 ロング CLOSE + 1 ショート OPEN', () => {
-    const rounds = buildRoundsForGroup([
-      ex({ side: 'BUY', qty: '100', price: '100', executedAt: new Date('2026-05-14T00:00:00Z') }),
-      ex({ side: 'SELL', qty: '150', price: '110', executedAt: new Date('2026-05-14T01:00:00Z') }),
-    ]);
-    expect(rounds).toHaveLength(2);
-    expect(rounds[0].direction).toBe('BUY');
-    expect(rounds[0].closedAt).toBeTruthy();
-    expect(rounds[0].realizedPnl).toBe('1000');
-    expect(rounds[1].direction).toBe('SELL');
-    expect(rounds[1].closedAt).toBeNull();
+    expect(rounds[1].direction).toBe('SHORT');
+    expect(rounds[1].status).toBe('OPEN');
     expect(rounds[1].qtyOpened).toBe('50');
+    expect(rounds[1].remainingQty).toBe('50');
+    expect(rounds[1].remainingAvgPrice).toBe('110');
     expect(rounds[1].executions[0].role).toBe('FLIP');
+    // ドテンで生まれたラウンドは、ドテン約定の hash 由来 + '-flip'
+    expect(rounds[1].id).toMatch(/^sbi-[0-9a-z-]{16}-flip$/);
+    expect(rounds[1].id).not.toBe(rounds[0].id);
   });
-});
 
-describe('buildRoundsFromExecutions: グルーピング', () => {
-  it('option-by-strike: 異なる instrumentId は別ラウンド', () => {
-    const rounds = buildRoundsFromExecutions([
-      ex({ instrumentId: 10, side: 'BUY', qty: '1', price: '1' }),
-      ex({ instrumentId: 11, side: 'BUY', qty: '1', price: '2' }),
-      ex({ instrumentId: 10, side: 'SELL', qty: '1', price: '1.5' }),
-      ex({ instrumentId: 11, side: 'SELL', qty: '1', price: '3' }),
+  it('別銘柄は別ラウンド', () => {
+    const rounds = buildSbiRounds([
+      ex({ instrumentId: 10, side: 'BUY', qty: '1', price: '1', executedAt: t('09:00') }),
+      ex({ instrumentId: 11, side: 'BUY', qty: '1', price: '2', executedAt: t('09:01') }),
+      ex({ instrumentId: 10, side: 'SELL', qty: '1', price: '1.5', executedAt: t('09:02') }),
+      ex({ instrumentId: 11, side: 'SELL', qty: '1', price: '3', executedAt: t('09:03') }),
     ]);
-    expect(rounds).toHaveLength(2);
     const byInst = new Map(rounds.map((r) => [r.instrumentId, r]));
     expect(byInst.get(10)!.realizedPnl).toBe('0.5');
     expect(byInst.get(11)!.realizedPnl).toBe('1');
   });
 
-  it('margin-cash-split: 同 instrumentId でも marginType が違えば別ラウンド', () => {
-    const rounds = buildRoundsFromExecutions([
-      ex({ instrumentId: 7, marginType: 'CASH', side: 'BUY', qty: '100', price: '100' }),
-      ex({ instrumentId: 7, marginType: 'MARGIN_LONG', side: 'BUY', qty: '100', price: '100' }),
-      ex({ instrumentId: 7, marginType: 'CASH', side: 'SELL', qty: '100', price: '110' }),
-      ex({ instrumentId: 7, marginType: 'MARGIN_LONG', side: 'SELL', qty: '100', price: '105' }),
+  it('margin-cash-split: 同じ銘柄でも信用区分が違えば別ラウンド', () => {
+    const rounds = buildSbiRounds([
+      ex({ marginType: 'CASH', side: 'BUY', price: '100', executedAt: t('09:00') }),
+      ex({ marginType: 'MARGIN_LONG', side: 'BUY', price: '100', executedAt: t('09:01') }),
+      ex({ marginType: 'CASH', side: 'SELL', price: '110', executedAt: t('09:02') }),
+      ex({ marginType: 'MARGIN_LONG', side: 'SELL', price: '105', executedAt: t('09:03') }),
     ]);
-    expect(rounds).toHaveLength(2);
     const byMt = new Map(rounds.map((r) => [r.marginType, r]));
     expect(byMt.get('CASH')!.realizedPnl).toBe('1000');
     expect(byMt.get('MARGIN_LONG')!.realizedPnl).toBe('500');
   });
 
-  it('tie-timestamp: 同時刻の約定は id 順で安定ソート', () => {
-    const t = new Date('2026-05-14T00:00:00Z');
-    const rounds = buildRoundsFromExecutions([
-      ex({ id: 2, side: 'SELL', qty: '100', price: '110', executedAt: t }),
-      ex({ id: 1, side: 'BUY', qty: '100', price: '100', executedAt: t }),
+  it('口座が違えば別ラウンド', () => {
+    const rounds = buildSbiRounds([
+      ex({ account: 'A', side: 'BUY', price: '100', executedAt: t('09:00') }),
+      ex({ account: 'B', side: 'SELL', price: '110', executedAt: t('09:01') }),
+    ]);
+    expect(rounds).toHaveLength(2);
+    expect(rounds.every((r) => r.status === 'OPEN')).toBe(true);
+  });
+
+  it('tie-timestamp: 同時刻は行順（seq）→ id で安定ソート', () => {
+    const rounds = buildSbiRounds([
+      ex({ id: 'b', seq: 1, side: 'SELL', price: '110', executedAt: t('09:00') }),
+      ex({ id: 'a', seq: 0, side: 'BUY', price: '100', executedAt: t('09:00') }),
     ]);
     expect(rounds).toHaveLength(1);
-    expect(rounds[0].executions.map((e) => e.id)).toEqual([1, 2]);
+    expect(rounds[0].executions.map((e) => e.id)).toEqual(['a', 'b']);
+  });
+
+  it('cross-day-hold: 日跨ぎの holdSeconds', () => {
+    const [r] = buildSbiRounds([
+      ex({ side: 'BUY', executedAt: new Date('2026-05-14T00:00:00Z') }),
+      ex({ side: 'SELL', price: '110', executedAt: new Date('2026-05-16T00:00:00Z') }),
+    ]);
+    expect(r.holdSeconds).toBe(2 * 86400);
+  });
+
+  it('未決済: 残数量と残平均建値を持つ', () => {
+    const [r] = buildSbiRounds([
+      ex({ side: 'BUY', price: '100', executedAt: t('09:00') }),
+      ex({ side: 'SELL', qty: '50', price: '110', executedAt: t('09:10') }),
+    ]);
+    expect(r.status).toBe('OPEN');
+    expect(r.closedAt).toBeNull();
+    expect(r.holdSeconds).toBeNull();
+    expect(r.realizedPnl).toBe('500');
+    expect(r.remainingQty).toBe('50');
+    expect(r.remainingAvgPrice).toBe('100');
+  });
+
+  it('決済後の買い増し: 残平均建値は移動平均、avgEntryPrice は建て全体の加重平均', () => {
+    const [r] = buildSbiRounds([
+      ex({ side: 'BUY', qty: '100', price: '100', executedAt: t('09:00') }),
+      ex({ side: 'SELL', qty: '50', price: '110', executedAt: t('09:10') }),
+      ex({ side: 'BUY', qty: '50', price: '120', executedAt: t('09:20') }),
+    ]);
+    expect(r.remainingQty).toBe('100');
+    expect(r.remainingAvgPrice).toBe('110'); // (50*100 + 50*120) / 100
+    expect(r.qtyOpened).toBe('150');
+    expect(new Decimal(r.avgEntryPrice!).toFixed(4)).toBe('106.6667'); // (100*100 + 50*120) / 150
+    expect(r.realizedPnl).toBe('500');
+  });
+
+  it('手数料は全約定の合計、netPnl は手数料込み', () => {
+    const [r] = buildSbiRounds([
+      ex({ side: 'BUY', price: '100', fee: '110', executedAt: t('09:00') }),
+      ex({ side: 'SELL', price: '110', fee: '132', executedAt: t('09:10') }),
+    ]);
+    expect(r.fees).toBe('242');
+    expect(r.realizedPnl).toBe('1000');
+    expect(r.netPnl).toBe('758');
   });
 });
 
-describe('buildRoundsForGroup: FX 換算', () => {
-  it('fx-realized-pnl: USD 建ての pnl を各約定の fxRateToJpy で按分', () => {
-    const rounds = buildRoundsForGroup([
-      ex({ side: 'BUY', qty: '10', price: '100', fxRateToJpy: '150' }),
-      // 部分決済 1: fx=151
-      ex({ side: 'SELL', qty: '5', price: '110', fxRateToJpy: '151' }),
-      // 部分決済 2: fx=152
-      ex({ side: 'SELL', qty: '5', price: '120', fxRateToJpy: '152' }),
+describe('SBI: 日付だけの約定（timePrecision=day）', () => {
+  const d = new Date('2026-01-07T00:00:00Z');
+  it('同じ日の中では、CSV で返済行が先でも建てを先に並べる（信用買）', () => {
+    const rounds = buildSbiRounds([
+      ex({ marginType: 'MARGIN_LONG', side: 'SELL', price: '1124', fee: '8', seq: 0, executedAt: d, timePrecision: 'day' }),
+      ex({ marginType: 'MARGIN_LONG', side: 'BUY', price: '1118', seq: 1, executedAt: d, timePrecision: 'day' }),
     ]);
     expect(rounds).toHaveLength(1);
-    // USD PnL: (110-100)*5 + (120-100)*5 = 50 + 100 = 150
-    expect(rounds[0].realizedPnl).toBe('150');
-    // JPY PnL: 50*151 + 100*152 = 7550 + 15200 = 22750
-    expect(rounds[0].realizedPnlJpy).toBe('22750');
-  });
-});
-
-describe('buildRoundsForGroup: クロス日', () => {
-  it('cross-day-hold: 日跨ぎで holdSeconds 正しい', () => {
-    const rounds = buildRoundsForGroup([
-      ex({ side: 'BUY', qty: '100', price: '100', executedAt: new Date('2026-05-14T00:00:00Z') }),
-      ex({ side: 'SELL', qty: '100', price: '110', executedAt: new Date('2026-05-16T00:00:00Z') }),
-    ]);
-    expect(rounds[0].holdSeconds).toBe(2 * 86400);
+    expect(rounds[0].direction).toBe('LONG');
+    expect(rounds[0].netPnl).toBe('592'); // CSV の決済損益と一致
+    expect(rounds[0].timePrecision).toBe('day');
   });
 
-  it('未クローズ: 最後にポジションが残っていても返す', () => {
-    const rounds = buildRoundsForGroup([
-      ex({ side: 'BUY', qty: '100', price: '100' }),
-      ex({ side: 'SELL', qty: '50', price: '110' }),
+  it('信用売は新規売を先に並べる', () => {
+    const rounds = buildSbiRounds([
+      ex({ marginType: 'MARGIN_SHORT', side: 'BUY', price: '90', seq: 0, executedAt: d, timePrecision: 'day' }),
+      ex({ marginType: 'MARGIN_SHORT', side: 'SELL', price: '100', seq: 1, executedAt: d, timePrecision: 'day' }),
     ]);
     expect(rounds).toHaveLength(1);
-    expect(rounds[0].closedAt).toBeNull();
-    expect(rounds[0].holdSeconds).toBeNull();
-    // 半分決済で実現 PnL は (110-100)*50 = 500
-    expect(rounds[0].realizedPnl).toBe('500');
-  });
-});
-
-describe('buildRoundsForGroup: 手数料', () => {
-  it('全約定の fee + tax が feesTotal に累積', () => {
-    const rounds = buildRoundsForGroup([
-      ex({ side: 'BUY', qty: '100', price: '100', fee: '100', tax: '10' }),
-      ex({ side: 'SELL', qty: '100', price: '110', fee: '120', tax: '12' }),
-    ]);
-    expect(rounds[0].feesTotal).toBe('242'); // 100+10+120+12
-  });
-});
-
-describe('buildRoundsForGroup: オプション multiplier', () => {
-  it('option-long: multiplier=100 で realizedPnl が 100 倍', () => {
-    // 1 契約を $5 で買って $7 で売る → (7-5) * 1 * 100 = $200
-    const rounds = buildRoundsForGroup([
-      ex({ side: 'BUY', qty: '1', price: '5', multiplier: '100' }),
-      ex({ side: 'SELL', qty: '1', price: '7', multiplier: '100' }),
-    ]);
-    expect(rounds).toHaveLength(1);
-    expect(rounds[0].realizedPnl).toBe('200');
-  });
-
-  it('option-short: multiplier=100 のショートも 100 倍', () => {
-    // 1 契約を $5 で売って $3 で買い戻し → (5-3) * 1 * 100 = $200
-    const rounds = buildRoundsForGroup([
-      ex({ side: 'SELL', qty: '1', price: '5', multiplier: '100' }),
-      ex({ side: 'BUY', qty: '1', price: '3', multiplier: '100' }),
-    ]);
-    expect(rounds).toHaveLength(1);
-    expect(rounds[0].direction).toBe('SELL');
-    expect(rounds[0].realizedPnl).toBe('200');
-  });
-
-  it('option-fx: multiplier 適用後に fxRateToJpy で JPY 換算', () => {
-    const rounds = buildRoundsForGroup([
-      ex({ side: 'BUY', qty: '2', price: '5', multiplier: '100', fxRateToJpy: '150' }),
-      ex({ side: 'SELL', qty: '2', price: '8', multiplier: '100', fxRateToJpy: '151' }),
-    ]);
-    expect(rounds).toHaveLength(1);
-    // USD PnL: (8-5) * 2 * 100 = 600
-    expect(rounds[0].realizedPnl).toBe('600');
-    // JPY PnL: 600 * 151 = 90600
-    expect(rounds[0].realizedPnlJpy).toBe('90600');
-  });
-
-  it('multiplier 未指定はデフォルト 1 (現物互換)', () => {
-    // 既存テストとの互換確認: multiplier プロパティ無しなら従来通り
-    const rounds = buildRoundsForGroup([
-      ex({ side: 'BUY', qty: '100', price: '100' }),
-      ex({ side: 'SELL', qty: '100', price: '110' }),
-    ]);
+    expect(rounds[0].direction).toBe('SHORT');
     expect(rounds[0].realizedPnl).toBe('1000');
   });
+
+  it('compareExecs: 時刻つきの約定は時刻順のまま', () => {
+    const a = ex({ side: 'SELL', executedAt: t('09:00') });
+    const b = ex({ side: 'BUY', executedAt: t('09:01') });
+    expect(compareExecs(a, b)).toBeLessThan(0);
+  });
 });
+
+describe('安定 ID', () => {
+  it('SBI: 先頭約定の dedupeHash から決まり、後ろに約定が増えても変わらない', () => {
+    const open = ex({ side: 'BUY', price: '100', executedAt: t('09:00'), dedupeHash: 'abcdef0123456789zzzz' });
+    const before = buildSbiRounds([open]);
+    const after = buildSbiRounds([open, ex({ side: 'SELL', price: '101', executedAt: t('09:05') })]);
+    expect(before[0].id).toBe('sbi-abcdef0123456789');
+    expect(after[0].id).toBe(before[0].id);
+  });
+
+  it('PAPER: positionId がそのまま ID', () => {
+    const rounds = buildPaperRounds([
+      ex({ source: 'PAPER', marginType: null, positionId: 'pos-1', side: 'BUY', executedAt: t('09:00') }),
+      ex({ source: 'PAPER', marginType: null, positionId: 'pos-1', side: 'SELL', price: '101', executedAt: t('09:05') }),
+    ]);
+    expect(rounds).toHaveLength(1);
+    expect(rounds[0].id).toBe('pos-1');
+    expect(rounds[0].realizedPnl).toBe('100');
+    expect(rounds[0].warnings).toEqual([]);
+  });
+});
+
+describe('PAPER: positionId 単位', () => {
+  it('同じ銘柄でも positionId が違えば別ラウンド（同時に 2 建玉）', () => {
+    const rounds = buildPaperRounds([
+      ex({ source: 'PAPER', marginType: null, positionId: 'A', side: 'BUY', price: '100', executedAt: t('09:00') }),
+      ex({ source: 'PAPER', marginType: null, positionId: 'B', side: 'SELL', price: '101', executedAt: t('09:01') }),
+      ex({ source: 'PAPER', marginType: null, positionId: 'A', side: 'SELL', price: '102', executedAt: t('09:02') }),
+      ex({ source: 'PAPER', marginType: null, positionId: 'B', side: 'BUY', price: '99', executedAt: t('09:03') }),
+    ]);
+    const byId = new Map(rounds.map((r) => [r.id, r]));
+    expect(byId.get('A')!.direction).toBe('LONG');
+    expect(byId.get('A')!.realizedPnl).toBe('200');
+    expect(byId.get('B')!.direction).toBe('SHORT');
+    expect(byId.get('B')!.realizedPnl).toBe('200');
+  });
+
+  it('0 に戻った後の約定は分割して警告', () => {
+    const rounds = buildPaperRounds([
+      ex({ source: 'PAPER', marginType: null, positionId: 'P', side: 'BUY', executedAt: t('09:00') }),
+      ex({ source: 'PAPER', marginType: null, positionId: 'P', side: 'SELL', executedAt: t('09:01') }),
+      ex({ source: 'PAPER', marginType: null, positionId: 'P', side: 'BUY', executedAt: t('09:02') }),
+    ]);
+    expect(rounds.map((r) => r.id)).toEqual(['P', 'P#2']);
+    expect(rounds[0].warnings[0]).toMatch(/分割/);
+  });
+
+  it('positionId が無い PAPER 約定は例外', () => {
+    expect(() => buildPaperRounds([ex({ source: 'PAPER', positionId: null })])).toThrow();
+  });
+});
+
+describe('価格の欠け・未確定', () => {
+  it('未確定（price=null）を含むラウンドは損益が null、数量は追える', () => {
+    const [r] = buildPaperRounds([
+      ex({ source: 'PAPER', marginType: null, positionId: 'P', side: 'BUY', price: '100', executedAt: t('09:00') }),
+      ex({ source: 'PAPER', marginType: null, positionId: 'P', side: 'SELL', price: null, priceStatus: 'UNRESOLVED', executedAt: t('09:05') }),
+    ]);
+    expect(r.status).toBe('CLOSED');
+    expect(r.remainingQty).toBe('0');
+    expect(r.realizedPnl).toBeNull();
+    expect(r.netPnl).toBeNull();
+    expect(r.avgEntryPrice).toBeNull();
+    expect(r.hasUnresolved).toBe(true);
+  });
+
+  it('要確認（仮置き価格あり）は損益を計算し hasUnresolved を立てる', () => {
+    const [r] = buildPaperRounds([
+      ex({ source: 'PAPER', marginType: null, positionId: 'P', side: 'BUY', price: '100', priceStatus: 'NEEDS_REVIEW', executedAt: t('09:00') }),
+      ex({ source: 'PAPER', marginType: null, positionId: 'P', side: 'SELL', price: '103', executedAt: t('09:05') }),
+    ]);
+    expect(r.realizedPnl).toBe('300');
+    expect(r.hasUnresolved).toBe(true);
+  });
+
+  it('数量 0 の約定は無視', () => {
+    const rounds = buildSbiRounds([ex({ qty: '0' })]);
+    expect(rounds).toHaveLength(0);
+  });
+});
+

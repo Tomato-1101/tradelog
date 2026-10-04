@@ -1,56 +1,67 @@
-// Round builder の入出力型。Prisma の Execution と Round を仲介する。
-// DB に保存する前の純粋計算用の構造体。
+// Round 構築の入出力型（DB に依存しない純粋計算用）。数値は 10 進数文字列。
 
-import type { MarginType, Side } from '@/lib/ingest/types';
+import type { MarginType, Side, TimePrecision } from '@/lib/ingest/types';
 
-/** builder に渡す Execution の最小情報 */
+export type Source = 'PAPER' | 'SBI';
+export type PriceStatus = 'CONFIRMED' | 'NEEDS_REVIEW' | 'UNRESOLVED';
+
 export type ExecForRound = {
-  id: number;
+  id: string;
+  source: Source;
   instrumentId: number;
-  accountId: number;
-  marginType: MarginType;
+  /** SBI の口座識別。ペーパーは "paper" */
+  account: string;
+  /** SBI のみ。ペーパーは null */
+  marginType: MarginType | null;
+  /** ペーパーのみ（建玉 ID）。SBI は null */
+  positionId: string | null;
   executedAt: Date;
+  timePrecision: TimePrecision;
+  /** 同時刻・同日の並べ替え用（CSV の行順など） */
+  seq: number;
   side: Side;
-  /** Decimal 文字列 (絶対値) */
   qty: string;
-  /** Decimal 文字列 (instrument の取引通貨ベース) */
-  price: string;
-  /** Decimal 文字列 (取引通貨ベース) */
+  /** 未確定は null */
+  price: string | null;
   fee: string;
-  /** Decimal 文字列 (取引通貨ベース) */
-  tax: string;
-  /** 取引日の USDJPY 中値 (instrument.ccy が JPY なら "1") */
-  fxRateToJpy: string;
-  /**
-   * 契約乗数 (Decimal 文字列)。米株オプションは 100、現物は 1。
-   * 同一グループ内では同じ値 (instrument 単位)。
-   */
-  multiplier?: string;
+  priceStatus: PriceStatus;
+  /** SBI のみ。Round の安定 ID の元 */
+  dedupeHash: string | null;
 };
 
 export type ExecutionRole = 'OPEN' | 'SCALE_IN' | 'SCALE_OUT' | 'CLOSE' | 'FLIP';
 
 export type RoundDraft = {
+  /** 安定 ID（PAPER = positionId / SBI = 先頭約定の dedupeHash 由来） */
+  id: string;
+  source: Source;
   instrumentId: number;
-  accountId: number;
-  marginType: MarginType;
-  direction: Side; // BUY = ロング, SELL = ショート
+  account: string;
+  marginType: MarginType | null;
+  direction: 'LONG' | 'SHORT';
   openedAt: Date;
   closedAt: Date | null;
-  /** ラウンド内の方向側 (open + scale-in) の数量合計 (絶対値) */
+  /** 建て始めの約定の時刻精度 */
+  timePrecision: TimePrecision;
+  /** 建て（新規 + 買い増し）の数量合計 */
   qtyOpened: string;
-  /** 加重平均エントリー価格 (open + scale-in 加重) */
-  avgEntryPrice: string;
-  /** 実現損益 (instrument.ccy 建て、手数料前) */
-  realizedPnl: string;
-  /** 実現損益 (JPY 換算、手数料前、各約定の fxRateToJpy で按分) */
-  realizedPnlJpy: string;
-  /** 手数料 + 税金の合計 (取引通貨ベース) */
-  feesTotal: string;
-  /** 手数料 + 税金の JPY 換算合計 (各約定の fxRateToJpy で按分) */
-  feesTotalJpy: string;
-  /** holdSeconds: closedAt - openedAt 秒 */
+  /** 残数量（決済済みなら 0） */
+  remainingQty: string;
+  /** 建ての加重平均価格。価格の欠けた約定を含むと null */
+  avgEntryPrice: string | null;
+  /** 残り建玉の平均建値（移動平均法）。決済済み・価格欠けは null */
+  remainingAvgPrice: string | null;
+  /** 決済の加重平均価格。決済が無い・価格欠けは null */
+  avgExitPrice: string | null;
+  /** 実現損益（手数料前、移動平均法）。価格欠けは null */
+  realizedPnl: string | null;
+  fees: string;
+  /** realizedPnl - fees。価格欠けは null */
+  netPnl: string | null;
   holdSeconds: number | null;
-  /** 構成 Execution の id + ロール */
-  executions: Array<{ id: number; role: ExecutionRole }>;
+  status: 'OPEN' | 'CLOSED';
+  /** CONFIRMED 以外の価格を含む */
+  hasUnresolved: boolean;
+  executions: Array<{ id: string; role: ExecutionRole }>;
+  warnings: string[];
 };

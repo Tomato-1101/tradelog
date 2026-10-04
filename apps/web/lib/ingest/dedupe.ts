@@ -1,23 +1,15 @@
-// 重複検出ハッシュ生成。
-// 1) externalOrderId + externalFillId があればそれを最優先
-// 2) externalOrderId のみあれば orderId + side + qty + price で複合
-// 3) どちらも無ければ broker + accountExternalId + 銘柄自然キー + executedAt + side + marginType + qty + price
-// 同じファイルを 2 度投入しても重複が検出されるよう、ハッシュは決定論的に。
+// 重複検出ハッシュ。同じファイルを 2 度取り込んでも重複が検出されるよう決定論的に作る。
+// 1) 注文番号 + 約定番号があれば最優先
+// 2) 注文番号だけなら 注文番号 + 売買 + 数量 + 価格
+// 3) どちらも無ければ 口座 + 銘柄 + 約定日時 + 売買 + 信用区分 + 数量 + 価格
+// roleSuffix（現引/現渡の分解・pnl=・seq=）があれば混ぜる。
 
 import { createHash } from 'node:crypto';
 import type { NormalizedExecution, NormalizedInstrument } from './types';
 
 export function instrumentNaturalKey(inst: NormalizedInstrument): string {
-  if (inst.kind === 'OPTION_US') {
-    return [
-      'OPT',
-      inst.underlying,
-      inst.expiry.toISOString().slice(0, 10),
-      inst.strike,
-      inst.right,
-    ].join(':');
-  }
-  return [inst.kind, inst.symbol].join(':');
+  // 旧版と同じ形（EQUITY_JP:7203）を保つ
+  return ['EQUITY_JP', inst.symbol].join(':');
 }
 
 export function makeDedupeHash(e: NormalizedExecution): string {
@@ -25,15 +17,7 @@ export function makeDedupeHash(e: NormalizedExecution): string {
   if (e.externalOrderId && e.externalFillId) {
     parts = [e.broker, e.accountExternalId, 'OF', e.externalOrderId, e.externalFillId];
   } else if (e.externalOrderId) {
-    parts = [
-      e.broker,
-      e.accountExternalId,
-      'O',
-      e.externalOrderId,
-      e.side,
-      e.qty,
-      e.price,
-    ];
+    parts = [e.broker, e.accountExternalId, 'O', e.externalOrderId, e.side, e.qty, e.price];
   } else {
     parts = [
       e.broker,
@@ -47,8 +31,6 @@ export function makeDedupeHash(e: NormalizedExecution): string {
       e.price,
     ];
   }
-  // 現引/現渡 のように 1 行を 2 Execution に分解した場合、片方は marginType が
-  // 異なるため通常は衝突しないが、念のため roleSuffix を hash に混ぜて防御。
   if (e.roleSuffix) parts.push('R', e.roleSuffix);
   return createHash('sha256').update(parts.join('|')).digest('hex');
 }

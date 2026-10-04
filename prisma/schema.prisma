@@ -1,5 +1,6 @@
-// データモデル詳細は docs/DATA_MODEL.md / plan ファイルを参照。
-// dedupe / round 集計は apps/web/lib に実装。
+// tradelog v1 スキーマ（ペーパートレード + SBI 実取引）。マイグレーションが正。
+// 金額・数量は String（10 進数文字列）で持ち、計算は decimal.js で行う（浮動小数を経由させない）。
+// 時刻はすべて UTC。足（Bar）の OHLC だけは表示・照合用なので Float でよい。
 
 generator client {
   provider = "prisma-client"
@@ -9,28 +10,49 @@ generator client {
 
 datasource db {
   provider = "sqlite"
-  // Prisma 7: url は prisma.config.ts (リポルート) で指定する。
+  // Prisma 7: url は apps/web/prisma.config.ts で指定する。
 }
 
-enum BrokerCode {
+enum Source {
+  PAPER
   SBI
-  MOOMOO
-}
-
-enum InstrumentKind {
-  EQUITY_JP
-  EQUITY_US
-  OPTION_US
-}
-
-enum OptionRight {
-  CALL
-  PUT
 }
 
 enum Side {
   BUY
   SELL
+}
+
+enum Direction {
+  LONG
+  SHORT
+}
+
+enum OrderIntent {
+  OPEN
+  ADD
+  CLOSE
+}
+
+enum OrderType {
+  MARKET
+  LIMIT
+}
+
+// MARKET: 成行 / PENDING: 指値の待機中（発注時に即約定できる指値もここに残り、約定は Execution の有無で判断）
+// FILL_MARKED: 本人が「約定した」を押した / CANCELLED / EXPIRED: 引け後まで約定も取消も無かった指値
+enum OrderState {
+  MARKET
+  PENDING
+  FILL_MARKED
+  CANCELLED
+  EXPIRED
+}
+
+// ms: 時刻まで分かっている / day: 日付だけ（SBI の約定履歴 CSV には時刻が無い）
+enum TimePrecision {
+  ms
+  day
 }
 
 enum MarginType {
@@ -39,157 +61,207 @@ enum MarginType {
   MARGIN_SHORT
 }
 
-model Broker {
-  id       Int        @id @default(autoincrement())
-  code     BrokerCode @unique
-  name     String
-  accounts Account[]
+enum PriceStatus {
+  CONFIRMED
+  NEEDS_REVIEW
+  UNRESOLVED
 }
 
-model Account {
-  id           Int         @id @default(autoincrement())
-  brokerId     Int
-  broker       Broker      @relation(fields: [brokerId], references: [id])
-  externalId   String
-  label        String?
-  baseCcy      String
-  executions   Execution[]
-  importBatches ImportBatch[]
-  rounds       Round[]
-
-  @@unique([brokerId, externalId])
+enum PriceBasis {
+  OPEN_AUCTION
+  CLOSE_AUCTION
+  SCREEN
+  BAR
+  LIMIT
+  MANUAL
+  CSV
 }
 
-// 現物・米株・米株オプションを同一テーブルで保持。
-// OPTION_US のとき expiry/strike/right/underlying/occSymbol が非 null。
-// 自然キーは (kind, symbol, expiry, strike, right) — 現物は expiry=null/strike=null/right=null。
+enum RoundStatus {
+  OPEN
+  CLOSED
+}
+
 model Instrument {
-  id         Int            @id @default(autoincrement())
-  kind       InstrumentKind
-  symbol     String
-  exchange   String?
+  id         Int          @id @default(autoincrement())
+  symbol     String // 東証コード（7203 / 285A）
   name       String?
-  ccy        String
-  // OPTION_US 固有
-  underlying String?
-  expiry     DateTime?
-  strike     Decimal?
-  right      OptionRight?
-  multiplier Int?
-  occSymbol  String?        @unique
-
+  market     String       @default("TSE")
   executions Execution[]
-  ohlcBars   OhlcBar[]
+  orders     PaperOrder[]
   rounds     Round[]
+  bars       Bar[]
+  barFetches BarFetch[]
 
-  @@unique([kind, symbol, expiry, strike, right])
-  @@index([kind, symbol])
+  @@unique([market, symbol])
 }
 
-model ImportBatch {
-  id         String      @id @default(cuid())
-  accountId  Int
-  account    Account     @relation(fields: [accountId], references: [id])
-  source     String // "sbi-csv" / "moomoo-api" / "moomoo-csv"
-  fileName   String?
-  fileSha256 String?
-  importedAt DateTime    @default(now())
-  newCount   Int         @default(0)
-  dupCount   Int         @default(0)
-  // 「ノーカン」フラグ: true のとき集計・チャート・Round 再構築から除外する。
-  // 削除ではなく一時的に隠すだけ。元データは Execution 側にそのまま残る。
-  hidden     Boolean     @default(false)
-  executions Execution[]
+model PaperOrder {
+  id           String      @id // order イベントの id
+  positionId   String
+  intent       OrderIntent
+  side         Side
+  qty          String
+  orderType    OrderType
+  limitPrice   String?
+  placedAt     DateTime // UTC
+  state        OrderState
+  fillMarkedAt DateTime? // UTC（fill_mark イベントの ts）
+  fillMarkId   String?     @unique
+  cancelId     String?     @unique
+  instrumentId Int
+  instrument   Instrument  @relation(fields: [instrumentId], references: [id])
+  shot         Shot?
+  execution    Execution?
+  rawJson      String // 取り込んだ order イベントそのもの
+
+  @@index([positionId])
+  @@index([placedAt])
 }
 
 model Execution {
-  id              Int         @id @default(autoincrement())
-  accountId       Int
-  account         Account     @relation(fields: [accountId], references: [id])
-  instrumentId    Int
-  instrument      Instrument  @relation(fields: [instrumentId], references: [id])
-  importBatchId   String
-  importBatch     ImportBatch @relation(fields: [importBatchId], references: [id])
-
-  executedAt      DateTime
-  side            Side
-  qty             Decimal
-  price           Decimal
-  fee             Decimal     @default(0)
-  tax             Decimal     @default(0)
-  marginType      MarginType  @default(CASH)
-  externalOrderId String?
-  externalFillId  String?
-  // 取引日の USDJPY 中値。instrument.ccy が JPY なら "1"。
-  fxRateToJpy     Decimal
-  dedupeHash      String      @unique
-  rawJson         String // JSON 文字列で生データを保持
+  id            String        @id @default(cuid())
+  source        Source
+  instrumentId  Int
+  instrument    Instrument    @relation(fields: [instrumentId], references: [id])
+  // Round のグルーピング用の口座識別。SBI は "default"、ペーパーは "paper"
+  account       String        @default("default")
+  // UTC。timePrecision=day のときは JST 当日 09:00（= UTC 00:00）を置く（日付だけが意味を持つ）
+  executedAt    DateTime
+  timePrecision TimePrecision
+  side          Side
+  qty           String
+  price         String? // 未確定は null
+  fee           String        @default("0")
+  marginType    MarginType? // SBI 用
+  priceStatus   PriceStatus
+  priceBasis    PriceBasis?
+  priceNote     String? // 要確認・未確定の理由（人と AI が読む）
+  paperOrderId  String?       @unique
+  paperOrder    PaperOrder?   @relation(fields: [paperOrderId], references: [id])
+  dedupeHash    String?       @unique // SBI 用
+  seq           Int           @default(0) // CSV 内の行順（同じ日の並べ替えに使う）
+  importBatchId String?
+  importBatch   ImportBatch?  @relation(fields: [importBatchId], references: [id])
+  roundId       String?
+  round         Round?        @relation(fields: [roundId], references: [id])
+  rawJson       String
 
   @@index([instrumentId, executedAt])
-  @@index([accountId, executedAt])
+  @@index([roundId])
 }
 
-// ポジションラウンド = 銘柄(+口座+marginType) 単位で
-// ポジション 0 → エントリー → 部分決済を経て 0 に戻るまでの 1 サイクル。
-// Execution が真実、Round は決定論的に再計算可能なキャッシュ。
+// 建玉 0 → 0 の 1 サイクル。Execution が真実で、Round は再計算できるキャッシュ。
+// ID は安定（PAPER = positionId / SBI = 先頭 Execution の dedupeHash 由来）。upsert で更新し、ID を変えない。
 model Round {
-  id              Int        @id @default(autoincrement())
-  instrumentId    Int
-  instrument      Instrument @relation(fields: [instrumentId], references: [id])
-  accountId       Int
-  account         Account    @relation(fields: [accountId], references: [id])
-  marginType      MarginType
-  direction       Side // BUY = ロング, SELL = ショート
-  openedAt        DateTime
-  closedAt        DateTime?
-  qtyOpened       Decimal
-  avgEntryPrice   Decimal
-  realizedPnl     Decimal
-  realizedPnlJpy  Decimal
-  feesTotal       Decimal
-  // 手数料+税の JPY 換算合計。各約定の fxRateToJpy で按分済み。
-  // ccy 混在ラウンドの netPnlJpy 計算用 (USD 手数料を JPY pnl から引いてしまう事故を防ぐ)。
-  feesTotalJpy    Decimal    @default(0)
-  holdSeconds     Int?
-  rMultiple       Decimal?
-  executionsJson  String // 構成 Execution の id 配列と role: [{ id, role }]
-  recomputedAt    DateTime   @default(now())
+  id            String        @id
+  source        Source
+  instrumentId  Int
+  instrument    Instrument    @relation(fields: [instrumentId], references: [id])
+  account       String
+  marginType    MarginType?
+  direction     Direction
+  openedAt      DateTime
+  closedAt      DateTime?
+  timePrecision TimePrecision // 建て始めの約定の精度
+  qtyOpened     String
+  remainingQty  String
+  // 価格が欠けた約定（未確定）を含むと計算できないので null
+  avgEntryPrice String?
+  avgExitPrice  String?
+  remainingAvgPrice String? // 未決済分の平均建値（移動平均）。決済済みや価格欠けは null
+  realizedPnl   String? // 手数料前
+  fees          String
+  netPnl        String? // 手数料込み（勝敗はこれで判定）
+  holdSeconds   Int?
+  // 建値からの最大逆行（<= 0）・最大順行（>= 0）。1 株あたりの値幅。1 分足が無ければ null
+  mae           String?
+  mfe           String?
+  status        RoundStatus
+  hasUnresolved Boolean // CONFIRMED 以外の価格を含む
+  warningsJson  String        @default("[]")
+  executions    Execution[]
+  memos         Memo[]
+  updatedAt     DateTime      @updatedAt
 
-  @@index([instrumentId, openedAt])
+  @@index([source, openedAt])
   @@index([closedAt])
-  @@index([accountId, marginType, openedAt])
 }
 
-model OhlcBar {
+model Memo {
+  id         String   @id // memo イベントの id
+  positionId String
+  roundId    String?
+  round      Round?   @relation(fields: [roundId], references: [id])
+  orderId    String?
+  ts         DateTime // UTC
+  text       String
+
+  @@index([positionId])
+}
+
+model Shot {
+  id           String     @id @default(cuid())
+  paperOrderId String     @unique
+  paperOrder   PaperOrder @relation(fields: [paperOrderId], references: [id])
+  path         String // data/paper/ からの相対パス
+  priceText    String?
+  price        String?
+  symbolText   String?
+  confidence   Float?
+}
+
+model Bar {
   id           Int        @id @default(autoincrement())
   instrumentId Int
   instrument   Instrument @relation(fields: [instrumentId], references: [id])
-  timeframe    String // "1m" | "5m" | "1h" | "1d"
-  ts           DateTime
-  open         Decimal
-  high         Decimal
-  low          Decimal
-  close        Decimal
-  volume       Decimal
-  source       String // "moomoo" | "yfinance"
+  timeframe    String // "1m" | "1d"
+  ts           DateTime // UTC。1m は分足の開始時刻、1d は JST 当日 00:00
+  open         Float
+  high         Float
+  low          Float
+  close        Float
+  volume       Float
+  source       String // "yahoo"
   fetchedAt    DateTime   @default(now())
 
   @@unique([instrumentId, timeframe, ts])
-  @@index([instrumentId, timeframe, ts])
 }
 
-model FxRate {
-  id     Int      @id @default(autoincrement())
-  pair   String // "USDJPY"
-  date   DateTime
-  rate   Decimal
-  source String
+// 足の取得記録（データ品質）。銘柄 × 足の種類 × JST 日付ごとに、取れたか・何本か・失敗理由を残す。
+model BarFetch {
+  id           Int        @id @default(autoincrement())
+  instrumentId Int
+  instrument   Instrument @relation(fields: [instrumentId], references: [id])
+  timeframe    String
+  date         String // JST の YYYY-MM-DD
+  status       String // OK / EMPTY / ERROR / UNAVAILABLE（遡れる期間外）
+  complete     Boolean // 引け後に取得し、その日の足が出揃っている
+  barCount     Int
+  error        String?
+  fetchedAt    DateTime   @default(now())
 
-  @@unique([pair, date])
+  @@unique([instrumentId, timeframe, date])
 }
 
-model UserPreference {
-  key       String   @id
-  value     String // JSON 文字列
-  updatedAt DateTime @updatedAt @default(now())
+// SBI CSV の取り込み単位
+model ImportBatch {
+  id         String      @id @default(cuid())
+  source     String // "sbi-csv"
+  format     String // third-savefile / new-daily / legacy / unknown
+  fileName   String
+  fileSha256 String
+  importedAt DateTime    @default(now())
+  newCount   Int
+  dupCount   Int
+  warnings   String      @default("[]")
+  executions Execution[]
+}
+
+// events.jsonl の取り込み済みイベント id（冪等化用）
+model PaperEventLog {
+  id         String   @id
+  type       String
+  ts         DateTime
+  importedAt DateTime @default(now())
 }

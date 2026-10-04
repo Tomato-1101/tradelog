@@ -64,3 +64,11 @@ apps/web/generated/
 # ローカル限定スクリプト (口座番号など本人固有の情報を含む)
 apps/web/scripts/*.local.ts
 apps/api-py/.python-version
+
+# ペーパートレード（イベント・スクショ）と AI 書き出し・旧 DB 退避（すべて本人の取引データ）
+data/paper/
+data/ai/
+data/legacy/
+
+# 第三者著作物の参照画像（社内参照用・リポジトリ非公開）
+docs/design-references/markers/

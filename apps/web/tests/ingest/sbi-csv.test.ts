@@ -25,9 +25,9 @@ describe('parseSbiCsvText: basic', () => {
 
     const e0 = executions[0];
     expect(e0.broker).toBe('SBI');
-    expect(e0.instrument.kind).toBe('EQUITY_JP');
     expect(e0.instrument.symbol).toBe('7203');
-    expect(e0.instrument.ccy).toBe('JPY');
+    expect(e0.timePrecision).toBe('ms');
+    expect(e0.brokerPnl).toBeNull();
     expect(e0.side).toBe('BUY');
     expect(e0.marginType).toBe('CASH');
     expect(e0.qty).toBe('100');
@@ -58,6 +58,7 @@ describe('parseSbiCsvText: basic', () => {
     expect(warnings).toEqual([]);
     expect(executions).toHaveLength(1);
     expect(executions[0].executedAt.toISOString().startsWith('2026-05-14T')).toBe(true);
+    expect(executions[0].timePrecision).toBe('day');
   });
 });
 
@@ -218,6 +219,9 @@ describe('parseSbiCsvText: 現引/現渡 (split kind)', () => {
     expect(margin.tax).toBe('11');
     expect(cash.fee).toBe('0');
     expect(cash.tax).toBe('0');
+    // 現引の受渡金額は決済損益ではないので brokerPnl は持たない
+    expect(margin.brokerPnl).toBeNull();
+    expect(cash.brokerPnl).toBeNull();
   });
 });
 
@@ -238,6 +242,8 @@ describe('parseSbiCsvText: 新フォーマット (約定履歴) で受渡損益�
     expect(executions[0].roleSuffix).toBe('pnl=-1262');
     expect(executions[1].roleSuffix).toBe('pnl=348');
     expect(makeDedupeHash(executions[0])).not.toBe(makeDedupeHash(executions[1]));
+    expect(executions.map((e) => e.brokerPnl)).toEqual(['-1262', '348']);
+    expect(executions.every((e) => e.timePrecision === 'day')).toBe(true);
   });
 
   it('受渡損益が "--" の同自然キー 2 行 → seq=2 で別 hash', () => {
@@ -311,6 +317,10 @@ describe('parseSbiCsvText: 約定履歴照会 (SaveFile_*.csv) フォーマッ�
     expect(e.price).toBe('960');
     expect(e.fee).toBe('0');
     expect(e.roleSuffix).toBe('pnl=3840');
+    // 約定履歴照会には時刻が無い
+    expect(e.timePrecision).toBe('day');
+    // 現物売の受渡金額は決済損益ではない
+    expect(e.brokerPnl).toBeNull();
   });
 
   it('信用返済売で同価格・同数量・異損益の 2 行が別 dedupeHash になる', () => {
@@ -395,6 +405,9 @@ describe('parseSbiCsvText: 約定履歴照会 (SaveFile_*.csv) フォーマッ�
     expect(executions[1]).toMatchObject({ side: 'SELL', marginType: 'MARGIN_LONG' });
     expect(executions[2]).toMatchObject({ side: 'SELL', marginType: 'MARGIN_SHORT' });
     expect(executions[3]).toMatchObject({ side: 'BUY', marginType: 'MARGIN_SHORT' });
+    // 決済損益は信用返済の行だけ
+    expect(executions.map((e) => e.brokerPnl)).toEqual([null, '10000', null, '10000']);
+    expect(executions.map((e) => e.seq)).toEqual([0, 1, 2, 3]);
   });
 });
 
@@ -493,20 +506,8 @@ describe('dedupe', () => {
     expect(h1).not.toBe(h3);
   });
 
-  it('instrumentNaturalKey: 現物とオプションを区別', () => {
-    expect(instrumentNaturalKey({ kind: 'EQUITY_JP', symbol: '7203', ccy: 'JPY' })).toBe('EQUITY_JP:7203');
-    expect(
-      instrumentNaturalKey({
-        kind: 'OPTION_US',
-        symbol: 'AAPL',
-        underlying: 'AAPL',
-        expiry: new Date(Date.UTC(2026, 4, 15)),
-        strike: '136',
-        right: 'CALL',
-        multiplier: 100,
-        occSymbol: 'AAPL  260515C00136000',
-        ccy: 'USD',
-      }),
-    ).toBe('OPT:AAPL:2026-05-15:136:CALL');
+  it('instrumentNaturalKey: 旧版と同じ EQUITY_JP:コード の形', () => {
+    expect(instrumentNaturalKey({ symbol: '7203' })).toBe('EQUITY_JP:7203');
+    expect(instrumentNaturalKey({ symbol: '285A', name: 'キオクシア' })).toBe('EQUITY_JP:285A');
   });
 });

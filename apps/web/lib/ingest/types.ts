@@ -1,50 +1,39 @@
-// 取り込み層で扱う中間型。Prisma の Execution / Instrument に近いが、
-// DB 書き込み前なので id を持たず文字列ベース。Decimal 演算は decimal.js を使う。
+// SBI CSV 取り込み層の中間型。DB 書き込み前なので id を持たず、数値は 10 進数文字列。
 
-export type BrokerCode = 'SBI' | 'MOOMOO';
 export type Side = 'BUY' | 'SELL';
 export type MarginType = 'CASH' | 'MARGIN_LONG' | 'MARGIN_SHORT';
-export type InstrumentKind = 'EQUITY_JP' | 'EQUITY_US' | 'OPTION_US';
-export type OptionRight = 'CALL' | 'PUT';
+export type TimePrecision = 'ms' | 'day';
 
-export type NormalizedInstrument =
-  | {
-      kind: 'EQUITY_JP' | 'EQUITY_US';
-      symbol: string;
-      exchange?: string;
-      name?: string;
-      ccy: 'JPY' | 'USD';
-    }
-  | {
-      kind: 'OPTION_US';
-      symbol: string;     // 表示用シンボル (underlying と同じことが多い)
-      underlying: string;
-      expiry: Date;       // 満期日 (UTC 00:00)
-      strike: string;     // Decimal 文字列
-      right: OptionRight;
-      multiplier: number; // 通常 100
-      occSymbol: string;  // 例: "AAPL  250515C00136000"
-      ccy: 'USD';
-      exchange?: string;
-      name?: string;
-    };
+/** 東証の個別銘柄（v1 は日本株だけを扱う） */
+export type NormalizedInstrument = {
+  symbol: string;
+  exchange?: string;
+  name?: string;
+};
 
 export type NormalizedExecution = {
-  broker: BrokerCode;
+  broker: 'SBI';
   accountExternalId: string;
   instrument: NormalizedInstrument;
-  executedAt: Date;       // UTC
+  /** UTC。timePrecision=day のときは JST 当日 09:00（= UTC 00:00）で、日付だけが意味を持つ */
+  executedAt: Date;
+  /** 約定履歴照会・当日約定の CSV は時刻が無いので day。時刻列がある旧形式だけ ms */
+  timePrecision: TimePrecision;
   side: Side;
   marginType: MarginType;
-  qty: string;            // Decimal 文字列 (枚数 / 株数、絶対値)
-  price: string;          // Decimal 文字列 (取引通貨ベース)
-  fee: string;            // Decimal 文字列 (取引通貨ベース)
-  tax: string;            // Decimal 文字列 (取引通貨ベース)
+  qty: string;
+  price: string;
+  fee: string;
+  tax: string;
   externalOrderId?: string;
   externalFillId?: string;
-  // 1 つの CSV 行から複数 Execution に分解されるケース (現引/現渡 など) の
-  // 役割タグ。dedupeHash の衝突を避けるためと、後段デバッグ用。
+  // 1 つの CSV 行から複数 Execution に分解されるケース（現引/現渡）や、同じ自然キーの行を
+  // 区別するためのタグ（pnl=… / seq=N）。dedupeHash に混ぜる。
   roleSuffix?: string;
+  /** 信用返済の行だけ: CSV の「決済損益」（SBI が計算した手数料・諸経費込みの損益）。それ以外は null */
+  brokerPnl: string | null;
+  /** CSV 内の出現順（0 起点、分解した行は同じ値） */
+  seq: number;
   raw: Record<string, unknown>;
 };
 
@@ -54,17 +43,13 @@ export type ParseWarning = {
   message: string;
 };
 
-// SBI CSV のフォーマット種別。全期間 CSV と当日約定 CSV を import 側で見分け、
-// 全期間 CSV 受領時に daily 由来 Execution を物理削除→上書きするために必要。
-// 旧 (注文一覧_約定履歴) と未判定はまとめて 'legacy' / 'unknown'。
+// third-savefile = 約定履歴照会（SaveFile_*.csv）/ new-daily = 注文一覧_当日約定 / legacy = 時刻列ありの旧形式
 export type SbiCsvFormat = 'third-savefile' | 'new-daily' | 'legacy' | 'unknown';
 
 export type ParseResult = {
   executions: NormalizedExecution[];
   warnings: ParseWarning[];
-  // 検出されたフォーマット。SBI 以外 (moomoo) では 'unknown'。
-  format?: SbiCsvFormat;
-  // executions の executedAt の範囲。daily 上書き時の削除範囲決定に使う。
-  earliestDate?: Date | null;
-  latestDate?: Date | null;
+  format: SbiCsvFormat;
+  earliestDate: Date | null;
+  latestDate: Date | null;
 };

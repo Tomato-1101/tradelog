@@ -13,8 +13,8 @@
     "db:migrate": "prisma migrate dev",
     "db:push": "prisma db push",
     "db:generate": "prisma generate",
-    "db:seed": "tsx scripts/seed.ts",
-    "smoke": "tsx scripts/smoke-import.ts",
+    "daily": "tsx scripts/daily.ts",
+    "import:sbi": "tsx scripts/import-sbi.ts",
     "db:studio": "prisma studio"
   },
   "dependencies": {

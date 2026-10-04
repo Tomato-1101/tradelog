@@ -1,9 +1,7 @@
-// ポジションラウンド集計。
-// 「銘柄 (instrumentId) + 口座 (accountId) + 信用区分 (marginType)」の 3 つ組単位で、
-// ポジションが 0 から積まれて再び 0 に戻るまでを 1 ラウンドとする。
-// ロング (符号 +) / ショート (符号 -) を符号付き Decimal でトラッキングし、
-// 部分決済・増し玉・反対売買 (flip / overfill) に対応。
-// 詳細仕様は plan ファイル §5 を参照。
+// ポジションラウンドの構築（純粋関数）。
+// SBI: 「銘柄 × 口座 × 信用区分」ごとに、建玉が 0 → 0 に戻るまでを 1 ラウンドとする（部分決済・買い増し・ドテン対応）。
+// PAPER: 建玉 ID（positionId）ごとに 1 ラウンド。0 に戻った後にも約定がある・決済しすぎた等は警告付きで分割する。
+// 損益は移動平均法（買い増しで建値を加重平均し、決済分は平均建値との差で実現）。
 
 import Decimal from 'decimal.js';
 import type { Side } from '@/lib/ingest/types';
@@ -15,163 +13,230 @@ function signedQty(side: Side, qty: Decimal): Decimal {
   return side === 'BUY' ? qty : qty.neg();
 }
 
-function newDraft(e: ExecForRound, firstSigned: Decimal): RoundDraft {
-  const feeSum = new Decimal(e.fee).plus(e.tax);
-  const fxRate = new Decimal(e.fxRateToJpy);
-  return {
-    instrumentId: e.instrumentId,
-    accountId: e.accountId,
-    marginType: e.marginType,
-    direction: firstSigned.gt(0) ? 'BUY' : 'SELL',
-    openedAt: e.executedAt,
-    closedAt: null,
-    qtyOpened: firstSigned.abs().toString(),
-    avgEntryPrice: e.price,
-    realizedPnl: '0',
-    realizedPnlJpy: '0',
-    feesTotal: feeSum.toString(),
-    feesTotalJpy: feeSum.times(fxRate).toString(),
-    holdSeconds: null,
-    executions: [],
-  };
-}
-
-function addStr(a: string, b: string): string {
-  return new Decimal(a).plus(b).toString();
-}
-
-function holdSecondsBetween(openedAt: Date, closedAt: Date): number {
-  return Math.max(0, Math.floor((closedAt.getTime() - openedAt.getTime()) / 1000));
+/** その約定が建て（新規）側か。日付しか分からない約定を同じ日の中で並べるのに使う */
+function isOpeningSide(e: ExecForRound): boolean {
+  if (e.marginType === 'MARGIN_SHORT') return e.side === 'SELL';
+  return e.side === 'BUY'; // CASH / MARGIN_LONG
 }
 
 /**
- * 1 グループ分 (instrumentId + accountId + marginType) の Execution 列から
- * Round の列を生成する。入力は executedAt + id 昇順を前提。
+ * 並び順: 約定時刻 → （日付だけの約定は）建て → 決済 → 行順 → id。
+ * SBI の約定履歴 CSV は時刻が無く、同じ日の中では「返済」行が「新規」行より先に並ぶ。
+ * そのまま並べると建玉が一時的にマイナスになり、ラウンドが壊れるため、同日内は建てを先に置く。
  */
-export function buildRoundsForGroup(execs: ExecForRound[]): RoundDraft[] {
-  const out: RoundDraft[] = [];
-  let cur: RoundDraft | null = null;
-  let pos = ZERO;       // ロング正、ショート負
-  let avgPx = ZERO;
-  // 契約乗数。米株オプションは 100、現物・米株は 1。同一グループ内では一定。
-  const multiplier = new Decimal(execs[0]?.multiplier ?? '1');
+export function compareExecs(a: ExecForRound, b: ExecForRound): number {
+  const ta = a.executedAt.getTime();
+  const tb = b.executedAt.getTime();
+  if (ta !== tb) return ta - tb;
+  if (a.timePrecision === 'day' && b.timePrecision === 'day') {
+    const ra = isOpeningSide(a) ? 0 : 1;
+    const rb = isOpeningSide(b) ? 0 : 1;
+    if (ra !== rb) return ra - rb;
+  }
+  if (a.seq !== b.seq) return a.seq - b.seq;
+  return a.id < b.id ? -1 : a.id > b.id ? 1 : 0;
+}
 
-  const pushRole = (role: ExecutionRole, id: number) => {
-    cur!.executions.push({ id, role });
+type Acc = {
+  draft: RoundDraft;
+  pos: Decimal; // ロング正・ショート負
+  avg: Decimal; // 残り建玉の平均建値
+  entryNotional: Decimal;
+  exitQty: Decimal;
+  exitNotional: Decimal;
+  realized: Decimal;
+  fees: Decimal;
+  priceMissing: boolean;
+};
+
+function open(e: ExecForRound, signed: Decimal, id: string, role: ExecutionRole, withFee: boolean): Acc {
+  const price = e.price == null ? null : new Decimal(e.price);
+  return {
+    draft: {
+      id,
+      source: e.source,
+      instrumentId: e.instrumentId,
+      account: e.account,
+      marginType: e.marginType,
+      direction: signed.gt(0) ? 'LONG' : 'SHORT',
+      openedAt: e.executedAt,
+      closedAt: null,
+      timePrecision: e.timePrecision,
+      qtyOpened: '0',
+      remainingQty: '0',
+      avgEntryPrice: null,
+      remainingAvgPrice: null,
+      avgExitPrice: null,
+      realizedPnl: null,
+      fees: '0',
+      netPnl: null,
+      holdSeconds: null,
+      status: 'OPEN',
+      hasUnresolved: e.priceStatus !== 'CONFIRMED',
+      executions: [{ id: e.id, role }],
+      warnings: [],
+    },
+    pos: signed,
+    avg: price ?? ZERO,
+    entryNotional: price ? price.times(signed.abs()) : ZERO,
+    exitQty: ZERO,
+    exitNotional: ZERO,
+    realized: ZERO,
+    // ドテンで生まれたラウンドは、その約定の手数料を決済側のラウンドで計上済み
+    fees: withFee ? new Decimal(e.fee) : ZERO,
+    priceMissing: price == null,
   };
+}
+
+function finalize(a: Acc): RoundDraft {
+  const d = a.draft;
+  const qtyOpened = new Decimal(d.qtyOpened);
+  d.remainingQty = a.pos.abs().toString();
+  d.fees = a.fees.toString();
+  if (a.priceMissing) {
+    d.avgEntryPrice = null;
+    d.remainingAvgPrice = null;
+    d.avgExitPrice = null;
+    d.realizedPnl = null;
+    d.netPnl = null;
+  } else {
+    d.avgEntryPrice = qtyOpened.gt(0) ? a.entryNotional.div(qtyOpened).toString() : null;
+    d.remainingAvgPrice = a.pos.isZero() ? null : a.avg.toString();
+    d.avgExitPrice = a.exitQty.gt(0) ? a.exitNotional.div(a.exitQty).toString() : null;
+    // 0 → 0 で閉じたラウンドは、移動平均の割り算を経由せず「決済代金 − 建て代金」で厳密に出す
+    // （移動平均の途中計算は 1/3 などで割り切れず、-3359.99999999999998 のような端数が残るため）。
+    // 未決済は移動平均の途中値なので小数 8 桁で丸める。
+    const realized = a.pos.isZero()
+      ? d.direction === 'LONG'
+        ? a.exitNotional.minus(a.entryNotional)
+        : a.entryNotional.minus(a.exitNotional)
+      : a.realized.toDecimalPlaces(8);
+    d.realizedPnl = realized.toString();
+    d.netPnl = realized.minus(a.fees).toString();
+  }
+  d.status = d.closedAt ? 'CLOSED' : 'OPEN';
+  return d;
+}
+
+/**
+ * 1 グループ分の約定列（並べ替え済み）を 0 → 0 のサイクルに分ける。
+ * idFor(先頭約定, 何本目のサイクルか, ドテンで生まれたか) で安定 ID を決める。
+ */
+function buildCycles(
+  execs: ExecForRound[],
+  idFor: (first: ExecForRound, index: number, flipped: boolean) => string,
+): RoundDraft[] {
+  const out: RoundDraft[] = [];
+  let cur: Acc | null = null;
 
   for (const e of execs) {
     const qty = new Decimal(e.qty);
-    if (qty.lte(0)) continue; // 数量 0 はスキップ
-
+    if (qty.lte(0)) continue;
     const sQty = signedQty(e.side, qty);
-    const price = new Decimal(e.price);
-    const fxRate = new Decimal(e.fxRateToJpy);
-    const feeSum = new Decimal(e.fee).plus(e.tax);
+    const price = e.price == null ? null : new Decimal(e.price);
+    const fee = new Decimal(e.fee);
 
-    if (pos.isZero()) {
-      cur = newDraft(e, sQty);
-      pos = sQty;
-      avgPx = price;
-      pushRole('OPEN', e.id);
+    if (!cur) {
+      cur = open(e, sQty, idFor(e, out.length, false), 'OPEN', true);
+      cur.draft.qtyOpened = sQty.abs().toString();
+      continue;
+    }
+    if (e.priceStatus !== 'CONFIRMED') cur.draft.hasUnresolved = true;
+    if (price == null) cur.priceMissing = true;
+
+    if (cur.pos.gt(0) === sQty.gt(0)) {
+      // 買い増し: 平均建値を加重平均で更新
+      const newPos = cur.pos.plus(sQty);
+      if (price) {
+        cur.avg = cur.pos.times(cur.avg).plus(sQty.times(price)).div(newPos);
+        cur.entryNotional = cur.entryNotional.plus(price.times(sQty.abs()));
+      }
+      cur.pos = newPos;
+      cur.fees = cur.fees.plus(fee);
+      cur.draft.qtyOpened = new Decimal(cur.draft.qtyOpened).plus(sQty.abs()).toString();
+      cur.draft.executions.push({ id: e.id, role: 'SCALE_IN' });
       continue;
     }
 
-    const sameDirection = pos.gt(0) === sQty.gt(0);
-
-    if (sameDirection) {
-      // 増し玉: 加重平均更新
-      const newPos = pos.plus(sQty);
-      avgPx = pos
-        .times(avgPx)
-        .plus(sQty.times(price))
-        .div(newPos);
-      pos = newPos;
-      pushRole('SCALE_IN', e.id);
-      cur!.qtyOpened = new Decimal(cur!.qtyOpened).plus(sQty.abs()).toString();
-      cur!.feesTotal = new Decimal(cur!.feesTotal).plus(feeSum).toString();
-      cur!.feesTotalJpy = new Decimal(cur!.feesTotalJpy).plus(feeSum.times(fxRate)).toString();
-      cur!.avgEntryPrice = avgPx.toString();
-      continue;
+    // 反対売買: 決済（決済しすぎた分はドテンで逆方向の新ラウンド）
+    const closingQty = Decimal.min(cur.pos.abs(), sQty.abs());
+    if (price) {
+      const perUnit = cur.pos.gt(0) ? price.minus(cur.avg) : cur.avg.minus(price);
+      cur.realized = cur.realized.plus(perUnit.times(closingQty));
+      cur.exitNotional = cur.exitNotional.plus(price.times(closingQty));
     }
+    cur.exitQty = cur.exitQty.plus(closingQty);
+    cur.fees = cur.fees.plus(fee);
+    cur.draft.executions.push({ id: e.id, role: 'SCALE_OUT' });
 
-    // 反対売買: クローズ or オーバーフィル
-    const closingQty = Decimal.min(pos.abs(), sQty.abs());
-    const pnlPerUnit = pos.gt(0)
-      ? price.minus(avgPx)        // ロングを売る → (売値 - 平均取得)
-      : avgPx.minus(price);       // ショートを買い戻す → (平均建値 - 買い戻し値)
-    // multiplier は 1 契約あたりの原資産単位数 (オプション=100)。fee/tax は対価建てそのままなので掛けない。
-    const pnl = pnlPerUnit.times(closingQty).times(multiplier);
+    const closeSigned = cur.pos.gt(0) ? closingQty.neg() : closingQty;
+    const remaining = sQty.minus(closeSigned);
+    cur.pos = cur.pos.plus(closeSigned);
 
-    cur!.realizedPnl = new Decimal(cur!.realizedPnl).plus(pnl).toString();
-    cur!.realizedPnlJpy = new Decimal(cur!.realizedPnlJpy)
-      .plus(pnl.times(fxRate))
-      .toString();
-    cur!.feesTotal = new Decimal(cur!.feesTotal).plus(feeSum).toString();
-    cur!.feesTotalJpy = new Decimal(cur!.feesTotalJpy).plus(feeSum.times(fxRate)).toString();
-    pushRole('SCALE_OUT', e.id);
-
-    // closeSign は pos を 0 に近づける向きの符号付き量。
-    // ロングをクローズする (pos>0, sQty<0) なら closeSign = -closingQty。
-    // ショートをクローズする (pos<0, sQty>0) なら closeSign = +closingQty。
-    const closeSign = pos.gt(0) ? closingQty.neg() : closingQty;
-    // remaining は「sQty のうちクローズに使われなかった残り」を符号付きで。
-    // sQty は反対方向 (= -closeSign 方向) なので、sQty から closeSign 分を差し引く。
-    const remaining = sQty.minus(closeSign);
-    pos = pos.plus(closeSign);
-
-    if (pos.isZero()) {
-      cur!.closedAt = e.executedAt;
-      cur!.holdSeconds = holdSecondsBetween(cur!.openedAt, e.executedAt);
-      // 最後にプッシュした SCALE_OUT を CLOSE に格上げ
-      cur!.executions[cur!.executions.length - 1].role = 'CLOSE';
-      out.push(cur!);
+    if (cur.pos.isZero()) {
+      cur.draft.closedAt = e.executedAt;
+      cur.draft.holdSeconds = Math.max(
+        0,
+        Math.floor((e.executedAt.getTime() - cur.draft.openedAt.getTime()) / 1000),
+      );
+      cur.draft.executions[cur.draft.executions.length - 1].role = 'CLOSE';
+      out.push(finalize(cur));
       cur = null;
-      avgPx = ZERO;
-
       if (!remaining.isZero()) {
-        // オーバーフィル: 残りを逆方向の新ラウンドにする
-        cur = newDraft(e, remaining);
-        pos = remaining;
-        avgPx = price;
-        // FLIP の場合 newDraft が feeSum 加算済みなのを取り消し、後段で扱わない
-        // (反対売買時にすでに加算済み)
-        cur.feesTotal = '0';
-        cur.feesTotalJpy = '0';
-        cur.executions.push({ id: e.id, role: 'FLIP' });
+        cur = open(e, remaining, idFor(e, out.length, true), 'FLIP', false);
+        cur.draft.qtyOpened = remaining.abs().toString();
       }
     }
   }
-
-  if (cur) {
-    out.push(cur);
-  }
+  if (cur) out.push(finalize(cur));
   return out;
 }
 
-/**
- * 並べ替えと境界グルーピングを行ったうえで builder を回す。
- * 入力は単一銘柄に限らない複数の execution。
- */
-export function buildRoundsFromExecutions(execs: ExecForRound[]): RoundDraft[] {
+function sbiRoundId(first: ExecForRound, _index: number, flipped: boolean): string {
+  const base = `sbi-${(first.dedupeHash ?? first.id).slice(0, 16)}`;
+  return flipped ? `${base}-flip` : base;
+}
+
+/** SBI: 銘柄 × 口座 × 信用区分 ごとに 0 → 0 で区切る */
+export function buildSbiRounds(execs: ExecForRound[]): RoundDraft[] {
   const groups = new Map<string, ExecForRound[]>();
   for (const e of execs) {
-    const key = `${e.instrumentId}|${e.accountId}|${e.marginType}`;
+    const key = `${e.instrumentId}|${e.account}|${e.marginType}`;
     const arr = groups.get(key);
     if (arr) arr.push(e);
     else groups.set(key, [e]);
   }
   const out: RoundDraft[] = [];
   for (const arr of groups.values()) {
-    arr.sort((a, b) => {
-      const da = a.executedAt.getTime();
-      const db = b.executedAt.getTime();
-      if (da !== db) return da - db;
-      return a.id - b.id;
-    });
-    out.push(...buildRoundsForGroup(arr));
+    arr.sort(compareExecs);
+    out.push(...buildCycles(arr, sbiRoundId));
   }
-  // 出力は openedAt 昇順で安定化
-  out.sort((a, b) => a.openedAt.getTime() - b.openedAt.getTime());
-  return out;
+  return out.sort((a, b) => a.openedAt.getTime() - b.openedAt.getTime() || (a.id < b.id ? -1 : 1));
+}
+
+/** PAPER: 建玉 ID ごとに 1 ラウンド。契約外の動き（0 に戻った後の約定・決済しすぎ）は分割して警告 */
+export function buildPaperRounds(execs: ExecForRound[]): RoundDraft[] {
+  const groups = new Map<string, ExecForRound[]>();
+  for (const e of execs) {
+    if (!e.positionId) throw new Error(`PAPER の約定に positionId が無い: ${e.id}`);
+    const arr = groups.get(e.positionId);
+    if (arr) arr.push(e);
+    else groups.set(e.positionId, [e]);
+  }
+  const out: RoundDraft[] = [];
+  for (const [positionId, arr] of groups) {
+    arr.sort(compareExecs);
+    const instruments = new Set(arr.map((e) => e.instrumentId));
+    const cycles = buildCycles(arr, (_f, index) => (index === 0 ? positionId : `${positionId}#${index + 1}`));
+    if (instruments.size > 1) {
+      for (const c of cycles) c.warnings.push('同じ建玉 ID に複数の銘柄の約定がある');
+    }
+    if (cycles.length > 1) {
+      for (const c of cycles) {
+        c.warnings.push(`建玉 ID ${positionId} が 0 に戻った後にも約定があり、${cycles.length} 本に分割した`);
+      }
+    }
+    out.push(...cycles);
+  }
+  return out.sort((a, b) => a.openedAt.getTime() - b.openedAt.getTime() || (a.id < b.id ? -1 : 1));
 }

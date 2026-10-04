@@ -1,7 +1,10 @@
-// SBI 証券「取引履歴」CSV のパーサ。
-// CSV は通常 Shift_JIS (CP932) でエクスポートされる。
-// 冒頭に案内文の数行が入ることがあり、ヘッダ行を内容から検出する。
-// カラム名はバージョンによって揺れるため、エイリアスでマッピングする。
+// SBI 証券の約定 CSV パーサ。CSV は通常 Shift_JIS（CP932）。
+// 対応形式:
+//   third-savefile: 約定履歴照会（SaveFile_*.csv）。約定日,銘柄,銘柄コード,市場,取引,…,受渡金額/決済損益
+//   new-daily:      注文一覧_当日約定。先頭 3 列が「銘柄」、平均約定単価・受渡金額・決済損益
+//   legacy:         取引履歴（約定時刻・注文番号・約定番号の列がある旧形式）
+// third-savefile と new-daily には約定時刻が無い。executedAt は JST 当日 09:00（UTC 00:00）を置き、
+// timePrecision='day' で「日付しか分からない」ことを明示する。
 
 import iconv from 'iconv-lite';
 import { combineJstDateTime, parseJpDate } from './jp-date';
@@ -14,62 +17,10 @@ import type {
   ParseWarning,
   SbiCsvFormat,
   Side,
+  TimePrecision,
 } from './types';
 
-// 各 parse 経路の return に format と executions の date 範囲を埋め込む。
-// import 経路で「全期間 CSV を投入したとき同期間の daily 由来を削除→再 INSERT」する
-// 上書きロジックに earliestDate を渡すために必要。
-function withFormatMeta(
-  result: { executions: NormalizedExecution[]; warnings: ParseWarning[] },
-  format: SbiCsvFormat,
-): ParseResult {
-  let earliest: Date | null = null;
-  let latest: Date | null = null;
-  for (const e of result.executions) {
-    if (!earliest || e.executedAt < earliest) earliest = e.executedAt;
-    if (!latest || e.executedAt > latest) latest = e.executedAt;
-  }
-  return { ...result, format, earliestDate: earliest, latestDate: latest };
-}
-
-type ColumnKey =
-  | 'tradeDate'      // 約定日
-  | 'tradeTime'      // 約定時刻
-  | 'symbol'         // 銘柄コード
-  | 'name'           // 銘柄名
-  | 'exchange'       // 市場
-  | 'kind'           // 取引区分 (現物買/信用新規買 等)
-  | 'marginType'     // 信用区分 (制度/一般 等) ※あれば
-  | 'qty'            // 数量
-  | 'price'          // 約定単価
-  | 'fee'            // 手数料
-  | 'tax'            // 税金
-  | 'orderId'        // 注文番号
-  | 'fillId';        // 約定番号
-
-// 注意: 部分一致なので、より具体的な名前は他カラムと混同しないこと。
-// 例: name の alias に「銘柄」だけ書くと「銘柄コード」にも一致してしまう。
-const HEADER_ALIASES: Record<ColumnKey, string[]> = {
-  tradeDate: ['約定日', '取引日'],
-  tradeTime: ['約定時刻', '約定時間'],
-  symbol: ['銘柄コード', 'コード'],
-  name: ['銘柄名'],
-  exchange: ['市場', '取引所'],
-  kind: ['取引区分', '売買区分', '区分'],
-  marginType: ['信用区分'],
-  qty: ['数量', '株数'],
-  price: ['約定単価', '単価', '取引単価'],
-  fee: ['手数料'],
-  tax: ['税金', '消費税'],
-  orderId: ['注文番号'],
-  fillId: ['約定番号'],
-};
-
-const KIND_PATTERNS: Array<{
-  re: RegExp;
-  side: Side;
-  marginType: MarginType;
-}> = [
+const KIND_PATTERNS: Array<{ re: RegExp; side: Side; marginType: MarginType }> = [
   { re: /信用.*新規.*買/, side: 'BUY', marginType: 'MARGIN_LONG' },
   { re: /信用.*返済.*売/, side: 'SELL', marginType: 'MARGIN_LONG' },
   { re: /信用.*新規.*売/, side: 'SELL', marginType: 'MARGIN_SHORT' },
@@ -87,27 +38,23 @@ function classifyKind(label: string): { side: Side; marginType: MarginType } | n
   return null;
 }
 
-// 損益計算対象外の取引区分。約定履歴照会 CSV には MRF (証券総合口座の自動運用) や
-// 投信買付・解約、株式の預り入出庫が混ざる。これらは Execution として落としても
-// Round 集計に乗らない (現物 fill ではない / 自動連動) ので、警告氾濫を避けるため静かに skip。
-const SKIP_KIND_PATTERNS: RegExp[] = [
-  /^MRF/,           // MRF解約 / MRF買付 / MRF再投資
-  /^投信/,          // 投信金額買付 / 投信金額解約
-  /預り(入庫|出庫)/, // 株式の入出庫
-];
+// 損益計算の対象外（MRF の自動運用・投信・株式の入出庫）。警告を出さずに読み飛ばす。
+const SKIP_KIND_PATTERNS: RegExp[] = [/^MRF/, /^投信/, /預り(入庫|出庫)/];
 
 function shouldSkipKind(label: string): boolean {
   return SKIP_KIND_PATTERNS.some((re) => re.test(label));
 }
 
-// 現引/現渡 は 1 行で 2 つのポジション変化が起きる。
-//   - 現引 = 信用買建を現物として引き取る → MARGIN_LONG SELL (建玉解消) + CASH BUY (現物取得)
-//   - 現渡 = 信用売建に対して現物を渡す → MARGIN_SHORT BUY (建玉解消) + CASH SELL (現物減)
-// 同 instrument / 同 qty / 同 price / 同 executedAt の 2 Execution を生成する。
-// dedupeHash は marginType が違うので衝突しないが、roleSuffix もキーに含めて防御。
-type SplitFill = { side: Side; marginType: MarginType; roleSuffix: string };
+function isMarginSettlement(label: string): boolean {
+  return /信用.*返済/.test(label);
+}
 
-function expandSplitKind(label: string): SplitFill[] | null {
+// 現引/現渡 は 1 行で 2 つの建玉変化が起きる。
+//   現引 = 信用買建を現物で引き取る → MARGIN_LONG SELL（建玉解消）+ CASH BUY（現物取得）
+//   現渡 = 信用売建に現物を渡す     → MARGIN_SHORT BUY（建玉解消）+ CASH SELL（現物減）
+type Leg = { side: Side; marginType: MarginType; roleSuffix?: string };
+
+function legsOf(label: string): Leg[] | null {
   if (/現引/.test(label)) {
     return [
       { side: 'SELL', marginType: 'MARGIN_LONG', roleSuffix: 'close-margin' },
@@ -120,69 +67,119 @@ function expandSplitKind(label: string): SplitFill[] | null {
       { side: 'SELL', marginType: 'CASH', roleSuffix: 'cash-deliver' },
     ];
   }
-  return null;
+  const c = classifyKind(label);
+  return c ? [c] : null;
 }
 
-function buildColumnMap(headerRow: string[]): Partial<Record<ColumnKey, number>> {
-  const map: Partial<Record<ColumnKey, number>> = {};
-  for (const [key, aliases] of Object.entries(HEADER_ALIASES) as [ColumnKey, string[]][]) {
-    const idx = headerRow.findIndex((h) => aliases.some((a) => h.includes(a)));
-    if (idx >= 0) map[key] = idx;
+/** "--" / 空欄を null にしてから数値文字列化 */
+function numOrNull(raw: string | undefined): string | null {
+  const s = (raw ?? '').trim();
+  if (!s || s === '--') return null;
+  return normalizeNumber(s);
+}
+
+function finish(
+  executions: NormalizedExecution[],
+  warnings: ParseWarning[],
+  format: SbiCsvFormat,
+): ParseResult {
+  let earliest: Date | null = null;
+  let latest: Date | null = null;
+  for (const e of executions) {
+    if (!earliest || e.executedAt < earliest) earliest = e.executedAt;
+    if (!latest || e.executedAt > latest) latest = e.executedAt;
   }
-  return map;
+  return { executions, warnings, format, earliestDate: earliest, latestDate: latest };
 }
 
-function findHeaderLine(lines: string[]): number {
-  // 「約定日」「銘柄コード」を両方含む行をヘッダとして検出。
-  for (let i = 0; i < lines.length; i++) {
-    const row = splitCsvRow(lines[i]);
-    const joined = row.join('|');
-    if (/約定日|取引日/.test(joined) && /銘柄コード|コード/.test(joined) && /数量|株数/.test(joined)) {
-      return i;
-    }
-  }
-  return -1;
-}
-
-export type SbiParseOptions = {
-  /** 既定: 自動判定 (BOM 付きは utf-8、それ以外は cp932)。 */
-  encoding?: 'cp932' | 'utf-8' | 'auto';
-  accountExternalId?: string; // デフォルト "default"
+/** 1 行分の共通入力（形式ごとの列位置の違いを吸収したあと） */
+type RowInput = {
+  line: number;
+  seq: number;
+  kindLabel: string;
+  executedAt: Date;
+  timePrecision: TimePrecision;
+  instrument: NormalizedInstrument;
+  qty: string;
+  price: string;
+  fee: string;
+  tax: string;
+  /** 受渡金額/決済損益 列（無い形式は undefined） */
+  settlement?: string | null;
+  externalOrderId?: string;
+  externalFillId?: string;
+  raw: Record<string, string>;
 };
 
-function detectEncoding(buf: Buffer): 'cp932' | 'utf-8' {
-  // UTF-8 BOM
-  if (buf.length >= 3 && buf[0] === 0xef && buf[1] === 0xbb && buf[2] === 0xbf) return 'utf-8';
-  // 先頭 256 バイトで非 ASCII の Shift_JIS 妥当性をざっくり評価
-  const head = buf.subarray(0, Math.min(buf.length, 512));
-  // 単純化: utf-8 として decode した結果に置換文字が含まれていなければ utf-8
-  try {
-    const decoded = head.toString('utf-8');
-    if (decoded.includes('�')) return 'cp932';
-    return 'utf-8';
-  } catch {
-    return 'cp932';
-  }
-}
-
-export function parseSbiCsvBuffer(
-  buf: Buffer,
-  opts: SbiParseOptions = {},
-): ParseResult {
-  const enc = opts.encoding && opts.encoding !== 'auto' ? opts.encoding : detectEncoding(buf);
-  const text = enc === 'utf-8' ? buf.toString('utf-8') : iconv.decode(buf, 'cp932');
-  return parseSbiCsvText(text, opts);
-}
-
 /**
- * 第 3 フォーマット (約定履歴照会 / SaveFile_*.csv): ヘッダが
- *   約定日,銘柄,銘柄コード,市場,取引,期限,預り,課税,約定数量,約定単価,手数料/諸経費等,税額,受渡日,受渡金額/決済損益
- * の 14 列前後。約定時刻なし、注文番号/約定番号なし、複数年に跨る長期エクスポート想定。
- * 取引区分カラム名が「取引」(他フォーマットは「取引区分」) なのが識別キー。
+ * 行を Execution に展開する。受渡金額/決済損益 の値を roleSuffix（pnl=）に乗せ、
+ * 同じ自然キーの 2 行目以降には seq=N を付けて dedupeHash を別物にする
+ * （同日・同銘柄・同価格・同数量の返済が建玉違いで複数あるため）。
  */
+function makeRowEmitter(accountExternalId: string, useSettlementSuffix: boolean) {
+  const seqByKey = new Map<string, number>();
+  return (r: RowInput, warnings: ParseWarning[], out: NormalizedExecution[]) => {
+    const legs = legsOf(r.kindLabel);
+    if (!legs) {
+      warnings.push({ line: r.line, code: 'unknown-kind', message: `取引区分を解釈できません: "${r.kindLabel}"` });
+      return;
+    }
+    const split = legs.length > 1;
+    const brokerPnl = isMarginSettlement(r.kindLabel) ? (r.settlement ?? null) : null;
+    legs.forEach((leg, k) => {
+      let roleSuffix: string | undefined;
+      if (useSettlementSuffix) {
+        const parts: string[] = [];
+        if (leg.roleSuffix) parts.push(leg.roleSuffix);
+        if (r.settlement) parts.push(`pnl=${r.settlement}`);
+        const naturalKey = `${r.executedAt.toISOString()}|${r.instrument.symbol}|${leg.marginType}|${leg.side}|${r.qty}|${r.price}|${parts.join('|')}`;
+        const n = (seqByKey.get(naturalKey) ?? 0) + 1;
+        seqByKey.set(naturalKey, n);
+        if (n > 1) parts.push(`seq=${n}`);
+        roleSuffix = parts.length ? parts.join('|') : undefined;
+      } else {
+        roleSuffix = leg.roleSuffix;
+      }
+      out.push({
+        broker: 'SBI',
+        accountExternalId,
+        instrument: r.instrument,
+        executedAt: r.executedAt,
+        timePrecision: r.timePrecision,
+        side: leg.side,
+        marginType: leg.marginType,
+        qty: r.qty,
+        price: r.price,
+        // 現引/現渡 の手数料・税は信用建玉の決済側（1 本目）に寄せ、現物側は 0
+        fee: k === 0 ? r.fee : '0',
+        tax: k === 0 ? r.tax : '0',
+        // 分解した行で同じ注文番号/約定番号を使うと hash が衝突するので捨てて自然キーで識別する
+        externalOrderId: split ? undefined : r.externalOrderId,
+        externalFillId: split ? undefined : r.externalFillId,
+        roleSuffix,
+        brokerPnl: k === 0 ? brokerPnl : null,
+        seq: r.seq,
+        raw: split || roleSuffix
+          ? {
+              ...r.raw,
+              _roleSuffix: roleSuffix ?? '',
+              ...(split ? { _origOrderId: r.externalOrderId ?? '', _origFillId: r.externalFillId ?? '' } : {}),
+            }
+          : r.raw,
+      });
+    });
+  };
+}
+
+function rowRecord(header: string[], row: string[]): Record<string, string> {
+  return Object.fromEntries(header.map((h, idx) => [h, row[idx] ?? '']));
+}
+
+// ---------- third-savefile（約定履歴照会） ----------
+
 function findThirdFormatHeader(lines: string[]): number {
   for (let i = 0; i < lines.length; i++) {
-    const row = splitCsvRow(lines[i]).map((c) => c.trim());
+    const row = splitCsvRow(lines[i]);
     if (row.length < 10) continue;
     if (
       row[0] === '約定日' &&
@@ -198,166 +195,64 @@ function findThirdFormatHeader(lines: string[]): number {
   return -1;
 }
 
-function parseThirdFormatRows(
-  rawLines: string[],
-  headerIdx: number,
-  accountExternalId: string,
-): ParseResult {
+function parseThirdFormat(lines: string[], headerIdx: number, account: string): ParseResult {
   const warnings: ParseWarning[] = [];
   const executions: NormalizedExecution[] = [];
-  const header = splitCsvRow(rawLines[headerIdx]).map((c) => c.trim());
-
-  const idxDate = 0;
-  const idxName = 1;
-  const idxCode = 2;
-  const idxExchange = 3;
-  const idxKind = 4;
+  const header = splitCsvRow(lines[headerIdx]);
   const idxQty = header.findIndex((h) => h.includes('約定数量'));
   const idxPrice = header.findIndex((h) => h.includes('約定単価'));
   const idxFee = header.findIndex((h) => h.includes('手数料'));
-  const idxTax = header.findIndex((h) => h === '税額' || h.includes('税額'));
-  // 受渡金額/決済損益: 区分により意味が変わる (現物=約定額、信用返済=実損益、現引=支払額)。
-  // 値があれば一律 roleSuffix の pnl= に乗せて dedupe を効かせる。
-  const idxSettlement = header.findIndex(
-    (h) => h.includes('受渡金額') && (h.includes('決済損益') || h.includes('/決済損益')),
-  );
-
+  const idxTax = header.findIndex((h) => h.includes('税額'));
+  const idxSettlement = header.findIndex((h) => h.includes('受渡金額') && h.includes('決済損益'));
   if (idxQty < 0 || idxPrice < 0) {
-    return withFormatMeta({
-      executions: [],
-      warnings: [{
-        line: headerIdx + 1,
-        code: 'missing-columns',
-        message: '約定履歴照会フォーマット必須カラム不足 (約定数量 / 約定単価)',
-      }],
-    }, 'third-savefile');
+    return finish([], [{ line: headerIdx + 1, code: 'missing-columns', message: '約定履歴照会の必須列不足（約定数量 / 約定単価）' }], 'third-savefile');
   }
-
-  const seqByKey = new Map<string, number>();
-  const composeRoleSuffix = (
-    base: string | undefined,
-    pnl: string | null,
-    naturalKey: string,
-  ): string | undefined => {
-    const parts: string[] = [];
-    if (base) parts.push(base);
-    if (pnl) parts.push(`pnl=${pnl}`);
-    const probe = parts.join('|');
-    const fullKey = `${naturalKey}|${probe}`;
-    const n = (seqByKey.get(fullKey) ?? 0) + 1;
-    seqByKey.set(fullKey, n);
-    if (n > 1) parts.push(`seq=${n}`);
-    return parts.length ? parts.join('|') : undefined;
-  };
-
-  for (let i = headerIdx + 1; i < rawLines.length; i++) {
-    const line = rawLines[i];
-    if (!line.trim()) continue;
-    const row = splitCsvRow(line);
-    if (row.every((c) => !c.trim())) continue;
-
-    const kindLabel = (row[idxKind] ?? '').trim();
-    if (!kindLabel) continue; // 体裁行・空 kind
-    if (shouldSkipKind(kindLabel)) continue; // MRF / 投信 / 入出庫
-
-    const dateRaw = (row[idxDate] ?? '').trim();
-    const date = parseJpDate(dateRaw);
+  const emit = makeRowEmitter(account, true);
+  let seq = 0;
+  for (let i = headerIdx + 1; i < lines.length; i++) {
+    if (!lines[i].trim()) continue;
+    const row = splitCsvRow(lines[i]);
+    if (row.every((c) => !c)) continue;
+    const kindLabel = row[4] ?? '';
+    if (!kindLabel || shouldSkipKind(kindLabel)) continue;
+    const date = parseJpDate(row[0] ?? '');
     if (!date) {
-      warnings.push({ line: i + 1, code: 'bad-date', message: `約定日のパース失敗: "${dateRaw}"` });
+      warnings.push({ line: i + 1, code: 'bad-date', message: `約定日のパース失敗: "${row[0] ?? ''}"` });
       continue;
     }
-
-    const split = expandSplitKind(kindLabel);
-    const classified = split ? null : classifyKind(kindLabel);
-    if (!split && !classified) {
-      warnings.push({ line: i + 1, code: 'unknown-kind', message: `取引区分を解釈できません: "${kindLabel}"` });
-      continue;
-    }
-
-    const symbol = (row[idxCode] ?? '').trim();
+    const symbol = row[2] ?? '';
     if (!symbol) {
-      warnings.push({ line: i + 1, code: 'no-symbol', message: `銘柄コードが空 (取引区分=${kindLabel})` });
+      warnings.push({ line: i + 1, code: 'no-symbol', message: `銘柄コードが空（取引区分=${kindLabel}）` });
       continue;
     }
-    const name = (row[idxName] ?? '').trim();
-    const exchangeRaw = (row[idxExchange] ?? '').trim();
-    const exchange = exchangeRaw && exchangeRaw !== '--' ? exchangeRaw : undefined;
-
-    const instrument: NormalizedInstrument = {
-      kind: 'EQUITY_JP',
-      symbol,
-      exchange,
-      name: name || undefined,
-      ccy: 'JPY',
-    };
-
-    const qty = normalizeNumber(row[idxQty]);
-    const price = normalizeNumber(row[idxPrice]);
-    const feeRaw = idxFee >= 0 ? (row[idxFee] ?? '').trim() : '';
-    const taxRaw = idxTax >= 0 ? (row[idxTax] ?? '').trim() : '';
-    const fee = feeRaw && feeRaw !== '--' ? normalizeNumber(feeRaw) : '0';
-    const tax = taxRaw && taxRaw !== '--' ? normalizeNumber(taxRaw) : '0';
-
-    const settlementRaw = idxSettlement >= 0 ? (row[idxSettlement] ?? '').trim() : '';
-    const settlementPnl =
-      settlementRaw && settlementRaw !== '--' ? normalizeNumber(settlementRaw) : null;
-
-    const rawRow = Object.fromEntries(header.map((h, idx) => [h, row[idx] ?? '']));
-
-    if (split) {
-      for (let k = 0; k < split.length; k++) {
-        const s = split[k];
-        const naturalKey = `${date.toISOString()}|${symbol}|${s.marginType}|${s.side}|${qty}|${price}`;
-        const roleSuffix = composeRoleSuffix(s.roleSuffix, settlementPnl, naturalKey);
-        executions.push({
-          broker: 'SBI',
-          accountExternalId,
-          instrument,
-          executedAt: date,
-          side: s.side,
-          marginType: s.marginType,
-          qty,
-          price,
-          fee: k === 0 ? fee : '0',
-          tax: k === 0 ? tax : '0',
-          externalOrderId: undefined,
-          externalFillId: undefined,
-          roleSuffix,
-          raw: { ...rawRow, _roleSuffix: roleSuffix ?? '' },
-        });
-      }
-      continue;
-    }
-
-    const naturalKey = `${date.toISOString()}|${symbol}|${classified!.marginType}|${classified!.side}|${qty}|${price}`;
-    const roleSuffix = composeRoleSuffix(undefined, settlementPnl, naturalKey);
-    executions.push({
-      broker: 'SBI',
-      accountExternalId,
-      instrument,
-      executedAt: date,
-      side: classified!.side,
-      marginType: classified!.marginType,
-      qty,
-      price,
-      fee,
-      tax,
-      externalOrderId: undefined,
-      externalFillId: undefined,
-      roleSuffix,
-      raw: roleSuffix ? { ...rawRow, _roleSuffix: roleSuffix } : rawRow,
-    });
+    const exchange = row[3] && row[3] !== '--' ? row[3] : undefined;
+    emit(
+      {
+        line: i + 1,
+        seq: seq++,
+        kindLabel,
+        executedAt: date,
+        timePrecision: 'day',
+        instrument: { symbol, exchange, name: row[1] || undefined },
+        qty: normalizeNumber(row[idxQty]),
+        price: normalizeNumber(row[idxPrice]),
+        fee: idxFee >= 0 ? numOrNull(row[idxFee]) ?? '0' : '0',
+        tax: idxTax >= 0 ? numOrNull(row[idxTax]) ?? '0' : '0',
+        settlement: idxSettlement >= 0 ? numOrNull(row[idxSettlement]) : undefined,
+        raw: rowRecord(header, row),
+      },
+      warnings,
+      executions,
+    );
   }
-  return withFormatMeta({ executions, warnings }, 'third-savefile');
+  return finish(executions, warnings, 'third-savefile');
 }
 
-/**
- * 新フォーマット (注文一覧_当日約定): ヘッダの先頭が「銘柄,銘柄,銘柄」と 3 列連続し、
- * 「平均約定単価」が含まれる。1=コード, 2=名称, 3=市場、約定時刻なし、手数料/税が "--" のことあり。
- */
+// ---------- new-daily（注文一覧_当日約定） ----------
+
 function findNewFormatHeader(lines: string[]): number {
   for (let i = 0; i < lines.length; i++) {
-    const row = splitCsvRow(lines[i]).map((c) => c.trim());
+    const row = splitCsvRow(lines[i]);
     if (row.length < 8) continue;
     if (
       row[0] === '銘柄' &&
@@ -373,291 +268,186 @@ function findNewFormatHeader(lines: string[]): number {
   return -1;
 }
 
-function parseNewFormatRows(
-  rawLines: string[],
-  headerIdx: number,
-  accountExternalId: string,
-): ParseResult {
+function parseNewFormat(lines: string[], headerIdx: number, account: string): ParseResult {
   const warnings: ParseWarning[] = [];
   const executions: NormalizedExecution[] = [];
-  const header = splitCsvRow(rawLines[headerIdx]).map((c) => c.trim());
-
-  // 必須カラム位置
+  const header = splitCsvRow(lines[headerIdx]);
   const idxKind = header.findIndex((h) => h.includes('取引区分'));
   const idxDate = header.findIndex((h) => h.includes('約定日'));
   const idxQty = header.findIndex((h) => h.includes('株数'));
   const idxPrice = header.findIndex((h) => h.includes('平均約定単価'));
   const idxFee = header.findIndex((h) => h.includes('手数料'));
   const idxTax = header.findIndex((h) => h.includes('課税額') || h.includes('譲渡益税'));
-  // 「注文一覧_約定履歴」固有: 受渡金額・決済損益。同日同銘柄同価格でも建玉違いの返済を区別する識別子になる。
-  // 値が "--" (T+2 前の当日約定) のときは null として扱い、後段の seq fallback に任せる。
-  const idxSettlement = header.findIndex(
-    (h) => h.includes('受渡金額') && h.includes('決済損益'),
-  );
-
+  const idxSettlement = header.findIndex((h) => h.includes('受渡金額') && h.includes('決済損益'));
   const missing: string[] = [];
   if (idxKind < 0) missing.push('取引区分');
   if (idxDate < 0) missing.push('約定日');
   if (idxQty < 0) missing.push('株数');
   if (idxPrice < 0) missing.push('平均約定単価');
   if (missing.length) {
-    return withFormatMeta({
-      executions: [],
-      warnings: [{ line: headerIdx + 1, code: 'missing-columns', message: `新フォーマット必須カラム不足: ${missing.join(', ')}` }],
-    }, 'new-daily');
+    return finish([], [{ line: headerIdx + 1, code: 'missing-columns', message: `新フォーマット必須カラム不足: ${missing.join(', ')}` }], 'new-daily');
   }
-
-  // 同自然キー (executedAt+symbol+marginType+side+qty+price+roleSuffix) の出現回数を
-  // 行ループ中に追跡。2 件目以降は roleSuffix に `seq=N` を付けて dedupeHash を別物にする。
-  // CSV 上で「受渡損益も同じ」完全重複が出ても (理論上ほぼ無い) 衝突しない最終安全網。
-  const seqByKey = new Map<string, number>();
-  const bumpSeq = (key: string): number => {
-    const n = (seqByKey.get(key) ?? 0) + 1;
-    seqByKey.set(key, n);
-    return n;
-  };
-  const composeRoleSuffix = (
-    base: string | undefined,
-    pnl: string | null,
-    naturalKey: string,
-  ): string | undefined => {
-    const parts: string[] = [];
-    if (base) parts.push(base);
-    if (pnl) parts.push(`pnl=${pnl}`);
-    const probe = parts.join('|');
-    const n = bumpSeq(`${naturalKey}|${probe}`);
-    if (n > 1) parts.push(`seq=${n}`);
-    return parts.length ? parts.join('|') : undefined;
-  };
-
-  for (let i = headerIdx + 1; i < rawLines.length; i++) {
-    const line = rawLines[i];
-    if (!line.trim()) continue;
-    const row = splitCsvRow(line);
-    if (row.every((c) => !c.trim())) continue;
-
-    const dateRaw = (row[idxDate] ?? '').trim();
-    const date = parseJpDate(dateRaw);
+  const emit = makeRowEmitter(account, true);
+  let seq = 0;
+  for (let i = headerIdx + 1; i < lines.length; i++) {
+    if (!lines[i].trim()) continue;
+    const row = splitCsvRow(lines[i]);
+    if (row.every((c) => !c)) continue;
+    const date = parseJpDate(row[idxDate] ?? '');
     if (!date) {
-      warnings.push({ line: i + 1, code: 'bad-date', message: `約定日のパース失敗: "${dateRaw}"` });
+      warnings.push({ line: i + 1, code: 'bad-date', message: `約定日のパース失敗: "${row[idxDate] ?? ''}"` });
       continue;
     }
-
-    const kindLabel = (row[idxKind] ?? '').trim();
-    const split = expandSplitKind(kindLabel);
-    const classified = split ? null : classifyKind(kindLabel);
-    if (!split && !classified) {
-      warnings.push({ line: i + 1, code: 'unknown-kind', message: `取引区分を解釈できません: "${kindLabel}"` });
-      continue;
-    }
-
-    const symbol = (row[0] ?? '').trim();
-    const name = (row[1] ?? '').trim();
-    const exchange = (row[2] ?? '').trim();
+    const symbol = row[0] ?? '';
     if (!symbol) {
       warnings.push({ line: i + 1, code: 'no-symbol', message: '銘柄コードが空' });
       continue;
     }
-
-    const instrument: NormalizedInstrument = {
-      kind: 'EQUITY_JP',
-      symbol,
-      exchange: exchange || undefined,
-      name: name || undefined,
-      ccy: 'JPY',
-    };
-
-    const qty = normalizeNumber(row[idxQty]);
-    const price = normalizeNumber(row[idxPrice]);
-    // 現引/現渡 の手数料・税金は信用建玉決済側に寄せる (現物側はゼロ扱い)。
-    // 受渡金額 = -建値×数量 のみで、手数料/課税は "--" で来るのが通常。
-    const fee = idxFee >= 0 ? normalizeNumber(row[idxFee]) : '0';
-    const tax = idxTax >= 0 ? normalizeNumber(row[idxTax]) : '0';
-    // 受渡損益: "--" / 空 のときは null。それ以外は normalizeNumber で数値文字列化。
-    const settlementRaw = idxSettlement >= 0 ? (row[idxSettlement] ?? '').trim() : '';
-    const settlementPnl =
-      settlementRaw && settlementRaw !== '--' ? normalizeNumber(settlementRaw) : null;
-    const rawRow = Object.fromEntries(header.map((h, idx) => [h, row[idx] ?? '']));
-
-    if (split) {
-      for (let k = 0; k < split.length; k++) {
-        const s = split[k];
-        const naturalKey = `${date.toISOString()}|${symbol}|${s.marginType}|${s.side}|${qty}|${price}`;
-        const roleSuffix = composeRoleSuffix(s.roleSuffix, settlementPnl, naturalKey);
-        executions.push({
-          broker: 'SBI',
-          accountExternalId,
-          instrument,
-          executedAt: date,
-          side: s.side,
-          marginType: s.marginType,
-          qty,
-          price,
-          // 信用建玉決済側 (k=0) に手数料/税を寄せ、現物側は 0
-          fee: k === 0 ? fee : '0',
-          tax: k === 0 ? tax : '0',
-          externalOrderId: undefined,
-          externalFillId: undefined,
-          roleSuffix,
-          raw: { ...rawRow, _roleSuffix: roleSuffix ?? '' },
-        });
-      }
-      continue;
-    }
-
-    const naturalKey = `${date.toISOString()}|${symbol}|${classified!.marginType}|${classified!.side}|${qty}|${price}`;
-    const roleSuffix = composeRoleSuffix(undefined, settlementPnl, naturalKey);
-    executions.push({
-      broker: 'SBI',
-      accountExternalId,
-      instrument,
-      executedAt: date,
-      side: classified!.side,
-      marginType: classified!.marginType,
-      qty,
-      price,
-      fee,
-      tax,
-      externalOrderId: undefined,
-      externalFillId: undefined,
-      roleSuffix,
-      raw: roleSuffix ? { ...rawRow, _roleSuffix: roleSuffix } : rawRow,
-    });
+    emit(
+      {
+        line: i + 1,
+        seq: seq++,
+        kindLabel: row[idxKind] ?? '',
+        executedAt: date,
+        timePrecision: 'day',
+        instrument: { symbol, exchange: row[2] || undefined, name: row[1] || undefined },
+        qty: normalizeNumber(row[idxQty]),
+        price: normalizeNumber(row[idxPrice]),
+        fee: idxFee >= 0 ? normalizeNumber(row[idxFee]) : '0',
+        tax: idxTax >= 0 ? normalizeNumber(row[idxTax]) : '0',
+        settlement: idxSettlement >= 0 ? numOrNull(row[idxSettlement]) : undefined,
+        raw: rowRecord(header, row),
+      },
+      warnings,
+      executions,
+    );
   }
-  return withFormatMeta({ executions, warnings }, 'new-daily');
+  return finish(executions, warnings, 'new-daily');
 }
 
-export function parseSbiCsvText(
-  text: string,
-  opts: SbiParseOptions = {},
-): ParseResult {
-  const accountExternalId = opts.accountExternalId ?? 'default';
+// ---------- legacy（約定時刻・注文番号のある旧形式） ----------
+
+type ColumnKey =
+  | 'tradeDate' | 'tradeTime' | 'symbol' | 'name' | 'exchange' | 'kind'
+  | 'qty' | 'price' | 'fee' | 'tax' | 'orderId' | 'fillId';
+
+// 部分一致なので、具体的な名前が他の列と混同しないこと（「銘柄」だけだと「銘柄コード」にも一致する）
+const HEADER_ALIASES: Record<ColumnKey, string[]> = {
+  tradeDate: ['約定日', '取引日'],
+  tradeTime: ['約定時刻', '約定時間'],
+  symbol: ['銘柄コード', 'コード'],
+  name: ['銘柄名'],
+  exchange: ['市場', '取引所'],
+  kind: ['取引区分', '売買区分', '区分'],
+  qty: ['数量', '株数'],
+  price: ['約定単価', '単価', '取引単価'],
+  fee: ['手数料'],
+  tax: ['税金', '消費税'],
+  orderId: ['注文番号'],
+  fillId: ['約定番号'],
+};
+
+function findLegacyHeader(lines: string[]): number {
+  for (let i = 0; i < lines.length; i++) {
+    const joined = splitCsvRow(lines[i]).join('|');
+    if (/約定日|取引日/.test(joined) && /銘柄コード|コード/.test(joined) && /数量|株数/.test(joined)) {
+      return i;
+    }
+  }
+  return -1;
+}
+
+function parseLegacyFormat(lines: string[], headerIdx: number, account: string): ParseResult {
   const warnings: ParseWarning[] = [];
   const executions: NormalizedExecution[] = [];
-
-  // BOM 除去、改行統一
-  const cleaned = text.replace(/^﻿/, '').replace(/\r\n?/g, '\n');
-  const rawLines = cleaned.split('\n');
-
-  // 約定履歴照会 (SaveFile_*.csv) を最初に試す — 14 列、約定時刻なし、長期エクスポート
-  const thirdIdx = findThirdFormatHeader(rawLines);
-  if (thirdIdx >= 0) {
-    return parseThirdFormatRows(rawLines, thirdIdx, accountExternalId);
+  const header = splitCsvRow(lines[headerIdx]);
+  const cols: Partial<Record<ColumnKey, number>> = {};
+  for (const [key, aliases] of Object.entries(HEADER_ALIASES) as [ColumnKey, string[]][]) {
+    const idx = header.findIndex((h) => aliases.some((a) => h.includes(a)));
+    if (idx >= 0) cols[key] = idx;
   }
-
-  // 新フォーマット (注文一覧_当日約定) を次に試す
-  const newIdx = findNewFormatHeader(rawLines);
-  if (newIdx >= 0) {
-    return parseNewFormatRows(rawLines, newIdx, accountExternalId);
-  }
-
-  const headerIdx = findHeaderLine(rawLines);
-  if (headerIdx < 0) {
-    return withFormatMeta({
-      executions: [],
-      warnings: [{ line: 0, code: 'no-header', message: 'ヘッダ行を検出できません (約定日/銘柄コード/数量 を含む行が必要)' }],
-    }, 'unknown');
-  }
-  const headerRow = splitCsvRow(rawLines[headerIdx]);
-  const cols = buildColumnMap(headerRow);
-
   const required: ColumnKey[] = ['tradeDate', 'symbol', 'kind', 'qty', 'price'];
   const missing = required.filter((k) => cols[k] == null);
   if (missing.length) {
-    return withFormatMeta({
-      executions: [],
-      warnings: [{ line: headerIdx + 1, code: 'missing-columns', message: `必須カラム不足: ${missing.join(', ')}` }],
-    }, 'legacy');
+    return finish([], [{ line: headerIdx + 1, code: 'missing-columns', message: `必須カラム不足: ${missing.join(', ')}` }], 'legacy');
   }
-
-  for (let i = headerIdx + 1; i < rawLines.length; i++) {
-    const line = rawLines[i];
-    if (!line.trim()) continue;
-    const row = splitCsvRow(line);
-    if (row.every((c) => !c.trim())) continue;
-
+  const emit = makeRowEmitter(account, false);
+  let seq = 0;
+  for (let i = headerIdx + 1; i < lines.length; i++) {
+    if (!lines[i].trim()) continue;
+    const row = splitCsvRow(lines[i]);
+    if (row.every((c) => !c)) continue;
     const get = (k: ColumnKey) => (cols[k] != null ? row[cols[k]!] ?? '' : '');
-
-    const dateRaw = get('tradeDate');
-    const date = parseJpDate(dateRaw);
+    const date = parseJpDate(get('tradeDate'));
     if (!date) {
-      warnings.push({ line: i + 1, code: 'bad-date', message: `約定日のパース失敗: "${dateRaw}"` });
+      warnings.push({ line: i + 1, code: 'bad-date', message: `約定日のパース失敗: "${get('tradeDate')}"` });
       continue;
     }
     const timeRaw = get('tradeTime');
-    const executedAt = timeRaw ? combineJstDateTime(date, timeRaw) : date;
-
-    const kindLabel = get('kind');
-    const split = expandSplitKind(kindLabel);
-    const classified = split ? null : classifyKind(kindLabel);
-    if (!split && !classified) {
-      warnings.push({ line: i + 1, code: 'unknown-kind', message: `取引区分を解釈できません: "${kindLabel}"` });
-      continue;
-    }
-
-    const symbol = get('symbol').trim();
+    const symbol = get('symbol');
     if (!symbol) {
       warnings.push({ line: i + 1, code: 'no-symbol', message: '銘柄コードが空' });
       continue;
     }
-
-    const instrument: NormalizedInstrument = {
-      kind: 'EQUITY_JP',
-      symbol,
-      exchange: get('exchange') || undefined,
-      name: get('name') || undefined,
-      ccy: 'JPY',
-    };
-
-    const qty = normalizeNumber(get('qty'));
-    const price = normalizeNumber(get('price'));
-    const fee = normalizeNumber(get('fee'));
-    const tax = normalizeNumber(get('tax'));
-    const orderId = get('orderId') || undefined;
-    const fillId = get('fillId') || undefined;
-    const rawRow = Object.fromEntries(headerRow.map((h, idx) => [h, row[idx] ?? '']));
-
-    if (split) {
-      for (let k = 0; k < split.length; k++) {
-        const s = split[k];
-        executions.push({
-          broker: 'SBI',
-          accountExternalId,
-          instrument,
-          executedAt,
-          side: s.side,
-          marginType: s.marginType,
-          qty,
-          price,
-          fee: k === 0 ? fee : '0',
-          tax: k === 0 ? tax : '0',
-          // 同一 orderId/fillId のままだと dedupeHash が衝突する経路に入るので、
-          // split 行では external ID を捨て、自然キー + roleSuffix で識別する。
-          externalOrderId: undefined,
-          externalFillId: undefined,
-          roleSuffix: s.roleSuffix,
-          raw: { ...rawRow, _origOrderId: orderId ?? '', _origFillId: fillId ?? '', _roleSuffix: s.roleSuffix },
-        });
-      }
-      continue;
-    }
-
-    executions.push({
-      broker: 'SBI',
-      accountExternalId,
-      instrument,
-      executedAt,
-      side: classified!.side,
-      marginType: classified!.marginType,
-      qty,
-      price,
-      fee,
-      tax,
-      externalOrderId: orderId,
-      externalFillId: fillId,
-      raw: rawRow,
-    });
+    emit(
+      {
+        line: i + 1,
+        seq: seq++,
+        kindLabel: get('kind'),
+        executedAt: timeRaw ? combineJstDateTime(date, timeRaw) : date,
+        timePrecision: timeRaw ? 'ms' : 'day',
+        instrument: { symbol, exchange: get('exchange') || undefined, name: get('name') || undefined },
+        qty: normalizeNumber(get('qty')),
+        price: normalizeNumber(get('price')),
+        fee: normalizeNumber(get('fee')),
+        tax: normalizeNumber(get('tax')),
+        externalOrderId: get('orderId') || undefined,
+        externalFillId: get('fillId') || undefined,
+        raw: rowRecord(header, row),
+      },
+      warnings,
+      executions,
+    );
   }
+  return finish(executions, warnings, 'legacy');
+}
 
-  return withFormatMeta({ executions, warnings }, 'legacy');
+// ---------- 入口 ----------
+
+export type SbiParseOptions = {
+  /** 既定: 自動判定（UTF-8 として読めれば utf-8、それ以外は cp932） */
+  encoding?: 'cp932' | 'utf-8' | 'auto';
+  accountExternalId?: string; // 既定 "default"
+};
+
+function detectEncoding(buf: Buffer): 'cp932' | 'utf-8' {
+  if (buf.length >= 3 && buf[0] === 0xef && buf[1] === 0xbb && buf[2] === 0xbf) return 'utf-8';
+  const head = buf.subarray(0, Math.min(buf.length, 512)).toString('utf-8');
+  return head.includes('�') ? 'cp932' : 'utf-8';
+}
+
+export function parseSbiCsvBuffer(buf: Buffer, opts: SbiParseOptions = {}): ParseResult {
+  const enc = opts.encoding && opts.encoding !== 'auto' ? opts.encoding : detectEncoding(buf);
+  const text = enc === 'utf-8' ? buf.toString('utf-8') : iconv.decode(buf, 'cp932');
+  return parseSbiCsvText(text, opts);
+}
+
+export function parseSbiCsvText(text: string, opts: SbiParseOptions = {}): ParseResult {
+  const account = opts.accountExternalId ?? 'default';
+  const lines = text.replace(/^﻿/, '').replace(/\r\n?/g, '\n').split('\n');
+
+  const thirdIdx = findThirdFormatHeader(lines);
+  if (thirdIdx >= 0) return parseThirdFormat(lines, thirdIdx, account);
+
+  const newIdx = findNewFormatHeader(lines);
+  if (newIdx >= 0) return parseNewFormat(lines, newIdx, account);
+
+  const legacyIdx = findLegacyHeader(lines);
+  if (legacyIdx >= 0) return parseLegacyFormat(lines, legacyIdx, account);
+
+  return finish(
+    [],
+    [{ line: 0, code: 'no-header', message: 'ヘッダ行を検出できません（約定日/銘柄コード/数量 を含む行が必要）' }],
+    'unknown',
+  );
 }
