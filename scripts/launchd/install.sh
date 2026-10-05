@@ -1,5 +1,6 @@
 #!/bin/bash
-# 振り返り画面の常駐（com.tomato.tradelog.web）と引け後の daily（com.tomato.tradelog.daily）を
+# 振り返り画面の常駐（com.tomato.tradelog.web）と引け後の daily（com.tomato.tradelog.daily）、
+# 平日 8:53 の小窓への録画指示（com.tomato.tradelog.record）を
 # ユーザーの LaunchAgents に入れて読み込む。何度実行してもよい（入れ直し）。
 # node の場所は NODE_BIN で指定できる。無ければ PATH → ログインシェル（nvm 等）→ nvm.sh の順に探す。
 set -euo pipefail
@@ -9,7 +10,7 @@ REPO="$(cd "$HERE/../.." && pwd)"
 AGENTS="$HOME/Library/LaunchAgents"
 LOG_DIR="$HOME/Library/Logs/tradelog"
 DOMAIN="gui/$(id -u)"
-LABELS=(com.tomato.tradelog.web com.tomato.tradelog.daily)
+LABELS=(com.tomato.tradelog.web com.tomato.tradelog.daily com.tomato.tradelog.record)
 
 find_node() {
   if [ -n "${NODE_BIN:-}" ]; then echo "$NODE_BIN"; return; fi
@@ -75,5 +76,5 @@ for label in "${LABELS[@]}"; do
   echo "読み込み: $label ($plist)"
 done
 
-echo "ログ: $LOG_DIR/web.log / $LOG_DIR/daily.log"
+echo "ログ: $LOG_DIR/web.log / $LOG_DIR/daily.log / $LOG_DIR/record.log"
 echo "画面: http://127.0.0.1:3000（この Mac からだけ）。初回は next build が走るので、開けるまで 1 分ほどかかることがある"

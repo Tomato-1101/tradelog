@@ -4,7 +4,7 @@ set -euo pipefail
 
 AGENTS="$HOME/Library/LaunchAgents"
 DOMAIN="gui/$(id -u)"
-for label in com.tomato.tradelog.web com.tomato.tradelog.daily; do
+for label in com.tomato.tradelog.web com.tomato.tradelog.daily com.tomato.tradelog.record; do
   if launchctl bootout "$DOMAIN/$label" 2>/dev/null; then
     echo "停止: $label"
   else

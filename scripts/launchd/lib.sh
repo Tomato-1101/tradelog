@@ -43,3 +43,19 @@ ensure_migrated() {
   fi
   log "migration を適用した"
 }
+
+# 録画が始まったかを待つ（record-run.sh）。marker より後に書かれたメタ（<dir>/*.json）に "status":"recording" が現れたら 0、
+# "failed" なら 2（すぐ返す）、timeout 秒たっても現れなければ 1。メタは小窓が録画を始めた直後に書く（docs/paper-events.md）
+wait_recording_started() {
+  local dir="$1" marker="$2" timeout="$3" i f
+  for ((i = 0; i < timeout; i++)); do
+    if [ -d "$dir" ]; then
+      while IFS= read -r f; do
+        grep -Eq '"status" *: *"recording"' "$f" && return 0
+        grep -Eq '"status" *: *"failed"' "$f" && return 2
+      done < <(find "$dir" -maxdepth 1 -name '*.json' -newer "$marker" 2>/dev/null)
+    fi
+    sleep 1
+  done
+  return 1
+}

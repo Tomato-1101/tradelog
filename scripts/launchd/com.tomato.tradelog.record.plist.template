@@ -1,0 +1,38 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- 平日 8:53 に小窓（TradePanel）へ「37 分録画」を指示する（寄り前後のリプレイ練習用）。
+     録るのは HYPER SBI 2 のウィンドウだけ。ネットワークは使わない。caffeinate で 45 分は画面を消さない。
+     スリープ中に時刻を過ぎた分は、復帰時に launchd が 1 回実行する（その時刻から 37 分録る）。
+     __REPO__ / __LOG_DIR__ は install.sh が埋める。 -->
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.tomato.tradelog.record</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/bin/bash</string>
+    <string>__REPO__/scripts/launchd/record-run.sh</string>
+  </array>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key>
+    <string>/usr/bin:/bin:/usr/sbin:/sbin</string>
+    <key>TRADELOG_LOG</key>
+    <string>__LOG_DIR__/record.log</string>
+  </dict>
+  <key>StartCalendarInterval</key>
+  <array>
+    <dict><key>Weekday</key><integer>1</integer><key>Hour</key><integer>8</integer><key>Minute</key><integer>53</integer></dict>
+    <dict><key>Weekday</key><integer>2</integer><key>Hour</key><integer>8</integer><key>Minute</key><integer>53</integer></dict>
+    <dict><key>Weekday</key><integer>3</integer><key>Hour</key><integer>8</integer><key>Minute</key><integer>53</integer></dict>
+    <dict><key>Weekday</key><integer>4</integer><key>Hour</key><integer>8</integer><key>Minute</key><integer>53</integer></dict>
+    <dict><key>Weekday</key><integer>5</integer><key>Hour</key><integer>8</integer><key>Minute</key><integer>53</integer></dict>
+  </array>
+  <key>RunAtLoad</key>
+  <false/>
+  <key>StandardOutPath</key>
+  <string>__LOG_DIR__/record.log</string>
+  <key>StandardErrorPath</key>
+  <string>__LOG_DIR__/record.log</string>
+</dict>
+</plist>
