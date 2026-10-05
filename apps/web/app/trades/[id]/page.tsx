@@ -12,12 +12,14 @@ import {
   fmtJst,
   fmtJstDate,
   fmtPrice,
+  fmtVideoMs,
   fmtYen,
   pnlSign,
 } from '@/lib/format';
+import { canSetManualPrice } from '@/lib/paper/ingest';
 import { shotUrl } from '@/lib/paper/shots';
 import { loadRoundDetail } from '@/lib/review/queries';
-import { buildHref, sourceParam } from '@/lib/review/url';
+import { SOURCE_LABEL, buildHref, sourceParam } from '@/lib/review/url';
 import FetchDailyButton from '@/components/FetchDailyButton';
 import ManualPriceForm from '@/components/ManualPriceForm';
 import ShotGallery from '@/components/ShotGallery';
@@ -59,7 +61,8 @@ export default async function TradePage({ params }: { params: Promise<{ id: stri
     const px = s.price != null ? `OCR読取価格 ${fmtPrice(s.price)}円` : `読み取れず${s.priceText ? `（${s.priceText}）` : ''}`;
     const conf = s.confidence != null ? `／読取信頼度${Math.round(s.confidence * 100)}%` : '';
     const auto = s.autoPrice != null ? `／自動読取 ${fmtPrice(s.autoPrice)}円` : '';
-    return [{ url, caption: `${fmtJst(s.placedAt, 'ms', true).slice(6)}／${px}${conf}${auto}` }];
+    const video = s.videoMs != null ? `／再生 ${fmtVideoMs(s.videoMs)}` : '';
+    return [{ url, caption: `${fmtJst(s.placedAt, 'ms', true).slice(6)}${video}／${px}${conf}${auto}` }];
   });
 
   return (
@@ -74,7 +77,7 @@ export default async function TradePage({ params }: { params: Promise<{ id: stri
           <div className="meta">
             <span className={`chip ${r.direction === 'LONG' ? 'up' : 'down'}`}>{DIRECTION_LABEL[r.direction]}</span>
             {r.marginType && <span className="chip">{MARGIN_LABEL[r.marginType]}</span>}
-            <span className="chip">{r.source === 'PAPER' ? 'ペーパー' : '本番(SBI)'}</span>
+            <span className="chip">{SOURCE_LABEL[r.source]}</span>
             {r.status === 'OPEN' ? <span className="chip live">保有中</span> : <span className="chip">決済済</span>}
           </div>
         </div>
@@ -102,6 +105,12 @@ export default async function TradePage({ params }: { params: Promise<{ id: stri
         {ms && <div><dt>最大逆行（1株）</dt><dd className="down">{fmtPrice(r.mae, 2)}</dd></div>}
         {ms && <div><dt>最大順行（1株）</dt><dd className="up">{fmtPrice(r.mfe, 2)}</dd></div>}
       </dl>
+      {d.replay && (
+        <p className="muted">
+          録画を再生しながらの練習。録画 {d.replay.recordingIds.join('・') || '—'}／セッション {d.replay.sessionIds.map((x) => x.slice(0, 8)).join('・') || '—'}
+          ／再生位置 {d.executions.filter((e) => e.videoMs != null).map((e) => fmtVideoMs(e.videoMs)).join('・') || '—'}（時刻は録画上の実時刻）
+        </p>
+      )}
       {r.warnings.length > 0 && (
         <ul className="notes">
           {r.warnings.map((w) => (
@@ -140,8 +149,9 @@ export default async function TradePage({ params }: { params: Promise<{ id: stri
                 {e.priceBasis && `・${PRICE_BASIS_LABEL[e.priceBasis as keyof typeof PRICE_BASIS_LABEL]}`}
                 {e.shareNote ? `・${e.shareNote}` : e.priceNote ? `・${e.priceNote}` : ''}
                 {e.captureDelayMs != null && `・${captureDelay(e.captureDelayMs)}`}
+                {e.videoMs != null && `・再生 ${fmtVideoMs(e.videoMs)}`}
               </div>
-              {e.source === 'PAPER' && (pending || e.priceBasis === 'MANUAL') && (
+              {canSetManualPrice(e.source) && (pending || e.priceBasis === 'MANUAL') && (
                 <ManualPriceForm executionId={e.id} initial={e.price} label={pending ? '確定' : '修正'} />
               )}
             </li>
@@ -173,6 +183,7 @@ export default async function TradePage({ params }: { params: Promise<{ id: stri
                     {when(e.executedAt, true)}
                     {e.intent && <span className="sub">{INTENT_LABEL[e.intent]}{e.orderType === 'LIMIT' ? `・指値${e.limitPrice ? ` ${fmtPrice(e.limitPrice)}` : ''}` : ''}</span>}
                     {e.captureDelayMs != null && <span className="sub">{captureDelay(e.captureDelayMs)}</span>}
+                    {e.videoMs != null && <span className="sub">再生 {fmtVideoMs(e.videoMs)}</span>}
                   </td>
                   <td><span className={`side ${e.side === 'BUY' ? 'buy' : 'sell'}`}>{SIDE_LABEL[e.side]}</span></td>
                   <td className="num">{fmtPrice(e.qty)}{e.shareNote && <span className="muted" title={e.shareNote}> *</span>}</td>
@@ -185,7 +196,7 @@ export default async function TradePage({ params }: { params: Promise<{ id: stri
                   <td>{e.priceBasis ? PRICE_BASIS_LABEL[e.priceBasis as keyof typeof PRICE_BASIS_LABEL] : '—'}</td>
                   <td>{e.shareNote ? `* ${e.shareNote}` : (e.priceNote ?? '')}</td>
                   <td>
-                    {e.source === 'PAPER' && (pending || e.priceBasis === 'MANUAL') && (
+                    {canSetManualPrice(e.source) && (pending || e.priceBasis === 'MANUAL') && (
                       <ManualPriceForm executionId={e.id} initial={e.price} label={pending ? '確定' : '修正'} />
                     )}
                   </td>
@@ -203,7 +214,10 @@ export default async function TradePage({ params }: { params: Promise<{ id: stri
         <ul className="panel memos">
           {d.memos.map((m) => (
             <li key={m.id}>
-              <time>{fmtJst(m.ts, 'ms', true)}</time>
+              <time>
+                {fmtJst(m.ts, 'ms', true)}
+                {m.videoMs != null && <span className="sub">再生 {fmtVideoMs(m.videoMs)}</span>}
+              </time>
               <span>{m.text}</span>
             </li>
           ))}
@@ -212,7 +226,7 @@ export default async function TradePage({ params }: { params: Promise<{ id: stri
 
       {ms && (
         <>
-          <h2>発注時のスクショ</h2>
+          <h2>{r.source === 'REPLAY' ? '発注時の録画のフレーム' : '発注時のスクショ'}</h2>
           <ShotGallery items={shots} />
         </>
       )}

@@ -1,9 +1,9 @@
-// 集計: lib/stats の値とエクイティカーブ。ペーパー / 本番(SBI) の切り替えと期間プリセット。
+// 集計: lib/stats の値とエクイティカーブ。ペーパー / 本番(SBI) / リプレイ の切り替えと期間プリセット。
 import { prisma } from '@/lib/db';
 import { fmtHold, fmtYen, pnlSign } from '@/lib/format';
 import { parsePeriodParams } from '@/lib/period';
 import { loadStatsRounds, provisionalRoundCount } from '@/lib/review/queries';
-import { buildHref, parseSource, sourceParam, type SP } from '@/lib/review/url';
+import { SOURCE_LABEL, buildHref, parseSource, sourceParam, type SP, type SourceKey } from '@/lib/review/url';
 import { computeStats } from '@/lib/stats/compute';
 import { equitySeries } from '@/lib/stats/equity';
 import EquityChart from '@/components/EquityChart';
@@ -31,7 +31,7 @@ export default async function StatsPage({ searchParams }: { searchParams: Promis
     from: period.preset === 'custom' ? period.from : undefined,
     to: period.preset === 'custom' ? period.to : undefined,
   };
-  const tab = (s: 'PAPER' | 'SBI', label: string) => (
+  const tab = (s: SourceKey, label: string) => (
     <a href={buildHref('/stats', { source: sourceParam(s), ...periodParams })} aria-current={source === s ? 'page' : undefined}>
       {label}
     </a>
@@ -54,8 +54,9 @@ export default async function StatsPage({ searchParams }: { searchParams: Promis
       <h1>集計</h1>
       <div className="bar">
         <nav className="tabs" aria-label="種別">
-          {tab('PAPER', 'ペーパー')}
-          {tab('SBI', '本番(SBI)')}
+          {tab('PAPER', SOURCE_LABEL.PAPER)}
+          {tab('SBI', SOURCE_LABEL.SBI)}
+          {tab('REPLAY', SOURCE_LABEL.REPLAY)}
         </nav>
       </div>
       <PeriodNav path="/stats" keep={{ source: sourceParam(source) }} period={period} />

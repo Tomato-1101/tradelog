@@ -4,8 +4,10 @@
 import type { PrismaClient } from '@/generated/prisma/client';
 import { floorToMinute } from '@/lib/time';
 import { loadMinuteBars } from '@/lib/bars/store';
+import { paperDir } from '@/lib/paper/shots';
+import { replayEndResolver, type ReplayEndResolver } from '@/lib/paper/recordings';
 import { buildPaperRounds, buildSbiRounds } from './builder';
-import { computeExcursion } from './excursion';
+import { computeExcursion, openRoundEnd } from './excursion';
 import type { ExecForRound, RoundDraft } from './types';
 
 /** 撮影画面の自動読取の銘柄が発注銘柄と違うか。読めていない（null・空）ときは比べない */
@@ -14,11 +16,16 @@ export function screenSymbolMismatch(screen: string | null, order: string): { sc
   return s && s !== order ? { screen: s, order } : null;
 }
 
-export type RebuildReport = { rounds: number; paper: number; sbi: number; deleted: number; warnings: string[] };
+export type RebuildReport = { rounds: number; paper: number; replay: number; sbi: number; deleted: number; warnings: string[] };
 
-export async function rebuildRounds(db: PrismaClient, now: Date): Promise<RebuildReport> {
+/** opts.replayEnd: 録画 ID → 録画の終わり（既定は data/paper の録画メタを読む） */
+export async function rebuildRounds(db: PrismaClient, now: Date, opts: { replayEnd?: ReplayEndResolver } = {}): Promise<RebuildReport> {
+  const replayEnd = opts.replayEnd ?? replayEndResolver(paperDir());
   const execs = await db.execution.findMany({
-    include: { instrument: { select: { symbol: true } }, paperOrder: { select: { positionId: true, shot: { select: { autoSymbol: true } } } } },
+    include: {
+      instrument: { select: { symbol: true } },
+      paperOrder: { select: { positionId: true, replayRecordingId: true, shot: { select: { autoSymbol: true } } } },
+    },
   });
   const toRound = (e: (typeof execs)[number]): ExecForRound => ({
     id: e.id,
@@ -38,14 +45,23 @@ export async function rebuildRounds(db: PrismaClient, now: Date): Promise<Rebuil
     dedupeHash: e.dedupeHash,
     screenSymbolMismatch: screenSymbolMismatch(e.paperOrder?.shot?.autoSymbol ?? null, e.instrument.symbol),
   });
-  const paper = buildPaperRounds(execs.filter((e) => e.source === 'PAPER').map(toRound));
+  // リプレイも建玉 ID ごとのラウンドで、作り方はペーパーと同じ（source・account は約定から引き継ぐ）
+  const paper = buildPaperRounds(execs.filter((e) => e.source === 'PAPER' || e.source === 'REPLAY').map(toRound));
   const sbi = buildSbiRounds(execs.filter((e) => e.source === 'SBI').map(toRound));
   const all: RoundDraft[] = [...paper, ...sbi];
 
   const excursion = new Map<string, { mae: string; mfe: string } | null>();
+  const recordingOf = new Map(execs.map((e) => [e.id, e.paperOrder?.replayRecordingId ?? null]));
   for (const r of paper) {
-    const bars = await loadMinuteBars(db, r.instrumentId, floorToMinute(r.openedAt), floorToMinute(r.closedAt ?? now));
-    excursion.set(r.id, computeExcursion(r, bars, now));
+    const rec = r.executions.map((x) => recordingOf.get(x.id) ?? null).find((x) => x !== null) ?? null;
+    const end = r.closedAt ?? openRoundEnd(r.source, replayEnd(rec), now);
+    // 録画の終わりが分からない未決済のリプレイは評価しない（見ていない値動きを入れない）
+    if (!end) {
+      excursion.set(r.id, null);
+      continue;
+    }
+    const bars = await loadMinuteBars(db, r.instrumentId, floorToMinute(r.openedAt), floorToMinute(end));
+    excursion.set(r.id, computeExcursion(r, bars, end));
   }
 
   // ドテン・現物の建玉超過売りの約定は、決済側（元ラウンド）と建て側（role FLIP のラウンド）の両方に載る。
@@ -118,7 +134,8 @@ export async function rebuildRounds(db: PrismaClient, now: Date): Promise<Rebuil
 
   return {
     rounds: all.length,
-    paper: paper.length,
+    paper: paper.filter((r) => r.source === 'PAPER').length,
+    replay: paper.filter((r) => r.source === 'REPLAY').length,
     sbi: sbi.length,
     deleted: stale.length,
     warnings: all.flatMap((r) => r.warnings.map((w) => `${r.id}: ${w}`)),

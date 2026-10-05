@@ -1,6 +1,6 @@
-// 発注時スクショの配信。shots ディレクトリ配下の PNG だけ返す（検査は lib/paper/shots.ts）。
+// 発注時スクショ・リプレイの録画フレームの配信。shots / replay/shots ディレクトリ配下の PNG だけ返す（検査は lib/paper/shots.ts）。
 import fs from 'node:fs';
-import { resolveShotFile, shotsDir } from '@/lib/paper/shots';
+import { paperDir, resolveShotUrlFile } from '@/lib/paper/shots';
 
 export const dynamic = 'force-dynamic';
 
@@ -12,7 +12,7 @@ export async function GET(_req: Request, ctx: { params: Promise<{ path: string[]
   } catch {
     return new Response('Not Found', { status: 404 });
   }
-  const file = resolveShotFile(shotsDir(), decoded);
+  const file = resolveShotUrlFile(paperDir(), decoded);
   if (!file) return new Response('Not Found', { status: 404 });
   const body = fs.readFileSync(file);
   return new Response(body, {

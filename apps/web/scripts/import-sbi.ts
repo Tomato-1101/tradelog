@@ -23,7 +23,7 @@ async function main() {
     if (r.format === 'unknown') process.exitCode = 1;
   }
   const rb = await rebuildRounds(prisma, new Date());
-  console.log(`[rounds] ${rb.rounds}（PAPER ${rb.paper} / SBI ${rb.sbi}）/ 削除 ${rb.deleted} / 警告 ${rb.warnings.length}`);
+  console.log(`[rounds] ${rb.rounds}（PAPER ${rb.paper} / REPLAY ${rb.replay} / SBI ${rb.sbi}）/ 削除 ${rb.deleted} / 警告 ${rb.warnings.length}`);
 }
 
 main()

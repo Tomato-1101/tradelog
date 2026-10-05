@@ -14,10 +14,17 @@ export function buildHref(path: string, params: Record<string, string | undefine
   return s ? `${path}?${s}` : path;
 }
 
-export function parseSource(v: string | string[] | undefined): 'PAPER' | 'SBI' {
-  return first(v) === 'sbi' ? 'SBI' : 'PAPER';
+export type SourceKey = 'PAPER' | 'SBI' | 'REPLAY';
+
+/** sbi → 本番、replay → リプレイ、それ以外（無指定を含む）はペーパー */
+export function parseSource(v: string | string[] | undefined): SourceKey {
+  const s = first(v);
+  return s === 'sbi' ? 'SBI' : s === 'replay' ? 'REPLAY' : 'PAPER';
 }
 
-export function sourceParam(s: 'PAPER' | 'SBI'): 'paper' | 'sbi' {
-  return s === 'SBI' ? 'sbi' : 'paper';
+export function sourceParam(s: SourceKey): 'paper' | 'sbi' | 'replay' {
+  return s === 'SBI' ? 'sbi' : s === 'REPLAY' ? 'replay' : 'paper';
 }
+
+/** 画面の表示名（タブ・取引詳細のチップ） */
+export const SOURCE_LABEL: Record<SourceKey, string> = { PAPER: 'ペーパー', SBI: '本番(SBI)', REPLAY: 'リプレイ' };

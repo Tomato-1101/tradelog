@@ -4,6 +4,7 @@ import { prisma } from '@/lib/db';
 import { PRICE_BASIS_LABEL, PRICE_STATUS_LABEL, SIDE_LABEL, fmtJst, fmtPrice } from '@/lib/format';
 import { shotUrl } from '@/lib/paper/shots';
 import { listPendingExecutions } from '@/lib/review/queries';
+import { SOURCE_LABEL } from '@/lib/review/url';
 import ManualPriceForm from '@/components/ManualPriceForm';
 
 export const dynamic = 'force-dynamic';
@@ -45,6 +46,7 @@ export default async function ReviewPage() {
                     </td>
                     <td>
                       {e.symbol} <span className="muted">{e.name ?? ''}</span>
+                      {e.source === 'REPLAY' && <span className="sub">{SOURCE_LABEL.REPLAY}</span>}
                     </td>
                     <td><span className={`side ${e.side === 'BUY' ? 'buy' : 'sell'}`}>{SIDE_LABEL[e.side]}</span></td>
                     <td className="num">{fmtPrice(e.qty)}</td>

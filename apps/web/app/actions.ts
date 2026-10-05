@@ -5,12 +5,12 @@ import { revalidatePath } from 'next/cache';
 import { prisma } from '@/lib/db';
 import { fetchAndStoreBars } from '@/lib/bars/store';
 import { dailyFetchNeed } from '@/lib/bars/round-daily';
-import { setManualPrice } from '@/lib/paper/ingest';
+import { canSetManualPrice, setManualPrice } from '@/lib/paper/ingest';
 import { rebuildRounds } from '@/lib/rounds/rebuild';
 
 export type ActionState = { ok: boolean; message: string } | null;
 
-/** 要確認・未確定（または手入力済み）のペーパー約定の価格を手入力で確定し、ラウンドを再計算する */
+/** 要確認・未確定（または手入力済み）のペーパー・リプレイ約定の価格を手入力で確定し、ラウンドを再計算する */
 export async function confirmPriceAction(_prev: ActionState, fd: FormData): Promise<ActionState> {
   const executionId = String(fd.get('executionId') ?? '');
   const price = String(fd.get('price') ?? '').trim().replaceAll(',', '');
@@ -20,7 +20,7 @@ export async function confirmPriceAction(_prev: ActionState, fd: FormData): Prom
   try {
     const e = await prisma.execution.findUnique({ where: { id: executionId } });
     if (!e) return { ok: false, message: '約定が見つからない' };
-    if (e.source !== 'PAPER') return { ok: false, message: '手入力で確定できるのはペーパーの約定だけ' };
+    if (!canSetManualPrice(e.source)) return { ok: false, message: '手入力で確定できるのはペーパー・リプレイの約定だけ' };
     if (e.priceStatus === 'CONFIRMED' && e.priceBasis !== 'MANUAL') {
       return { ok: false, message: '確定済みの約定は変更できない（手入力で確定したものだけ修正できる）' };
     }

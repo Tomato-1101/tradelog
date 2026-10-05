@@ -2,18 +2,18 @@
 
 import type { MarginType, Side, TimePrecision } from '@/lib/ingest/types';
 
-export type Source = 'PAPER' | 'SBI';
+export type Source = 'PAPER' | 'SBI' | 'REPLAY';
 export type PriceStatus = 'CONFIRMED' | 'NEEDS_REVIEW' | 'UNRESOLVED';
 
 export type ExecForRound = {
   id: string;
   source: Source;
   instrumentId: number;
-  /** SBI の口座識別。ペーパーは "paper" */
+  /** SBI の口座識別。ペーパーは "paper"、リプレイは "replay" */
   account: string;
   /** SBI のみ。ペーパーは null */
   marginType: MarginType | null;
-  /** ペーパーのみ（建玉 ID）。SBI は null */
+  /** ペーパー・リプレイのみ（建玉 ID）。SBI は null */
   positionId: string | null;
   executedAt: Date;
   timePrecision: TimePrecision;

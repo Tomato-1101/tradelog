@@ -1,5 +1,7 @@
 // events.jsonl → DB（PaperOrder / Shot / Memo / PaperEventLog）と、約定の確定（Execution）。
 // ファイルは追記専用なので毎回全行を読み直す。DB への反映は id で冪等（何度流しても同じ結果）。
+// リプレイ（replay/events.jsonl）も同じ関数で取り込み、PaperOrder / Memo の replay* 列に録画・セッション・再生位置を残す。
+// 約定の確定はペーパーと同じ規則で、Execution.source = REPLAY・account = replay にする（一覧・集計を分けるため）。
 
 import type { PrismaClient } from '@/generated/prisma/client';
 import { floorToMinute, jstAt, jstMinuteOfDay, jstYmd, SESSION } from '@/lib/time';
@@ -9,6 +11,7 @@ import { manualResolution, resolveOrder } from './resolve';
 import { readSidecar } from './sidecar';
 
 export const PAPER_ACCOUNT = 'paper';
+export const REPLAY_ACCOUNT = 'replay';
 
 export type IngestReport = {
   lines: number;
@@ -30,9 +33,17 @@ async function instrumentId(db: PrismaClient, symbol: string): Promise<number> {
   return i.id;
 }
 
-/** @param opts.paperDir サイドカーの基準ディレクトリ（data/paper）。省略時はサイドカーを読まない */
-export async function ingestPaperEvents(db: PrismaClient, text: string, now: Date, opts: { paperDir?: string } = {}): Promise<IngestReport> {
-  const p = parseEventsText(text);
+/**
+ * @param opts.paperDir サイドカーの基準ディレクトリ（data/paper）。省略時はサイドカーを読まない
+ * @param opts.replay リプレイのファイル（replay/events.jsonl）として取り込む。サイドカーの基準は通常と同じ data/paper
+ */
+export async function ingestPaperEvents(
+  db: PrismaClient,
+  text: string,
+  now: Date,
+  opts: { paperDir?: string; replay?: boolean } = {},
+): Promise<IngestReport> {
+  const p = parseEventsText(text, { replay: opts.replay });
   const sidecars: IngestReport['sidecars'] = { loaded: 0, missing: 0, errors: [] };
   const logged = new Set((await db.paperEventLog.findMany({ select: { id: true } })).map((x) => x.id));
 
@@ -59,6 +70,9 @@ export async function ingestPaperEvents(db: PrismaClient, text: string, now: Dat
         cancelId: cc?.id ?? null,
         instrumentId: instId,
         rawJson: JSON.stringify(o.raw),
+        replayRecordingId: o.replay?.recordingId ?? null,
+        replaySessionId: o.replay?.sessionId ?? null,
+        replayVideoMs: o.replay?.videoMs ?? null,
       },
       update: { state, fillMarkedAt: fm?.ts ?? null, fillMarkId: fm?.id ?? null, cancelId: cc?.id ?? null },
     });
@@ -102,7 +116,16 @@ export async function ingestPaperEvents(db: PrismaClient, text: string, now: Dat
   for (const m of p.memos) {
     await db.memo.upsert({
       where: { id: m.id },
-      create: { id: m.id, positionId: m.positionId, orderId: m.orderId, ts: m.ts, text: m.text },
+      create: {
+        id: m.id,
+        positionId: m.positionId,
+        orderId: m.orderId,
+        ts: m.ts,
+        text: m.text,
+        replayRecordingId: m.replay?.recordingId ?? null,
+        replaySessionId: m.replay?.sessionId ?? null,
+        replayVideoMs: m.replay?.videoMs ?? null,
+      },
       update: {},
     });
   }
@@ -179,9 +202,10 @@ export async function resolvePaperExecutions(db: PrismaClient): Promise<ResolveR
       where: { paperOrderId: o.id },
       create: {
         ...data,
-        source: 'PAPER',
+        // リプレイの注文も確定規則は同じ。ソースと口座だけ分ける（作成後は変わらない）
+        source: o.replayRecordingId ? 'REPLAY' : 'PAPER',
         instrumentId: o.instrumentId,
-        account: PAPER_ACCOUNT,
+        account: o.replayRecordingId ? REPLAY_ACCOUNT : PAPER_ACCOUNT,
         timePrecision: 'ms',
         side: o.side,
         qty: o.qty,
@@ -198,9 +222,12 @@ export async function resolvePaperExecutions(db: PrismaClient): Promise<ResolveR
   return rep;
 }
 
+/** 手入力で確定できる約定か（ペーパーとリプレイ。SBI は CSV の約定値が正なので不可） */
+export const canSetManualPrice = (source: string) => source === 'PAPER' || source === 'REPLAY';
+
 /** 要確認・未確定の約定を手入力で確定する（規則 4）。画面ができるまでは CLI/スクリプトから呼ぶ */
 export async function setManualPrice(db: PrismaClient, executionId: string, price: string, note?: string) {
   const e = await db.execution.findUniqueOrThrow({ where: { id: executionId } });
-  if (e.source !== 'PAPER') throw new Error('手入力で確定できるのはペーパーの約定だけ');
+  if (!canSetManualPrice(e.source)) throw new Error('手入力で確定できるのはペーパー・リプレイの約定だけ');
   return db.execution.update({ where: { id: executionId }, data: manualResolution(price, note) });
 }

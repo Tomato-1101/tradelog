@@ -25,6 +25,10 @@ describe('結果の分類', () => {
     expect(dailyResult({ barFailures: 0, sidecarErrors: 1 }, null)).toBe('partial');
     expect(dailyResult({ barFailures: 0, sidecarErrors: 0 }, 'boom')).toBe('failed');
   });
+  it('events の契約違反で捨てた行（通常・リプレイの合計）があれば partial', () => {
+    expect(dailyResult({ barFailures: 0, sidecarErrors: 0, eventErrors: 1 }, null)).toBe('partial');
+    expect(dailyResult({ barFailures: 0, sidecarErrors: 0, eventErrors: 0 }, null)).toBe('ok');
+  });
 });
 
 describe('警告の判定（正常時は何も出さない）', () => {
@@ -38,6 +42,10 @@ describe('警告の判定（正常時は何も出さない）', () => {
     const p = dailyAlert(st({ result: 'partial', barFailures: 2, sidecarErrors: 1 }), now);
     expect(p).toMatchObject({ kind: 'partial' });
     expect(p?.message).toMatch(/足の取得失敗 2.*サイドカー読めず 1/);
+    const e = dailyAlert(st({ result: 'partial', eventErrors: 3 }), now);
+    expect(e).toMatchObject({ kind: 'partial' });
+    expect(e?.message).toMatch(/events の契約違反 3 行/);
+    expect(dailyAlert(st({}), now), 'eventErrors の無い古い状態ファイルは 0 とみなす').toBeNull();
   });
   it('金曜の引け後に成功 → 月曜の夜は 1 営業日分しか抜けていないので出さない、火曜の引け後は出す', () => {
     const fri = st({ startedAt: jst('2026-10-02T15:45:00').toISOString(), finishedAt: jst('2026-10-02T15:46:00').toISOString() });

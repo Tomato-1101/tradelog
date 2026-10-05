@@ -248,7 +248,7 @@ export function buildSbiRounds(execs: ExecForRound[]): RoundDraft[] {
   return out.sort((a, b) => a.openedAt.getTime() - b.openedAt.getTime() || (a.id < b.id ? -1 : 1));
 }
 
-/** PAPER: 建玉 ID ごとに 1 ラウンド。契約外の動き（0 に戻った後の約定・決済しすぎ）は分割して警告 */
+/** PAPER / REPLAY: 建玉 ID ごとに 1 ラウンド。契約外の動き（0 に戻った後の約定・決済しすぎ）は分割して警告 */
 export function buildPaperRounds(execs: ExecForRound[]): RoundDraft[] {
   const groups = new Map<string, ExecForRound[]>();
   for (const e of execs) {

@@ -10,10 +10,14 @@ import { fmtJst, fmtJstDate, fmtPrice, PRICE_BASIS_LABEL } from '@/lib/format';
 import { floorToMinute } from '@/lib/time';
 import { applyPeriodToRounds, periodToRange, type Period } from '@/lib/period';
 import { PRIOR_HOLDING_SALE_WARNING } from '@/lib/rounds/builder';
+import { barWindowTo } from '@/lib/rounds/excursion';
+import { paperDir } from '@/lib/paper/shots';
+import { replayEndResolver, type ReplayEndResolver } from '@/lib/paper/recordings';
 import { avgPriceTimeline, avgSteps, type AvgStep, type TimelinePoint } from '@/lib/rounds/timeline';
 import type { StatsRound } from '@/lib/stats/types';
+import type { SourceKey } from './url';
 
-export type SourceKey = 'PAPER' | 'SBI';
+export type { SourceKey };
 
 export const PAGE_SIZE = 100;
 
@@ -95,11 +99,12 @@ export async function listRounds(
 
 /** 要確認・未確定の約定があるラウンド数（ソース別。期間に関係なく全件） */
 export async function reviewRoundCounts(db: PrismaClient): Promise<Record<SourceKey, number>> {
-  const [paper, sbi] = await Promise.all([
+  const [paper, sbi, replay] = await Promise.all([
     db.round.count({ where: { source: 'PAPER', hasUnresolved: true } }),
     db.round.count({ where: { source: 'SBI', hasUnresolved: true } }),
+    db.round.count({ where: { source: 'REPLAY', hasUnresolved: true } }),
   ]);
-  return { PAPER: paper, SBI: sbi };
+  return { PAPER: paper, SBI: sbi, REPLAY: replay };
 }
 
 /** 損益が要確認（仮置きの価格）を含む決済済みラウンドの数。集計の「暫定」表示用 */
@@ -139,6 +144,7 @@ export async function loadStatsRounds(db: PrismaClient, source: SourceKey, perio
 
 export type PendingExecution = {
   id: string;
+  source: SourceKey;
   roundId: string | null;
   symbol: string;
   name: string | null;
@@ -161,6 +167,7 @@ export async function listPendingExecutions(db: PrismaClient): Promise<PendingEx
   });
   return es.map((e) => ({
     id: e.id,
+    source: e.source,
     roundId: e.roundId,
     symbol: e.instrument.symbol,
     name: e.instrument.name,
@@ -241,12 +248,18 @@ export type RoundDetail = {
     avgAfter: string | null;
     /** 撮影の遅れ（撮影完了 − 発注、ms）。ペーパーで小窓が記録したときだけ */
     captureDelayMs: number | null;
+    /** リプレイの発注の瞬間の再生位置（録画の先頭からの ms）。リプレイ以外は null */
+    videoMs: number | null;
   }>;
-  memos: Array<{ id: string; ts: Date; text: string; orderId: string | null }>;
+  /** リプレイのとき、このラウンドの注文の録画とセッション（出てきた順・重複なし）。リプレイ以外は null */
+  replay: { recordingIds: string[]; sessionIds: string[] } | null;
+  /** videoMs はリプレイのメモだけ（書いた時の再生位置） */
+  memos: Array<{ id: string; ts: Date; text: string; orderId: string | null; videoMs: number | null }>;
   shots: Array<{
     orderId: string;
     placedAt: Date;
     path: string;
+    videoMs: number | null;
     priceText: string | null;
     price: string | null;
     confidence: number | null;
@@ -297,7 +310,13 @@ async function findFlipClosers(db: PrismaClient, r: RoundWithExecs) {
 }
 
 /** ラウンド 1 件の画面用データ（約定・メモ・スクショ・足・平均建値の推移）。無ければ null */
-export async function loadRoundDetail(db: PrismaClient, id: string, now: Date): Promise<RoundDetail | null> {
+/** opts.replayEnd: 録画 ID → 録画の終わり（既定は data/paper の録画メタを読む） */
+export async function loadRoundDetail(
+  db: PrismaClient,
+  id: string,
+  now: Date,
+  opts: { replayEnd?: ReplayEndResolver } = {},
+): Promise<RoundDetail | null> {
   const r = await db.round.findUnique({
     where: { id },
     include: {
@@ -314,7 +333,9 @@ export async function loadRoundDetail(db: PrismaClient, id: string, now: Date): 
   let barRows: Array<{ ts: Date; open: number; high: number; low: number; close: number; volume: number }>;
   if (paper) {
     const from = new Date(floorToMinute(r.openedAt).getTime() - BAR_WINDOW_MIN * 60_000);
-    const to = new Date(floorToMinute(r.closedAt ?? now).getTime() + BAR_WINDOW_MIN * 60_000);
+    const last = r.executions.length ? r.executions[r.executions.length - 1].executedAt : null;
+    const rec = r.executions.find((e) => e.paperOrder?.replayRecordingId)?.paperOrder?.replayRecordingId ?? null;
+    const to = barWindowTo(r, last, (opts.replayEnd ?? replayEndResolver(paperDir()))(rec), now, BAR_WINDOW_MIN);
     barRows = await db.bar.findMany({
       where: { instrumentId: r.instrumentId, timeframe: '1m', ts: { gte: from, lte: to } },
       orderBy: { ts: 'asc' },
@@ -360,8 +381,14 @@ export async function loadRoundDetail(db: PrismaClient, id: string, now: Date): 
   const tl = new Map<string, TimelinePoint>(timeline.map((p) => [p.id, p]));
   const steps: AvgStep[] = avgSteps(timeline);
 
+  const replayOrders = r.executions.flatMap((e) => (e.paperOrder?.replayRecordingId ? [e.paperOrder] : []));
+  const uniq = (xs: Array<string | null>) => [...new Set(xs.filter((x): x is string => x !== null))];
   return {
     instrumentId: r.instrumentId,
+    replay:
+      r.source === 'REPLAY'
+        ? { recordingIds: uniq(replayOrders.map((o) => o.replayRecordingId)), sessionIds: uniq(replayOrders.map((o) => o.replaySessionId)) }
+        : null,
     round: {
       id: r.id,
       source: r.source,
@@ -407,8 +434,9 @@ export async function loadRoundDetail(db: PrismaClient, id: string, now: Date): 
       posAfter: tl.get(e.id)?.pos ?? null,
       avgAfter: tl.get(e.id)?.avg ?? null,
       captureDelayMs: e.paperOrder?.shot?.captureDelayMs ?? null,
+      videoMs: e.paperOrder?.replayVideoMs ?? null,
     })),
-    memos: r.memos.map((m) => ({ id: m.id, ts: m.ts, text: m.text, orderId: m.orderId })),
+    memos: r.memos.map((m) => ({ id: m.id, ts: m.ts, text: m.text, orderId: m.orderId, videoMs: m.replayVideoMs })),
     shots: r.executions.flatMap((e) =>
       e.paperOrder?.shot
         ? [
@@ -416,6 +444,7 @@ export async function loadRoundDetail(db: PrismaClient, id: string, now: Date): 
               orderId: e.paperOrder.id,
               placedAt: e.paperOrder.placedAt,
               path: e.paperOrder.shot.path,
+              videoMs: e.paperOrder.replayVideoMs,
               priceText: e.paperOrder.shot.priceText,
               price: e.paperOrder.shot.price,
               confidence: e.paperOrder.shot.confidence,

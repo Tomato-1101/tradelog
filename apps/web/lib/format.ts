@@ -86,3 +86,14 @@ export const PRICE_BASIS_LABEL = {
 export const SIDE_LABEL = { BUY: '買', SELL: '売' } as const;
 export const DIRECTION_LABEL = { LONG: 'ロング', SHORT: 'ショート' } as const;
 export const MARGIN_LABEL = { CASH: '現物', MARGIN_LONG: '信用買', MARGIN_SHORT: '信用売' } as const;
+
+/** リプレイの再生位置（録画の先頭からの ms）→ `m:ss.mmm`（1 時間以上は `h:mm:ss.mmm`） */
+export function fmtVideoMs(ms: number | null | undefined): string {
+  if (ms == null) return '—';
+  const h = Math.floor(ms / 3600_000);
+  const m = Math.floor((ms % 3600_000) / 60_000);
+  const sec = Math.floor((ms % 60_000) / 1000);
+  const frac = String(ms % 1000).padStart(3, '0');
+  const ss = `${String(sec).padStart(2, '0')}.${frac}`;
+  return h > 0 ? `${h}:${String(m).padStart(2, '0')}:${ss}` : `${m}:${ss}`;
+}

@@ -1,6 +1,7 @@
 // AI 分析用の書き出し。毎回全量を書き直す（追記しない）。
 //  - trades.jsonl: 1 行 1 ラウンド。約定・メモ・前後 30 分の 1 分足・スクショのパスまで、そのラウンドの判断材料を全部入れる。
-//  - summary.md: 全体 / 直近 30 日 / PAPER / SBI の統計。
+//    リプレイ（source=REPLAY）は録画 ID・セッション ID と、約定・メモごとの再生位置も入れる。
+//  - summary.md: 全体 / 直近 30 日 / PAPER / SBI / REPLAY の統計。
 // 時刻はすべて JST の ISO8601（+09:00）。金額・数量は 10 進数文字列、足の OHLCV は数値。
 
 import fs from 'node:fs';
@@ -10,6 +11,9 @@ import { computeStats } from '@/lib/stats/compute';
 import type { Stats, StatsRound } from '@/lib/stats/types';
 import { loadMinuteBarsWithVolume } from '@/lib/bars/store';
 import { floorToMinute, isContinuousSessionMinute, jstMinuteOfDay } from '@/lib/time';
+import { barWindowTo } from '@/lib/rounds/excursion';
+import { paperDir } from '@/lib/paper/shots';
+import { replayEndResolver, type ReplayEndResolver } from '@/lib/paper/recordings';
 
 const JST_MS = 9 * 3600_000;
 export function toJstIso(d: Date): string {
@@ -21,7 +25,9 @@ export const BAR_WINDOW_MIN = 30;
 
 export type ExportReport = { trades: number; withBars: number; tradesPath: string; summaryPath: string };
 
-export async function exportForAi(db: PrismaClient, outDir: string, now: Date): Promise<ExportReport> {
+/** opts.replayEnd: 録画 ID → 録画の終わり（既定は data/paper の録画メタを読む） */
+export async function exportForAi(db: PrismaClient, outDir: string, now: Date, opts: { replayEnd?: ReplayEndResolver } = {}): Promise<ExportReport> {
+  const replayEnd = opts.replayEnd ?? replayEndResolver(paperDir());
   fs.mkdirSync(outDir, { recursive: true });
   const rounds = await db.round.findMany({
     include: {
@@ -38,7 +44,9 @@ export async function exportForAi(db: PrismaClient, outDir: string, now: Date): 
     let bars: unknown = null;
     if (r.timePrecision === 'ms') {
       const from = new Date(floorToMinute(r.openedAt).getTime() - BAR_WINDOW_MIN * 60_000);
-      const to = new Date(floorToMinute(r.closedAt ?? now).getTime() + BAR_WINDOW_MIN * 60_000);
+      const last = r.executions.length ? r.executions[r.executions.length - 1].executedAt : null;
+      const rec = r.executions.find((e) => e.paperOrder?.replayRecordingId)?.paperOrder?.replayRecordingId ?? null;
+      const to = barWindowTo(r, last, replayEnd(rec), now, BAR_WINDOW_MIN);
       const rows = await loadMinuteBarsWithVolume(db, r.instrumentId, from, to);
       const have = new Set(rows.map((b) => b.ts.getTime()));
       let missing = 0;
@@ -57,9 +65,13 @@ export async function exportForAi(db: PrismaClient, outDir: string, now: Date): 
       };
     }
     const shots = r.executions.flatMap((e) => (e.paperOrder?.shot ? [`data/paper/${e.paperOrder.shot.path}`] : []));
+    // リプレイは建て始めの注文の録画・セッション（建玉が複数の練習にまたがれば約定ごとの replay を見る）
+    const opening = r.executions.find((e) => e.paperOrder?.replayRecordingId)?.paperOrder ?? null;
     const rec = {
       round_id: r.id,
       source: r.source,
+      recording_id: r.source === 'REPLAY' ? (opening?.replayRecordingId ?? null) : null,
+      session_id: r.source === 'REPLAY' ? (opening?.replaySessionId ?? null) : null,
       symbol: r.instrument.symbol,
       name: r.instrument.name,
       direction: r.direction,
@@ -102,8 +114,12 @@ export async function exportForAi(db: PrismaClient, outDir: string, now: Date): 
         // 撮影の遅れ（撮影完了 − 発注、ms）。大きいと画面の値が発注の瞬間からずれている
         capture_delay_ms: e.paperOrder?.shot?.captureDelayMs ?? null,
         shot: e.paperOrder?.shot ? `data/paper/${e.paperOrder.shot.path}` : null,
+        // リプレイだけ: 発注の瞬間の録画と再生位置（録画の先頭からの ms）。at / placed_at は録画上の実時刻
+        replay: e.paperOrder?.replayRecordingId
+          ? { recording_id: e.paperOrder.replayRecordingId, session_id: e.paperOrder.replaySessionId, video_ms: e.paperOrder.replayVideoMs }
+          : null,
       })),
-      memos: r.memos.map((m) => ({ at: iso(m.ts), order_id: m.orderId, text: m.text })),
+      memos: r.memos.map((m) => ({ at: iso(m.ts), order_id: m.orderId, text: m.text, ...(m.replayRecordingId ? { video_ms: m.replayVideoMs } : {}) })),
       shots,
       bars_1m: bars,
     };
@@ -139,6 +155,7 @@ export async function exportForAi(db: PrismaClient, outDir: string, now: Date): 
       ['直近 30 日（決済日基準）', computeStats(statsRounds.filter((r) => r.closedAt && r.closedAt >= since))],
       ['PAPER', computeStats(statsRounds.filter((r) => r.source === 'PAPER'))],
       ['SBI', computeStats(statsRounds.filter((r) => r.source === 'SBI'))],
+      ['REPLAY（録画を再生しながらの練習）', computeStats(statsRounds.filter((r) => r.source === 'REPLAY'))],
     ],
     now,
     quality,
@@ -206,6 +223,8 @@ function renderSummary(
     `- 失効した指値: ${q.expired} 件`,
     `- 足の取得: 失敗 ${q.barErrors} 日 / 遡れず取得不可 ${q.barUnavailable} 日`,
     '- SBI の約定は日付だけ（時刻なし）なので、保有時間・時間帯別・1 分足・MAE/MFE は出ない',
+    '- REPLAY の時刻は録画上の実時刻（押した現実の時刻ではない）。trades.jsonl の各ラウンドに recording_id / session_id、約定に replay.video_ms（再生位置）がある',
+    '- 全体・直近 30 日には PAPER・SBI・REPLAY がすべて入る。種別ごとの成績は各節を見る',
     '',
   ].join('\n');
 }

@@ -20,6 +20,8 @@ export type DailyStatus = {
   sidecarErrors: number;
   /** events.jsonl から取り込んだ注文の数 */
   ordersIngested: number;
+  /** events.jsonl（通常のペーパーとリプレイの合計）で契約違反として捨てた行の数（この項目が無い古い状態ファイルは 0 とみなす） */
+  eventErrors?: number;
 };
 export type DailyAlert = { kind: 'failed' | 'partial' | 'stale' | 'missing'; message: string };
 
@@ -31,9 +33,9 @@ export function dailyStatusPath(dbUrl: string): string {
   return path.join(path.dirname(dbUrl.replace(/^file:/, '')), 'daily-status.json');
 }
 
-export function dailyResult(c: { barFailures: number; sidecarErrors: number }, error: string | null): DailyResult {
+export function dailyResult(c: { barFailures: number; sidecarErrors: number; eventErrors?: number }, error: string | null): DailyResult {
   if (error !== null) return 'failed';
-  return c.barFailures > 0 || c.sidecarErrors > 0 ? 'partial' : 'ok';
+  return c.barFailures > 0 || c.sidecarErrors > 0 || (c.eventErrors ?? 0) > 0 ? 'partial' : 'ok';
 }
 
 export function writeDailyStatus(file: string, s: DailyStatus): void {
@@ -79,7 +81,11 @@ export function dailyAlert(s: DailyStatus | null | 'unreadable', now: Date): Dai
   }
   if (s.result === 'failed') return { kind: 'failed', message: `daily が失敗（${fmt(s.finishedAt)}）: ${s.error ?? '理由不明'}` };
   if (s.result === 'partial') {
-    const parts = [s.barFailures > 0 ? `足の取得失敗 ${s.barFailures} 件` : null, s.sidecarErrors > 0 ? `サイドカー読めず ${s.sidecarErrors} 件` : null];
+    const parts = [
+      s.barFailures > 0 ? `足の取得失敗 ${s.barFailures} 件` : null,
+      s.sidecarErrors > 0 ? `サイドカー読めず ${s.sidecarErrors} 件` : null,
+      (s.eventErrors ?? 0) > 0 ? `events の契約違反 ${s.eventErrors} 行（取り込まずに捨てた）` : null,
+    ];
     return { kind: 'partial', message: `daily が一部失敗（${fmt(s.finishedAt)}）: ${parts.filter((x) => x !== null).join('・')}` };
   }
   return null;

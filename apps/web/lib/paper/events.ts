@@ -1,6 +1,8 @@
 // data/paper/events.jsonl（docs/paper-events.md が契約の正）の厳密パースと検証。純粋関数のみ。
 // 契約違反の行はエラーとして報告し、その行だけ捨てて他の行は続ける。
 // ファイルは追記専用なので、毎回全行を読み直して検証し、DB への書き込みは id で冪等にする（ingest.ts）。
+// リプレイ（data/paper/replay/events.jsonl）も同じパーサで読む。違いは全行に `replay` キーが必須なことだけ
+// （通常のファイルに `replay` があれば契約違反）。建玉の流れはファイルごとに独立に検証する。
 
 import { closeOf, jstYmd } from '@/lib/time';
 
@@ -18,7 +20,11 @@ export type Shot = {
   ocrPath?: string | null;
 };
 
-type Base = { id: string; ts: Date; raw: Record<string, unknown>; line: number };
+/** リプレイの行にだけ付く（docs/paper-events.md「リプレイ」） */
+export type ReplayInfo = { recordingId: string; sessionId: string; videoMs: number };
+
+/** replay はリプレイのファイルの行にだけある（通常の行では undefined） */
+type Base = { id: string; ts: Date; raw: Record<string, unknown>; line: number; replay?: ReplayInfo };
 
 export type OrderEvent = Base & {
   type: 'order';
@@ -45,6 +51,9 @@ const QTY = /^[1-9]\d*$/;
 const PRICE = /^(0|[1-9]\d*)(\.\d+)?$/;
 // 東証コード: 4 文字（数字始まり、2 文字目以降は数字か英大文字。例 7203 / 285A / 130A）
 const SYMBOL = /^[0-9][0-9A-Z]{3}$/;
+// 録画の rec_id: 録画開始の JST YYYYMMDD-HHMMSS（同じ秒に 2 本目があれば -2 等）
+const RECORDING_ID = /^\d{8}-\d{6}(-\d+)?$/;
+const REPLAY_KEYS = ['recording_id', 'session_id', 'video_ms'];
 
 const KEYS: Record<PaperEvent['type'], { required: string[]; optional: string[] }> = {
   order: {
@@ -120,8 +129,26 @@ function relPath(p: string, key: string): string {
   return p;
 }
 
+function parseReplay(v: unknown): ReplayInfo {
+  if (typeof v !== 'object' || v === null || Array.isArray(v)) fail('replay がオブジェクトでない');
+  const o = v as Record<string, unknown>;
+  exactKeys(o, REPLAY_KEYS, [], 'replay.');
+  const ms = o.video_ms;
+  if (typeof ms !== 'number' || !Number.isInteger(ms) || ms < 0) fail(`replay.video_ms は 0 以上の整数: ${JSON.stringify(ms)}`);
+  return { recordingId: str(o, 'recording_id', RECORDING_ID), sessionId: str(o, 'session_id', UUID), videoMs: ms as number };
+}
+
+export type ParseOptions = {
+  /** リプレイのファイル（replay/events.jsonl）の行として読む。全行に replay が必須になる */
+  replay?: boolean;
+};
+
 /** 1 行を契約どおりにパースする。違反は例外（ContractError）ではなく結果で返す */
-export function parseEventLine(text: string, line: number): { ok: true; event: PaperEvent } | { ok: false; error: EventError } {
+export function parseEventLine(
+  text: string,
+  line: number,
+  opts: ParseOptions = {},
+): { ok: true; event: PaperEvent } | { ok: false; error: EventError } {
   let id: string | null = null;
   try {
     let json: unknown;
@@ -136,9 +163,14 @@ export function parseEventLine(text: string, line: number): { ok: true; event: P
     if (o.v !== 1) fail(`未対応の契約バージョン v=${JSON.stringify(o.v)}`);
     const type = o.type as PaperEvent['type'];
     if (!(type in KEYS)) fail(`未知の type: ${JSON.stringify(o.type)}`);
-    exactKeys(o, KEYS[type].required, KEYS[type].optional, '');
+    // 通常とリプレイの取り違え（別のファイルに書いた）は、契約に無いキーより分かりやすい理由で弾く
+    if (opts.replay && !('replay' in o)) fail('リプレイの行に replay が無い');
+    if (!opts.replay && 'replay' in o) fail('通常の events.jsonl に replay がある（リプレイの行は replay/events.jsonl に書く）');
+    const replayKeys = opts.replay ? ['replay'] : [];
+    exactKeys(o, [...KEYS[type].required, ...replayKeys], KEYS[type].optional, '');
     const base: Base = { id: str(o, 'id', UUID), ts: new Date(str(o, 'ts', TS)), raw: o, line };
     if (Number.isNaN(base.ts.getTime())) fail('ts が日時として不正');
+    if (opts.replay) base.replay = parseReplay(o.replay);
 
     switch (type) {
       case 'order': {
@@ -198,7 +230,7 @@ export type ParsedEvents = {
  * ファイル全体をパースし、行どうしの整合（重複 id・参照先・建玉の流れ）も検証する。
  * 後の行が前の行と矛盾するときは後の行をエラーにする（追記専用なので先に書かれた方を正とする）。
  */
-export function parseEventsText(text: string): ParsedEvents {
+export function parseEventsText(text: string, opts: ParseOptions = {}): ParsedEvents {
   const out: ParsedEvents = { orders: [], fillMarks: new Map(), cancels: new Map(), memos: [], accepted: [], errors: [] };
   const seen = new Map<string, string>(); // id → 行の内容
   const orders = new Map<string, OrderEvent>();
@@ -210,7 +242,7 @@ export function parseEventsText(text: string): ParsedEvents {
     const line = i + 1;
     const t = raw.trim();
     if (t === '') return;
-    const r = parseEventLine(t, line);
+    const r = parseEventLine(t, line, opts);
     if (!r.ok) {
       out.errors.push(r.error);
       return;

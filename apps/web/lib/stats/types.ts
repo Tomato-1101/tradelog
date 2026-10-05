@@ -2,7 +2,7 @@
 
 export type StatsRound = {
   id: string;
-  source: 'PAPER' | 'SBI';
+  source: 'PAPER' | 'SBI' | 'REPLAY';
   symbol: string;
   direction: 'LONG' | 'SHORT';
   status: 'OPEN' | 'CLOSED';

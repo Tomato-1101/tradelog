@@ -112,3 +112,60 @@ panel は 1 銘柄に建玉を 1 つしか持たない（ネッティング）�
   切り出して読み直した値。**ラベルが見つからなければ null**（画面のどこかの数字は拾わない）。全画面 OCR の読みと読み直しが食い違えば null。
 - 約定価格の規則 2・3 で使う現在値は `shot.price`、それが読めない・その分の 1 分足の外ならサイドカーの `auto.price`（1 分足内のときだけ。
   `auto.symbol` が発注銘柄と違えば `shot.price` と `auto.price` の両方を使わない）。取り込みの実装は web 側（`lib/paper/resolve.ts` の `verifiedCurrentPrice`）が正。
+
+## リプレイ（録画を再生しながらの練習。2026-10-06〜）
+平日の朝に panel が HYPER SBI 2 の画面を録画し、後でその録画を再生しながら小窓で発注して練習する。
+通常のペーパーとは**別のファイル**に書き、建玉も混ぜない。規則（ネッティング・両建て禁止・ドテン・指値・メモ）は通常と完全に同じ。
+
+### 置き場所（データフォルダ = `data/paper/`）
+| パス | 中身 |
+|---|---|
+| `replay/recordings/YYYY-MM-DD/<rec_id>.mp4` | 録画（HEVC。HEVC が使えなければ H.264。10fps 前後・可変フレームレート・実ピクセル（画面の pointPixelScale 倍）・カーソルなし） |
+| `replay/recordings/YYYY-MM-DD/<rec_id>.json` | 録画のメタ（下記）。録画中も数秒ごとに置き換える（一時ファイルから置き換えるので書きかけは見えない） |
+| `replay/events.jsonl` | リプレイ中の発注・約定・取消・メモ（形式は通常の events.jsonl と同じ ＋ `replay`） |
+| `replay/shots/YYYY-MM-DD/<event id>.png` / `.ocr.json` | 発注の瞬間の録画のフレーム（切り出し済み）と全画面 OCR のサイドカー（形式は通常と同じ） |
+
+`rec_id` は録画を始めた（指示を受けた）時刻の JST `YYYYMMDD-HHMMSS`（同じ秒に 2 本あれば `-2` を付ける）。ディレクトリの日付も同じ時刻の JST。録画は自動で消さない。
+
+### `replay/events.jsonl` の行
+通常の行（`order` / `fill_mark` / `cancel` / `memo`）に、どの型でも次のキーを足す（`v` は 1 のまま）。
+```json
+"replay":{"recording_id":"20261006-085312","session_id":"6f1c…(UUID)","video_ms":483123}
+```
+| key | 型 | 説明 |
+|---|---|---|
+| `recording_id` | string | 録画の `rec_id` |
+| `session_id` | UUID | 練習 1 回ごとの ID（録画を開くたびに新しく振る。同じ録画を何度練習しても別のセッション） |
+| `video_ms` | integer | 押した瞬間の再生位置（録画の先頭からのミリ秒） |
+
+- `ts` は**録画上の実時刻** = メタの `started_at` ＋ `video_ms`（押した現実の時刻ではない）。約定価格の確定規則は `ts` で通常と同じに適用する
+  （その日の 1 分足が要る。Yahoo の 1 分足は約 30 日前までなので、録画から 30 日以内に daily を回す）。
+- `shot.path` / `shot.ocr_path` は通常と同じく **`data/paper/` からの相対パス**（`replay/shots/YYYY-MM-DD/<id>.png`）。
+- `shot.captured_at` はそのフレームの録画上の実時刻（= `ts`。録画のフレームなので撮影の遅れは 0）。
+  `shot.window_title` は切り出した全板ウィンドウのタイトル（切り出さなかったら無い）。
+- shot の画像は、録画のその時点のフレーム（許容誤差 0 で取り出す）から全板ウィンドウの領域（メタの `frame`）を切り出したもの:
+  発注銘柄のコードをタイトルに含む全板 → 無ければ、全板が 1 つだけならそれ → それも無ければフレーム全体。
+  全板が複数あってどれも発注銘柄と合わない時はフレーム全体を保存し、サイドカーの `auto.price` は null にする（別の銘柄の値を拾わないため）。
+  全板が 1 つだけでも、そのタイトルのコードが発注銘柄と違う時は切り出すが、`auto.price` は null にする（同じ理由）。
+  まとめると、`auto.price` を入れるのは切り出した全板のタイトルのコードが発注銘柄と一致した時だけ（タイトルにコードが無い時も null）。
+- 再生が一時停止中・再生ウィンドウが無い時、panel は発注・約定した・取消・全決済を押せない（時刻が決まらないため）。メモは再生位置の時刻で書ける。
+- web は `source = REPLAY` として取り込み、ペーパー・本番と分けて一覧・集計する。
+
+### 録画のメタ（`<rec_id>.json`）
+```json
+{"v":1,"id":"20261006-085312","started_at":"2026-10-06T08:53:12.345+09:00","ended_at":"2026-10-06T09:30:12.400+09:00",
+ "status":"done","fps":10,"width":3024,"height":1964,"codec":"hevc","display":{"id":1,"x":0,"y":0,"w":1512,"h":982},
+ "frames":21400,"planned_minutes":37,
+ "samples":[{"t_ms":0,"locked":false,"windows":[{"title":"全板　フジクラ(5803)","frame":{"x":12,"y":40,"w":620,"h":900}}]}],
+ "issues":[{"at":"2026-10-06T09:05:00.120+09:00","t_ms":707775,"kind":"black","message":"黒い画面が続いている（ロック中・ディスプレイのスリープの可能性）"}]}
+```
+- `started_at`: 最初のフレームの実時刻（JST・ミリ秒）。再生位置 0 ms がこの時刻。1 フレームも録れていなければ null。`ended_at`: 録画を閉じた時刻（録画中は null）。
+- `status`: `recording`（録画中、または途中で落ちた）/ `done`（予定どおり終わった）/ `stopped`（手で止めた）/ `failed`（1 フレームも録れなかった。mp4 は無い）。
+  mp4 を正しく閉じられなかった時も `failed`（mp4 は残っても再生できない）。`failed` の録画と、再生できる映像トラックが無い mp4 は練習に使えない。
+- `width` / `height`: 動画のピクセル数（`display` の w/h × 画面の倍率。Retina なら 2 倍）。`display`: 録った画面（グローバル座標・ポイント）。
+- `samples`: 約 1 秒ごとのウィンドウ情報。`t_ms` は `started_at` からのミリ秒、`windows` は HYPER SBI 2 の画面に出ているウィンドウ（タイトルと、
+  **動画のピクセル座標**の `frame`。左上原点）。`locked` は画面ロック中か（取れなければ無い）。
+- `issues[].t_ms` は `started_at` からのミリ秒（最初のフレームより前なら null）。
+- `issues`: 録画が途切れた・録れていない疑いの記録（時刻と理由）。`kind`: `no_permission`（画面収録の権限なし）/ `no_app`（HYPER SBI 2 が起動していない・終了した）/
+  `stream_error`（ScreenCaptureKit が止まった。`message` に理由。数秒後に録り直す）/ `black` / `black_end`（黒い画面が続いた・戻った。粗い判定）/
+  `locked` / `unlocked`（画面ロックの状態が変わった）/ `no_frames` / `frames_back`（60 秒以上フレームが来ない・来るようになった。一度も来ない時も `no_frames`）/ `write_error`（ファイルに書けない）。途切れた間の動画は直前のフレームのまま止まって見える。

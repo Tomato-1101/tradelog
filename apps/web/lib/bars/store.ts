@@ -1,5 +1,6 @@
 // 足の永続化と、不足分（取りこぼし日を含む）の計画・取得。取得の成否は BarFetch にデータ品質として残す。
-// 対象はペーパーの建玉が存在した日（MAE/MFE・約定確定・AI 書き出しに使う）。SBI は時刻が無いので取らない。
+// 対象はペーパー・リプレイの建玉が存在した日（MAE/MFE・約定確定・AI 書き出しに使う）。SBI は時刻が無いので取らない。
+// リプレイの日付は ts（録画上の実時刻）の JST 日付 = 録画の日。
 
 import type { PrismaClient } from '@/generated/prisma/client';
 import { addDays, isWeekend, jstAt, jstYmd } from '@/lib/time';
@@ -29,12 +30,20 @@ function weekdaysBetween(from: string, to: string): string[] {
 /**
  * どの銘柄のどの日の足が要るか。建玉ごとに「最初の発注日〜最後の発注/約定マーク日（未決済なら今日）」の平日。
  * 取得済みで出揃っている日（OK / EMPTY かつ complete）は除く。古すぎる 1m は UNAVAILABLE を記録して除く。
+ * opts.recorded: 録画に映っていた銘柄 × 録画の日。発注が無くても 1 分足だけ取る（1m は約 30 日で取れなくなり、後からリプレイで練習した時に足が無いため）。
+ * 建玉の日と重なる分は 1 回にまとめる。
  */
-export async function planBarFetches(db: PrismaClient, now: Date): Promise<{ needs: FetchNeed[]; unavailable: number }> {
+export async function planBarFetches(
+  db: PrismaClient,
+  now: Date,
+  opts: { recorded?: Array<{ symbol: string; date: string }> } = {},
+): Promise<{ needs: FetchNeed[]; unavailable: number }> {
   const today = jstYmd(now);
   const orders = await db.paperOrder.findMany({
     select: { instrumentId: true, positionId: true, placedAt: true, fillMarkedAt: true, instrument: { select: { symbol: true } } },
   });
+  // 未決済を今日まで延ばすのはペーパーだけ。リプレイの未決済は録画の中で止まっている（今日の値動きとは関係ない）ので、
+  // 発注・約定マークのあった日（録画の日）だけ取る。リプレイの注文も orders に入っているので日付は下で拾われる
   const openPositions = new Set(
     (await db.round.findMany({ where: { source: 'PAPER', status: 'OPEN' }, select: { id: true } })).map((r) => r.id.split('#')[0]),
   );
@@ -59,6 +68,22 @@ export async function planBarFetches(db: PrismaClient, now: Date): Promise<{ nee
     wanted.set(s.instrumentId, w);
   }
 
+  // 録画の銘柄（1m だけ）。銘柄がまだ無ければ登録する（取り込みと同じ TSE）
+  const minuteOnly = new Map<number, { symbol: string; dates: Set<string> }>();
+  for (const t of opts.recorded ?? []) {
+    if (t.date > today || isWeekend(t.date)) continue;
+    const inst = await db.instrument.upsert({
+      where: { market_symbol: { market: 'TSE', symbol: t.symbol } },
+      create: { symbol: t.symbol, market: 'TSE' },
+      update: {},
+      select: { id: true },
+    });
+    const m = minuteOnly.get(inst.id) ?? { symbol: t.symbol, dates: new Set<string>() };
+    m.dates.add(t.date);
+    minuteOnly.set(inst.id, m);
+  }
+  for (const [instrumentId, m] of minuteOnly) if (!wanted.has(instrumentId)) wanted.set(instrumentId, { symbol: m.symbol, dates: new Set<string>() });
+
   const existing = await db.barFetch.findMany({ where: { instrumentId: { in: [...wanted.keys()] } } });
   const done = new Map(existing.map((f) => [`${f.instrumentId}|${f.timeframe}|${f.date}`, f]));
   const cutoff = addDays(today, -MINUTE_LOOKBACK_DAYS);
@@ -68,7 +93,8 @@ export async function planBarFetches(db: PrismaClient, now: Date): Promise<{ nee
   for (const [instrumentId, w] of wanted) {
     for (const timeframe of ['1m', '1d'] as const) {
       const dates: string[] = [];
-      for (const date of [...w.dates].sort()) {
+      const all = timeframe === '1m' ? new Set([...w.dates, ...(minuteOnly.get(instrumentId)?.dates ?? [])]) : w.dates;
+      for (const date of [...all].sort()) {
         const f = done.get(`${instrumentId}|${timeframe}|${date}`);
         if (f && f.complete && (f.status === 'OK' || f.status === 'EMPTY')) continue;
         if (timeframe === '1m' && date < cutoff) {

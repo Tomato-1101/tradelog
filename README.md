@@ -38,7 +38,7 @@ npx prisma migrate deploy   # data/app.db を作る
 ## 使い方
 
 ```sh
-./scripts/dev.sh                                   # 振り返り画面 http://localhost:3000
+./scripts/dev.sh                                   # 振り返り画面 http://127.0.0.1:3000（127.0.0.1 だけで待ち受ける）
 cd apps/web && npm run daily                       # 引け後: 取り込み → 足の取得 → 約定確定 → 再計算 → AI 書き出し
 cd apps/web && npm run import:sbi -- ../../data/raw/sbi/*.csv   # 本番の約定 CSV を取り込む（重複は除外）
 ./scripts/backup-db.sh                             # DB のバックアップ（data/backups/）
@@ -66,11 +66,17 @@ cd apps/web && npm run import:sbi -- ../../data/raw/sbi/*.csv   # 本番の約�
   祝日は足が無いだけでそのまま動く。AI の呼び出し（分析）はしない（`data/ai/` への書き出しまで）。
   今すぐ 1 回回す: `launchctl kickstart gui/$(id -u)/com.tomato.tradelog.daily`
   結果は `data/daily-status.json` に残り、失敗・一部失敗（足の取得失敗など）・2 営業日以上未実行のときだけ画面の上部に警告が出る。
-- ログ: `~/Library/Logs/tradelog/web.log` / `daily.log`（5MB を超えたら `.1` に回して 1 世代だけ残す）。状態: `launchctl print gui/$(id -u)/com.tomato.tradelog.web`
+- 録画（`com.tomato.tradelog.record`）: 平日 8:53 に `caffeinate -u -d -t 2700`（45 分は画面を消さない）を張ってから、小窓（TradePanel）に 37 分の録画を指示する
+  （起動中なら `open -g -a TradePanel.app 'tradepanel://record?minutes=37'`、起動していなければ `--args --record-minutes 37` で起動。前面には出さない・ネットワークは使わない）。
+  録画は小窓の中で行い、`data/paper/replay/recordings/` に残す（自動では消さない）。小窓は `apps/panel/build/Build/Products/Release/TradePanel.app` を使うので、
+  ビルドし直したら起動中の小窓も起動し直す。ロック中・ディスプレイが消えている間は録れないことがある（録れなかった区間はメタの `issues` に残る）。詳しくは `apps/panel/README.md`「録画リプレイ練習」。
+  指示から 90 秒以内に新しい録画メタが `status: recording` にならなければ、`record.log` に「録画が始まらなかった（小窓が古いビルド/画面収録の許可/データフォルダ未設定を確認）」と書いて失敗で終わる。
+  容量の実測は 1 分 約 15 MB（37 分で約 540 MB/日、20 営業日で約 11 GB）。データフォルダのディスクの空きが 5 GB 未満なら録画しない（ゴミ箱に移しただけでは空きは戻らない）。
+- ログ: `~/Library/Logs/tradelog/web.log` / `daily.log` / `record.log`（5MB を超えたら `.1` に回して 1 世代だけ残す）。状態: `launchctl print gui/$(id -u)/com.tomato.tradelog.web`
 - 一時的に止める: `launchctl bootout gui/$(id -u)/com.tomato.tradelog.web`（daily も同様）。戻すときは `install.sh` を再実行する。
 - node は install 時に見つけた場所（`NODE_BIN=/path/to/node` で指定可）を使う。node を入れ替えたら `install.sh` を再実行する
   （better-sqlite3 が合わなければ先に `cd apps/web && npm rebuild better-sqlite3`）。
-- install.sh は 3000 番を別のプロセスが使っていたら、その PID とコマンドを出して登録を中止する。常駐中は 3000 番を使うので、開発時は `./scripts/dev.sh` の前に止めるか、`cd apps/web && npx next dev -p 3001` のように別の番号で起動する。
+- install.sh は 3000 番を別のプロセスが使っていたら、その PID とコマンドを出して登録を中止する。常駐中は 3000 番を使うので、開発時は `./scripts/dev.sh` の前に止めるか、`cd apps/web && npx next dev -H 127.0.0.1 -p 3001` のように別の番号で起動する。
 
 ## 開発
 

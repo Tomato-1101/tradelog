@@ -16,6 +16,7 @@ datasource db {
 enum Source {
   PAPER
   SBI
+  REPLAY // 録画を再生しながらの練習（data/paper/replay/events.jsonl）。ペーパーと同じ規則で確定し、別に一覧・集計する
 }
 
 enum Side {
@@ -115,6 +116,10 @@ model PaperOrder {
   shot         Shot?
   execution    Execution?
   rawJson      String // 取り込んだ order イベントそのもの
+  // リプレイ（replay/events.jsonl の行）だけ埋まる。通常のペーパーは null（source は replayRecordingId の有無で決まる）
+  replayRecordingId String? // 録画の rec_id（YYYYMMDD-HHMMSS）
+  replaySessionId   String? // 練習 1 回ごとの UUID
+  replayVideoMs     Int? // 押した瞬間の再生位置（録画の先頭からの ms）
 
   @@index([positionId])
   @@index([placedAt])
@@ -125,7 +130,7 @@ model Execution {
   source        Source
   instrumentId  Int
   instrument    Instrument    @relation(fields: [instrumentId], references: [id])
-  // Round のグルーピング用の口座識別。SBI は "default"、ペーパーは "paper"
+  // Round のグルーピング用の口座識別。SBI は "default"、ペーパーは "paper"、リプレイは "replay"
   account       String        @default("default")
   // UTC。timePrecision=day のときは JST 当日 09:00（= UTC 00:00）を置く（日付だけが意味を持つ）
   executedAt    DateTime
@@ -197,6 +202,10 @@ model Memo {
   orderId    String?
   ts         DateTime // UTC
   text       String
+  // リプレイのメモだけ埋まる（PaperOrder と同じ意味）
+  replayRecordingId String?
+  replaySessionId   String?
+  replayVideoMs     Int?
 
   @@index([positionId])
 }

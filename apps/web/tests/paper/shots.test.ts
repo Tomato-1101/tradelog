@@ -2,7 +2,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
-import { resolveShotFile, shotUrl } from '@/lib/paper/shots';
+import { resolveShotFile, resolveShotUrlFile, shotUrl } from '@/lib/paper/shots';
 
 let tmp: string;
 let root: string;
@@ -18,6 +18,9 @@ beforeAll(() => {
   fs.mkdirSync(path.join(tmp, 'outdir'));
   fs.writeFileSync(path.join(tmp, 'outdir', 'b.png'), 'b');
   fs.symlinkSync(path.join(tmp, 'outdir'), path.join(root, 'linkdir'));
+  fs.mkdirSync(path.join(tmp, 'paper', 'replay', 'shots', '2026-10-02'), { recursive: true });
+  fs.writeFileSync(path.join(tmp, 'paper', 'replay', 'shots', '2026-10-02', 'r.png'), 'png');
+  fs.writeFileSync(path.join(tmp, 'paper', 'replay', 'events.jsonl'), 'secret');
 });
 afterAll(() => fs.rmSync(tmp, { recursive: true, force: true }));
 
@@ -66,5 +69,31 @@ describe('shotUrl', () => {
     expect(shotUrl('events.jsonl')).toBeNull();
     expect(shotUrl('../x.png')).toBeNull();
     expect(shotUrl('shots')).toBeNull();
+    expect(shotUrl('replay/events.jsonl')).toBeNull();
+    expect(shotUrl('replay/shots')).toBeNull();
+    expect(shotUrl('replay/x/a.png')).toBeNull();
+  });
+  it('リプレイの path（replay/shots/…）→ /shots/replay/…', () => {
+    expect(shotUrl('replay/shots/2026-10-02/abc.png')).toBe('/shots/replay/2026-10-02/abc.png');
+  });
+});
+
+describe('resolveShotUrlFile（/shots/... の URL → paper 配下の実ファイル）', () => {
+  const paper = () => path.join(tmp, 'paper');
+  it('shots/ と replay/shots/ の PNG を返す', () => {
+    expect(resolveShotUrlFile(paper(), ['2026-10-01', 'a.png'])).toBe(fs.realpathSync(path.join(root, '2026-10-01', 'a.png')));
+    expect(resolveShotUrlFile(paper(), ['replay', '2026-10-02', 'r.png'])).toBe(
+      fs.realpathSync(path.join(paper(), 'replay', 'shots', '2026-10-02', 'r.png')),
+    );
+  });
+  it('replay/shots の外へ出るもの・PNG 以外・replay だけは拒否', () => {
+    expect(resolveShotUrlFile(paper(), ['replay'])).toBeNull();
+    expect(resolveShotUrlFile(paper(), ['replay', '..', 'events.jsonl'])).toBeNull();
+    expect(resolveShotUrlFile(paper(), ['replay', '..', '..', 'shots', '2026-10-01', 'a.png'])).toBeNull();
+    expect(resolveShotUrlFile(paper(), ['replay', '..', '..', '..', 'outside.png'])).toBeNull();
+    expect(resolveShotUrlFile(paper(), ['replay', '2026-10-02/../../events.jsonl'])).toBeNull();
+    expect(resolveShotUrlFile(paper(), ['replay', '2026-10-02', 'none.png'])).toBeNull();
+    expect(resolveShotUrlFile(paper(), ['..', 'replay', 'events.jsonl'])).toBeNull();
+    expect(resolveShotUrlFile(paper(), ['..', 'outside.png'])).toBeNull();
   });
 });

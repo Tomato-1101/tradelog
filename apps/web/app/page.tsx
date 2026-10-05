@@ -1,10 +1,10 @@
-// 取引一覧: ペーパー / 本番(SBI) のタブ、期間プリセット、要確認だけの絞り込み。新しい順。
+// 取引一覧: ペーパー / 本番(SBI) / リプレイ のタブ、期間プリセット、要確認だけの絞り込み。新しい順。
 import Link from 'next/link';
 import { prisma } from '@/lib/db';
 import { DIRECTION_LABEL, MARGIN_LABEL, fmtHold, fmtJst, fmtPrice, fmtYen, pnlSign } from '@/lib/format';
 import { parsePeriodParams } from '@/lib/period';
 import { PAGE_SIZE, listRounds, reviewRoundCounts, type ListedRound } from '@/lib/review/queries';
-import { buildHref, first, parseSource, sourceParam, type SP } from '@/lib/review/url';
+import { SOURCE_LABEL, buildHref, first, parseSource, sourceParam, type SP, type SourceKey } from '@/lib/review/url';
 import PeriodNav from '@/components/PeriodNav';
 
 export const dynamic = 'force-dynamic';
@@ -44,7 +44,7 @@ export default async function Home({ searchParams }: { searchParams: Promise<SP>
     to: period.preset === 'custom' ? period.to : undefined,
   };
   const href = (extra: Record<string, string | undefined>) => buildHref('/', { ...keep, ...periodParams, ...extra });
-  const tab = (s: 'PAPER' | 'SBI', label: string) => (
+  const tab = (s: SourceKey, label: string) => (
     <a href={buildHref('/', { source: sourceParam(s), review: reviewOnly ? '1' : undefined, ...periodParams })} aria-current={source === s ? 'page' : undefined}>
       {label}
       {counts[s] > 0 && <span className="badge" title="要確認・未確定の約定があるトレード">{counts[s]}</span>}
@@ -56,8 +56,9 @@ export default async function Home({ searchParams }: { searchParams: Promise<SP>
       <h1>取引一覧</h1>
       <div className="bar">
         <nav className="tabs" aria-label="種別">
-          {tab('PAPER', 'ペーパー')}
-          {tab('SBI', '本番(SBI)')}
+          {tab('PAPER', SOURCE_LABEL.PAPER)}
+          {tab('SBI', SOURCE_LABEL.SBI)}
+          {tab('REPLAY', SOURCE_LABEL.REPLAY)}
         </nav>
         <nav className="tabs" aria-label="絞り込み">
           <a href={href({ review: undefined, page: undefined })} aria-current={!reviewOnly ? 'page' : undefined}>すべて</a>
