@@ -55,6 +55,13 @@ public enum WindowCapturer {
         return byArea.first(where: \.isOnScreen) ?? byArea.first
     }
 
+    /// 撮影対象のウィンドウの位置（画面上で囲む時の基準）。frame は SCWindow.frame（左上原点のグローバル座標・ポイント）
+    public static func locate(preferredID: CGWindowID?, preferredTitle: String?) async throws -> (id: CGWindowID, frame: CGRect, isOnScreen: Bool) {
+        let windows = try await targetWindows()
+        guard let w = choose(windows, preferredID: preferredID, preferredTitle: preferredTitle) else { throw CaptureError.noWindow }
+        return (w.windowID, w.frame, w.isOnScreen)
+    }
+
     public static func capture(preferredID: CGWindowID?, preferredTitle: String?) async throws -> (CGImage, CapturableWindow) {
         let windows = try await targetWindows()
         guard let w = choose(windows, preferredID: preferredID, preferredTitle: preferredTitle) else { throw CaptureError.noWindow }

@@ -56,18 +56,23 @@ public struct SettingsView: View {
                     .labelsHidden()
                     .frame(width: 200)
                     Spacer()
+                    Button("画面上で囲む") { model.pickOnScreen() }
+                        .buttonStyle(.borderedProminent)
                     Button("いま撮影") { model.capture() }
                 }
-                Text("撮った画像の上でドラッグして囲みます。保存はウィンドウの大きさに対する比率なので、ウィンドウの位置を動かしても使えます。")
+                Text("「画面上で囲む」を押すと画面が暗くなるので、HYPER SBI 2 の実物の数字をドラッグで囲みます（Esc で取り消し）。保存はウィンドウの大きさに対する比率なので、ウィンドウの位置を動かしても使えます。")
                     .font(.caption)
                     .foregroundStyle(.secondary)
-                RegionCanvas(model: model)
-                    .frame(minHeight: 260)
-                VStack(alignment: .leading, spacing: 2) {
-                    Text("現在値: \(model.priceReading)")
-                    Text("銘柄コード: \(model.symbolReading)")
+                RegionResult(title: "現在値", color: .red, crop: model.priceCrop, reading: model.priceReading)
+                RegionResult(title: "銘柄コード", color: .blue, crop: model.symbolCrop, reading: model.symbolReading)
+                VStack(alignment: .leading, spacing: 4) {
+                    Text("ウィンドウ全体（位置の確認用。ドラッグで囲み直すこともできます）")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                    RegionCanvas(model: model)
+                        .frame(minHeight: 200)
+                        .padding(.top, 14)  // 枠のラベルが上にはみ出して説明文に重ならないように
                 }
-                .font(.system(.callout, design: .monospaced))
             }
             if let message = model.message {
                 Text(message).font(.caption).foregroundStyle(.red)
@@ -96,6 +101,9 @@ final class SettingsModel: ObservableObject {
     @Published var symbolRegion: RelRect? { didSet { settings.symbolRegion = symbolRegion; updateReadings() } }
     @Published var priceReading = "-"
     @Published var symbolReading = "-"
+    /// 撮った画像から領域を切り出したもの（設定画面で拡大して見せる）
+    @Published var priceCrop: CGImage?
+    @Published var symbolCrop: CGImage?
     @Published var message: String?
     @Published var hasPermission = WindowCapturer.hasPermission
 
@@ -139,14 +147,53 @@ final class SettingsModel: ObservableObject {
     }
 
     func setRegion(_ r: RelRect) {
-        switch editing {
+        setRegion(r, for: editing)
+    }
+
+    private func setRegion(_ r: RelRect, for kind: RegionKind) {
+        switch kind {
         case .price: priceRegion = r
         case .symbol: symbolRegion = r
         }
     }
 
+    /// 実物の HYPER SBI 2 の上に出したオーバーレイでドラッグして囲み、直後に 1 回撮影して読む
+    func pickOnScreen() {
+        let kind = editing
+        Task {
+            do {
+                let target = try await WindowCapturer.locate(preferredID: settings.targetWindowID, preferredTitle: settings.targetWindowTitle)
+                let screens = NSScreen.screens
+                let primaryHeight = screens.first?.frame.height ?? 0
+                guard target.isOnScreen,
+                      let i = ScreenGeometry.screenIndex(forWindow: target.frame, screenFrames: screens.map(\.frame), primaryHeight: primaryHeight)
+                else {
+                    message = "HYPER SBI 2 のウィンドウが今の画面に出ていません（最小化・別のスペース）。表示してからもう一度押してください"
+                    return
+                }
+                settings.targetWindowID = target.id
+                message = nil
+                let name = kind == .price ? "現在値" : "銘柄コード"
+                guard let picked = await RegionPicker.pick(on: screens[i], windowFrame: target.frame, primaryHeight: primaryHeight,
+                                                           prompt: "HYPER SBI 2 の「\(name)」の数字をドラッグで囲む（Esc で取り消し）")
+                else { return }
+                let selection = ScreenGeometry.cgRect(fromAppKit: picked, primaryHeight: primaryHeight)
+                guard let rel = ScreenGeometry.relRect(selection: selection, windowFrame: target.frame) else {
+                    message = "囲んだ範囲が HYPER SBI 2 のウィンドウの外か、小さすぎます"
+                    return
+                }
+                setRegion(rel, for: kind)
+                capture()
+            } catch {
+                message = "HYPER SBI 2 のウィンドウを探せません（起動・画面収録の権限を確認）: \(error.localizedDescription)"
+            }
+        }
+    }
+
     private func updateReadings() {
         guard let image else { return }
+        priceCrop = priceRegion.flatMap { Self.crop(image, $0) }
+        symbolCrop = symbolRegion.flatMap { Self.crop(image, $0) }
         if let priceRegion {
             let r = TextReader.read(image, region: priceRegion)
             priceReading = "「\(r.text ?? "")」 → \(PriceParser.parse(r.text) ?? "null（解釈できず）")"
@@ -155,6 +202,50 @@ final class SettingsModel: ObservableObject {
             let r = TextReader.read(image, region: symbolRegion)
             symbolReading = "「\(r.text ?? "")」 → \(SymbolParser.extract(r.text) ?? "読めず")"
         }
+    }
+
+    static func crop(_ image: CGImage, _ region: RelRect) -> CGImage? {
+        region.pixelRect(width: image.width, height: image.height).flatMap { image.cropping(to: $0) }
+    }
+}
+
+/// 選んだ領域の切り出し（数字が読める大きさに拡大）と、読み取り結果（生の文字列 → 解釈した値）
+struct RegionResult: View {
+    let title: String
+    let color: Color
+    let crop: CGImage?
+    let reading: String
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            HStack(spacing: 6) {
+                Circle().fill(color).frame(width: 8, height: 8)
+                Text(title).font(.callout.bold())
+            }
+            if let crop {
+                let size = Self.displaySize(crop)
+                Image(decorative: crop, scale: 1)
+                    .resizable()
+                    .interpolation(.high)
+                    .frame(width: size.width, height: size.height)
+                    .border(color.opacity(0.7))
+            } else {
+                Text("未設定または未撮影（「画面上で囲む」で選ぶ）")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+            Text(reading)
+                .font(.system(.callout, design: .monospaced))
+                .lineLimit(2)
+                .textSelection(.enabled)
+        }
+    }
+
+    /// 高さ 64pt に揃えて拡大（小さい数字でも読める大きさ）。横に長すぎる時は幅 480pt に収める
+    static func displaySize(_ image: CGImage) -> CGSize {
+        let w = CGFloat(max(image.width, 1)), h = CGFloat(max(image.height, 1))
+        let s = min(64 / h, 480 / w)
+        return CGSize(width: w * s, height: h * s)
     }
 }
 

@@ -62,6 +62,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
                              styleMask: [.titled, .closable, .resizable], backing: .buffered, defer: false)
             w.title = "ペーパー発注 設定"
             w.isReleasedWhenClosed = false
+            // フルスクリーンの HYPER SBI 2 のスペースでも開けるように（「画面上で囲む」は対象が今の画面に出ている必要がある）
+            w.collectionBehavior = [.fullScreenAuxiliary, .moveToActiveSpace]
             w.contentView = NSHostingView(rootView: SettingsView(store: store))
             w.center()
             settingsWindow = w
