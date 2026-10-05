@@ -6,9 +6,9 @@ public struct SettingsView: View {
     @ObservedObject var store: PanelStore
     @StateObject private var model: SettingsModel
 
-    public init(store: PanelStore, preview: CGImage? = nil) {
+    public init(store: PanelStore, preview: CGImage? = nil, previewTitle: String? = nil) {
         self.store = store
-        _model = StateObject(wrappedValue: SettingsModel(settings: store.settings, preview: preview))
+        _model = StateObject(wrappedValue: SettingsModel(settings: store.settings, preview: preview, previewTitle: previewTitle))
     }
 
     public var body: some View {
@@ -46,7 +46,21 @@ public struct SettingsView: View {
                     Button("一覧を更新") { model.refreshWindows() }
                 }
             }
-            Section("読み取り領域") {
+            Section("自動読み取り") {
+                HStack {
+                    Text("現在値は画面の「現在値」の右から、銘柄コードはウィンドウタイトルの「(5803)」から自動で読みます。")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                    Spacer()
+                    Button("いま撮影") { model.capture() }
+                }
+                ForEach(model.autoReading, id: \.self) { line in
+                    Text(line)
+                        .font(.system(.callout, design: .monospaced))
+                        .textSelection(.enabled)
+                }
+            }
+            Section("読み取り領域（任意：自動で読めない時だけ）") {
                 HStack {
                     Picker("", selection: $model.editing) {
                         Text("現在値").tag(RegionKind.price)
@@ -57,10 +71,8 @@ public struct SettingsView: View {
                     .frame(width: 200)
                     Spacer()
                     Button("画面上で囲む") { model.pickOnScreen() }
-                        .buttonStyle(.borderedProminent)
-                    Button("いま撮影") { model.capture() }
                 }
-                Text("「画面上で囲む」を押すと画面が暗くなるので、HYPER SBI 2 の実物の数字をドラッグで囲みます（Esc で取り消し）。保存はウィンドウの大きさに対する比率なので、ウィンドウの位置を動かしても使えます。")
+                Text("通常は設定不要です。上の自動読み取りで読めない時だけ使います（現在値の領域を設定すると、発注時はその領域の値を優先します）。「画面上で囲む」を押すと画面が暗くなるので、HYPER SBI 2 の実物の数字をドラッグで囲みます（Esc で取り消し）。保存はウィンドウの大きさに対する比率なので、ウィンドウの位置を動かしても使えます。")
                     .font(.caption)
                     .foregroundStyle(.secondary)
                 RegionResult(title: "現在値", color: .red, crop: model.priceCrop, reading: model.priceReading)
@@ -106,14 +118,32 @@ final class SettingsModel: ObservableObject {
     @Published var symbolCrop: CGImage?
     @Published var message: String?
     @Published var hasPermission = WindowCapturer.hasPermission
+    /// 「いま撮影」で自動読み取りした結果（現在値・時刻・銘柄の行）
+    @Published var autoReading: [String] = ["「いま撮影」を押すと、ここに読み取り結果が出ます"]
 
-    init(settings: PanelSettings, preview: CGImage?) {
+    init(settings: PanelSettings, preview: CGImage?, previewTitle: String? = nil) {
         self.settings = settings
         self.selectedTitle = settings.targetWindowTitle
         self.priceRegion = settings.priceRegion
         self.symbolRegion = settings.symbolRegion
         self.image = preview
         updateReadings()
+        // プレビュー描画では結果をその場で出す（実機では撮影のたびに裏で読む）
+        if let preview { autoReading = Self.describeAuto(image: preview, title: previewTitle) }
+    }
+
+    /// 全画面を読んで、自動読み取りの結果を行にする（全画面 OCR は 1 秒前後かかるので呼び出し側で裏に回す）
+    nonisolated static func describeAuto(image: CGImage, title: String?) -> [String] {
+        let label = BoardReader.priceByLabel(image: image, items: BoardReader.recognize(image))
+        let price: String
+        if let label {
+            price = "現在値 \(label.price ?? "読めず")（「\(label.text ?? "")」）"
+        } else {
+            price = "現在値 読めず（画面に「現在値」の文字が見つからない）"
+        }
+        let time = "時刻 \(label?.time ?? "読めず")"
+        let symbol = "銘柄 \(BoardReader.symbol(fromTitle: title) ?? "読めず")（タイトル「\(title ?? "")」）"
+        return [price, time, symbol]
     }
 
     func requestPermission() {
@@ -140,6 +170,9 @@ final class SettingsModel: ObservableObject {
                 settings.targetWindowID = w.id
                 message = nil
                 updateReadings()
+                autoReading = ["読み取り中…"]
+                let title = w.title
+                autoReading = await Task.detached(priority: .userInitiated) { Self.describeAuto(image: img, title: title) }.value
             } catch {
                 message = "撮影できません: \(error.localizedDescription)"
             }

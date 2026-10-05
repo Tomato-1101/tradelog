@@ -5,10 +5,10 @@ import Foundation
 @MainActor
 public final class PanelStore: ObservableObject {
     // 入力欄
-    @Published public var symbol = ""
-    @Published public var qtyText: String { didSet { settings.lastQty = qtyText } }
-    @Published public var orderType: OrderType { didSet { settings.orderType = orderType } }
-    @Published public var limitPriceText = ""
+    @Published public var symbol = "" { didSet { disarmFlip() } }
+    @Published public var qtyText: String { didSet { settings.lastQty = qtyText; disarmFlip() } }
+    @Published public var orderType: OrderType { didSet { settings.orderType = orderType; disarmFlip() } }
+    @Published public var limitPriceText = "" { didSet { disarmFlip() } }
     @Published public var memoText = ""
     @Published public var memoTarget: UUID?
 
@@ -20,6 +20,10 @@ public final class PanelStore: ObservableObject {
     @Published public private(set) var badLines = 0
     /// 値が変わるたびに画面がメモ欄へフォーカスを移す
     @Published public private(set) var memoFocusRequest = 0
+    /// ドテンになる発注は 1 回目の押下でここに向きを入れ、3 秒以内にもう一度押すと書く
+    @Published public private(set) var armedFlip: Side?
+    /// 直近の発注の、押下から撮影完了までのミリ秒（小窓の状態表示用）
+    @Published public private(set) var lastShotLatencyMs: Int?
 
     public let settings: PanelSettings
     let shotTaker: ShotTaking
@@ -28,15 +32,28 @@ public final class PanelStore: ObservableObject {
     private var writeChain: Task<Void, Never>?
     private var lastAutoSymbol: String?
     private var lastSymbolRead = Date.distantPast
+    private var armedAt = Date.distantPast
+    /// 予告した時の内容。2 回目に計算し直した内容と完全に同じ時だけ書く
+    private var armedPlan: OrderPlan?
+    /// 書き込みに失敗した回数。積んだ時点の値と違えば、先に積んだ書き込みが失敗している（続きも書かずに画面から戻す）
+    private var writeFailures = 0
+    private var refreshLoop: Task<Void, Never>?
+    /// 全画面 OCR のサイドカーで後から読めた現在値（ocr_path → 価格）。建値の表示にだけ使う
+    private var autoByPath: [String: String] = [:]
     /// マウスが乗った時の自動読み取りの間隔と可否（テストで差し替える）
     var autoReadInterval: TimeInterval = 1.5
     var autoCaptureAllowed: () -> Bool = { WindowCapturer.hasPermission }
+    /// ドテンの確認の猶予（秒）
+    var flipConfirmWindow: TimeInterval = 3
 
     public init(settings: PanelSettings, shotTaker: ShotTaking) {
         self.settings = settings
         self.shotTaker = shotTaker
         self.qtyText = settings.lastQty
         self.orderType = settings.orderType
+        shotTaker.onAutoRead = { [weak self] path, auto in
+            Task { @MainActor in self?.applyAutoRead(path: path, auto: auto) }
+        }
     }
 
     // MARK: データフォルダ
@@ -60,8 +77,13 @@ public final class PanelStore: ObservableObject {
             dataFolder = folder
             events = r.events
             badLines = r.badLines
+            autoByPath = [:]
             recompute()
+            loadAutoReadsForOpenPositions(folder: folder)
             status = r.badLines > 0 ? "読めない行が \(r.badLines) 件あります（無視しました）" : "記録 \(r.events.count) 件を読み込みました"
+            if let first = book.warnings.first {
+                status += "・要確認 \(book.warnings.count) 件（\(first)）"
+            }
             memoTarget = book.memoTargets.first?.id
         } catch {
             status = "events.jsonl を読めません: \(error.localizedDescription)"
@@ -96,79 +118,122 @@ public final class PanelStore: ObservableObject {
             && (orderType == .market || PriceParser.parse(limitPriceText) != nil)
     }
 
-    /// 大きな「買い」「売り」。同じ銘柄・同じ向きの建玉があれば買い増し、無ければ新規建て（売りの新規 = 空売り）
+    /// 今の入力でそのボタンを押したら何が起きるか（押す前の表示用）。押せない入力なら nil
+    public func previewPlan(side: Side) -> OrderPlan? {
+        guard canOrder, let qty = QtyParser.parse(qtyText) else { return nil }
+        return book.plan(symbol: symbol, side: side, qty: qty, orderType: orderType,
+                         limitPrice: orderType == .limit ? PriceParser.parse(limitPriceText) : nil, ts: Date())
+    }
+
+    /// 大きな「買い」「売り」。銘柄ごとに建玉は 1 つ（ネッティング）で、新規・買い増し・決済・ドテンをここだけで行う。
+    /// ドテンになる時だけ、1 回目は予告して止まり、3 秒以内のもう一度で書く
     public func placeOrder(side: Side) {
         let ts = JST.nowMillis()
-        guard canOrder, let qty = QtyParser.parse(qtyText) else { return }
-        let existing = book.openPosition(symbol: symbol, direction: side)
-        let order = OrderEvent(ts: ts, positionID: existing?.id ?? UUID(), intent: existing == nil ? .open : .add,
-                               symbol: symbol, side: side, qty: qty, orderType: orderType,
-                               limitPrice: orderType == .limit ? PriceParser.parse(limitPriceText) : nil)
-        submit(order)
-    }
-
-    /// 建玉の決済。数量は保有中（待機中の決済指値を除く）を超えない
-    public func close(positionID: UUID, qtyText: String, type: OrderType) {
-        let ts = JST.nowMillis()
-        guard log != nil, let p = book.positions[positionID], let q = QtyParser.parse(qtyText),
-              let qd = Decimal(contract: q), qd <= p.closableQty else {
-            status = "決済できる数量を超えています"
-            return
-        }
-        var limit: String?
-        if type == .limit {
-            guard let lp = PriceParser.parse(limitPriceText) else {
-                status = "指値決済は上の「価格」欄に指値を入れてください"
+        guard canOrder, let qty = QtyParser.parse(qtyText),
+              let plan = book.plan(symbol: symbol, side: side, qty: qty, orderType: orderType,
+                                   limitPrice: orderType == .limit ? PriceParser.parse(limitPriceText) : nil, ts: ts)
+        else { return }
+        if plan.isFlip {
+            let confirming = armedFlip == side && Date().timeIntervalSince(armedAt) <= flipConfirmWindow
+            // 予告した時と書く内容（決済数・新規数・取消対象）が完全に同じ時だけ書く。変わっていたら予告し直す
+            guard confirming, armedPlan?.sameEffect(as: plan) == true else {
+                armFlip(side, plan: plan, changed: confirming)
                 return
             }
-            limit = lp
         }
-        let order = OrderEvent(ts: ts, positionID: p.id, intent: .close, symbol: p.symbol, side: p.direction.opposite,
-                               qty: q, orderType: type, limitPrice: limit)
-        submit(order)
+        disarmFlip()
+        execute(plan)
     }
 
-    private func submit(_ order: OrderEvent) {
-        guard let log else { return }
-        // 状態は押した瞬間に反映し、撮影の完了を待ってから shot 付きで 1 行書く
-        events.append(.order(order))
+    /// 建玉の行の「全決済」。成行で保有全数を反対売買する（その建玉の待機中の指値は取り消す）
+    public func closeAll(positionID: UUID) {
+        let ts = JST.nowMillis()
+        guard log != nil, let p = book.positions[positionID], p.isOpen,
+              let plan = book.plan(symbol: p.symbol, side: p.direction.opposite, qty: p.qty.contractString, orderType: .market,
+                                   limitPrice: nil, ts: ts, target: p.id)
+        else { return }
+        disarmFlip()
+        execute(plan)
+    }
+
+    private func armFlip(_ side: Side, plan: OrderPlan, changed: Bool = false) {
+        armedFlip = side
+        armedPlan = plan
+        let at = Date()
+        armedAt = at
+        status = "\(changed ? "内容が変わりました: " : "")\(plan.summary)。もう一度押すと発注します"
+        Task { [weak self] in
+            try? await Task.sleep(nanoseconds: UInt64((self?.flipConfirmWindow ?? 3) * 1_000_000_000))
+            guard let self, self.armedAt == at, self.armedFlip != nil else { return }
+            self.disarmFlip()
+            self.status = "ドテンを取りやめました"
+        }
+    }
+
+    private func disarmFlip() {
+        if armedFlip != nil { armedFlip = nil }
+        armedPlan = nil
+    }
+
+    private func execute(_ plan: OrderPlan) {
+        guard let log, let first = plan.orders.first else { return }
+        // 状態は押した瞬間に反映し、撮影の完了を待ってから shot 付きで書く（取消 → order の順）
+        let cancels = plan.cancels.map { PaperEvent.cancel(RefEvent(ts: first.ts, orderID: $0.id)) }
+        events.append(contentsOf: cancels)
+        events.append(contentsOf: plan.orders.map(PaperEvent.order))
         recompute()
-        memoTarget = order.positionID
+        memoTarget = plan.orders.last?.positionID
         memoFocusRequest += 1
-        status = "\(order.symbol) \(order.side.label) \(order.qty) \(order.orderType.label) \(JST.clock(order.ts)) 撮影中…"
+        let head = "\(first.symbol) \(plan.summary) \(first.orderType.label) \(JST.clock(first.ts))"
+        status = "\(head) 撮影中…"
 
         let previous = writeChain
         let taker = shotTaker
+        let failuresAtPress = writeFailures
         writeChain = Task { [weak self] in
-            let shot = await taker.takeShot(eventID: order.id, ts: order.ts, log: log)
+            // ドテンの 2 行は同じ画像・同じ OCR を共有する（ファイル名は 1 行目の id）
+            let shot = await taker.takeShot(eventID: first.id, ts: first.ts, log: log)
             await previous?.value
-            var final = order
-            final.shot = shot
             guard let self else { return }
-            if let i = self.events.firstIndex(where: { $0.id == order.id }) { self.events[i] = .order(final) }
+            let finals = plan.orders.map { o -> OrderEvent in
+                var final = o
+                final.shot = shot
+                return final
+            }
+            let latency = shot?.capturedAt.map { Int(($0.timeIntervalSince(first.ts) * 1000).rounded()) }
+            self.lastShotLatencyMs = latency
+            // 取消と order（ドテンなら 2 行）をまとめて 1 回で書く。失敗したら画面からも外す
+            guard self.commit(cancels + finals.map(PaperEvent.order), to: log, failuresAtPress: failuresAtPress) else { return }
+            for final in finals {
+                if let i = self.events.firstIndex(where: { $0.id == final.id }) { self.events[i] = .order(final) }
+            }
             self.recompute()
-            self.write(.order(final), to: log) {
-                let shotText: String
-                if let shot {
-                    shotText = "撮影OK 現在値 \(shot.price ?? "読めず")"
-                } else {
-                    shotText = "撮影なし（記録は保存）"
-                }
-                return "\(order.symbol) \(order.side.label) \(order.qty) \(order.orderType.label) \(JST.clock(order.ts)) \(shotText)"
+            if let shot {
+                let ms = latency.map { "撮影 \($0)ms" } ?? "撮影OK"
+                self.status = "\(head) \(ms) 現在値 \(shot.price ?? "自動読み取り中")"
+            } else {
+                self.status = "\(head) 撮影なし（記録は保存）"
             }
         }
     }
 
     // MARK: 指値
 
-    public func markFilled(orderID: UUID) { appendRef(.fillMark(RefEvent(ts: JST.nowMillis(), orderID: orderID)), done: "約定を記録しました") }
-    public func cancel(orderID: UUID) { appendRef(.cancel(RefEvent(ts: JST.nowMillis(), orderID: orderID)), done: "取消を記録しました") }
+    /// ドテンの 2 行の片方なら、相方も同じ時刻で約定・取消にする（片方だけだと両建てになる）。
+    /// 決済指値の約定で建玉が 0 になる時は、その建玉に残る新規・買い増し指値も取り消す（PositionBook.refEvents）
+    public func markFilled(orderID: UUID) { appendRefs(orderID, fill: true, done: "約定を記録しました") }
+    public func cancel(orderID: UUID) { appendRefs(orderID, fill: false, done: "取消を記録しました") }
 
-    private func appendRef(_ e: PaperEvent, done: String) {
+    private func appendRefs(_ orderID: UUID, fill: Bool, done: String) {
         guard log != nil else { return }
-        events.append(e)
+        let batch = book.refEvents(orderID: orderID, fill: fill, ts: JST.nowMillis())
+        guard !batch.isEmpty else { return }
+        // 建玉が変わるので、ドテンの予告は解除する（変わった数量を確認なしに書かない）
+        disarmFlip()
+        events.append(contentsOf: batch)
         recompute()
-        enqueueWrite(e, done: done)
+        let extra = fill ? batch.filter { if case .cancel = $0 { return true } else { return false } }.count : 0
+        enqueueWrite(batch, done: extra > 0 ? "\(done)（建玉が 0 になったので残りの指値 \(extra) 件を取消）" : done)
     }
 
     // MARK: メモ
@@ -184,15 +249,32 @@ public final class PanelStore: ObservableObject {
         events.append(e)
         recompute()
         memoText = ""
-        enqueueWrite(e, done: "メモを保存しました")
+        enqueueWrite([e], done: "メモを保存しました")
     }
 
-    // MARK: 銘柄コードの自動入力
+    // MARK: 撮影対象のキャッシュと銘柄コードの自動入力
 
-    /// 画面の銘柄コード領域を読み、前回読んだコードから変わった時だけ欄を上書きする
-    /// （手で直した値は、HYPER SBI 2 側で銘柄を切り替えるまで残る）
+    /// 小窓にマウスが乗った: 撮影対象のウィンドウを探し直しておき（発注時は撮るだけにする）、銘柄コードを読む
+    public func hoverEntered() {
+        if autoCaptureAllowed() { shotTaker.refreshTarget() }
+        refreshSymbolFromScreen()
+    }
+
+    /// 撮影対象のキャッシュを定期的に更新する（アプリの起動時に 1 回呼ぶ）
+    public func startBackgroundRefresh(every seconds: TimeInterval = 10) {
+        refreshLoop?.cancel()
+        refreshLoop = Task { [weak self] in
+            while !Task.isCancelled {
+                guard let self else { return }
+                if self.autoCaptureAllowed() { self.shotTaker.refreshTarget() }
+                try? await Task.sleep(nanoseconds: UInt64(seconds * 1_000_000_000))
+            }
+        }
+    }
+
+    /// 銘柄コードを読み（ウィンドウタイトルの「(5803)」→ 無ければ銘柄コード領域の OCR）、
+    /// 前回読んだコードから変わった時だけ欄を上書きする（手で直した値は、HYPER SBI 2 側で銘柄を切り替えるまで残る）
     public func refreshSymbolFromScreen(force: Bool = false) {
-        guard settings.symbolRegion != nil else { return }
         // 権限が無いうちはマウスが乗るたびに OS のダイアログを出さない
         guard force || (autoCaptureAllowed() && Date().timeIntervalSince(lastSymbolRead) >= autoReadInterval) else { return }
         lastSymbolRead = Date()
@@ -208,32 +290,71 @@ public final class PanelStore: ObservableObject {
 
     // MARK: 終了
 
-    /// 書きかけのイベントを全部書き切るまで待つ（終了時に呼ぶ）
+    /// 書きかけのイベントと、裏で走っている全画面 OCR を書き切るまで待つ（終了時に呼ぶ）
     public func flush() async {
         await writeChain?.value
+        await shotTaker.waitForBackground()
     }
 
     // MARK: 内部
 
-    private func enqueueWrite(_ e: PaperEvent, done: String) {
+    private func enqueueWrite(_ batch: [PaperEvent], done: String) {
         guard let log else { return }
         let previous = writeChain
+        let failuresAtPress = writeFailures
         writeChain = Task { [weak self] in
             await previous?.value
-            self?.write(e, to: log) { done }
+            guard let self, self.commit(batch, to: log, failuresAtPress: failuresAtPress) else { return }
+            self.status = done
         }
     }
 
-    private func write(_ e: PaperEvent, to log: EventLog, done: () -> String) {
-        do {
-            try log.append(e)
-            status = done()
-        } catch {
-            status = "書き込みに失敗: \(error.localizedDescription)"
+    /// 1 回の操作の行をまとめて 1 回の write で書く。書けなかったら（または先に積んだ書き込みが失敗していたら）
+    /// その行を画面の状態からも外して、ファイルと画面を一致させる
+    private func commit(_ batch: [PaperEvent], to log: EventLog, failuresAtPress: Int) -> Bool {
+        if failuresAtPress == writeFailures {
+            do {
+                try log.append(contentsOf: batch)
+                return true
+            } catch {
+                writeFailures += 1
+                status = "書き込みに失敗: \(error.localizedDescription)（この操作は記録していません）"
+            }
         }
+        let ids = Set(batch.map(\.id))
+        events.removeAll { ids.contains($0.id) }
+        recompute()
+        disarmFlip()
+        if let t = memoTarget, book.positions[t] == nil { memoTarget = book.memoTargets.first?.id }
+        return false
+    }
+
+    private func applyAutoRead(path: String, auto: AutoRead) {
+        guard let price = auto.price else { return }
+        autoByPath[path] = price
+        recompute()
+    }
+
+    /// 起動時: 保有中の建玉で現在値が未記録（領域を設定していない）の成行だけ、サイドカーの自動読み取りを拾う
+    private func loadAutoReadsForOpenPositions(folder: URL) {
+        let open = Set(book.openPositions.map(\.id))
+        var found = false
+        for case .order(let o) in events where open.contains(o.positionID) && o.orderType == .market && o.shot?.price == nil {
+            guard let path = o.shot?.ocrPath, autoByPath[path] == nil,
+                  let price = OCRSidecar.load(folder.appendingPathComponent(path))?.auto.price else { continue }
+            autoByPath[path] = price
+            found = true
+        }
+        if found { recompute() }
     }
 
     private func recompute() {
-        book = PositionBook.replay(events)
+        var auto: [UUID: String] = [:]
+        if !autoByPath.isEmpty {
+            for case .order(let o) in events where o.shot?.price == nil {
+                if let path = o.shot?.ocrPath, let v = autoByPath[path] { auto[o.id] = v }
+            }
+        }
+        book = PositionBook.replay(events, autoPrices: auto)
     }
 }

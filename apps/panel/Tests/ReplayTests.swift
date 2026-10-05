@@ -163,6 +163,83 @@ final class ReplayTests: XCTestCase {
         XCTAssertTrue(b.positions.isEmpty)
     }
 
+    // MARK: ドテンの書きかけ（旧ログ・破損）
+
+    /// 指値ドテンの約定・取消が片方だけ: 落ちずに警告を出す。状態は書かれた行のとおり（自動で補わない）
+    func testHalfWrittenFlipRefPairWarns() {
+        let pid = UUID()
+        let closeRow = limit(pid, .close, .sell, "200", "1100", 10)
+        let openRow = limit(UUID(), .open, .sell, "100", "1100", 10)
+        let base: [PaperEvent] = [.order(market(pid, .open, .buy, "200", price: "1000", 0)), .order(closeRow), .order(openRow)]
+
+        let cancelHalf = PositionBook.replay(base + [.cancel(RefEvent(ts: at(20), orderID: closeRow.id))])
+        XCTAssertTrue(cancelHalf.warnings.contains { $0.contains("ドテン") && $0.contains("片方") }, "\(cancelHalf.warnings)")
+        XCTAssertEqual(cancelHalf.pendingLimits.map(\.id), [openRow.id])
+        XCTAssertEqual(cancelHalf.positions[pid]?.qty, 200)
+
+        // 途中にある（後ろに別の行が続く）場合も同じ
+        let fillHalf = PositionBook.replay(base + [.fillMark(RefEvent(ts: at(20), orderID: closeRow.id)),
+                                                   .memo(MemoEvent(ts: at(21), positionID: pid, text: "x"))])
+        XCTAssertTrue(fillHalf.warnings.contains { $0.contains("ドテン") && $0.contains("片方") }, "\(fillHalf.warnings)")
+        XCTAssertEqual(fillHalf.positions[pid]?.qty, 0)
+
+        // 2 行そろっていれば警告なし
+        let both = PositionBook.replay(base + [.fillMark(RefEvent(ts: at(20), orderID: closeRow.id)),
+                                               .fillMark(RefEvent(ts: at(20), orderID: openRow.id))])
+        XCTAssertTrue(both.warnings.isEmpty, "\(both.warnings)")
+    }
+
+    /// 成行ドテンの open 行だけ（close 行が壊れて読めない）: 共有している shot のファイル名から気づいて警告する
+    func testFlipOpenRowWithoutCloseRowWarns() {
+        let pid = UUID(), closeID = UUID()
+        let shot = Shot(path: "shots/2026-10-05/\(closeID.uuidString.lowercased()).png", priceText: "1,000", price: "1000")
+        let openRow = OrderEvent(ts: at(10), positionID: UUID(), intent: .open, symbol: "7203", side: .sell, qty: "100",
+                                 orderType: .market, shot: shot)
+        let closeRow = OrderEvent(id: closeID, ts: at(10), positionID: pid, intent: .close, symbol: "7203", side: .sell, qty: "200",
+                                  orderType: .market, shot: shot)
+        let open: PaperEvent = .order(market(pid, .open, .buy, "200", price: "1000", 0))
+
+        let broken = PositionBook.replay([open, .order(openRow)])
+        XCTAssertTrue(broken.warnings.contains { $0.contains("ドテン") && $0.contains("決済") }, "\(broken.warnings)")
+
+        let ok = PositionBook.replay([open, .order(closeRow), .order(openRow)])
+        XCTAssertTrue(ok.warnings.isEmpty, "\(ok.warnings)")
+    }
+
+    /// 成行ドテンの close 行だけ（open 行の前で止まった）: 全決済と見分けられないので全決済として再生する（両建てにはならない）
+    func testFlipCloseRowAloneReplaysAsFullClose() {
+        let pid = UUID(), closeID = UUID()
+        let closeRow = OrderEvent(id: closeID, ts: at(10), positionID: pid, intent: .close, symbol: "7203", side: .sell, qty: "200",
+                                  orderType: .market,
+                                  shot: Shot(path: "shots/2026-10-05/\(closeID.uuidString.lowercased()).png", price: "1000"))
+        let b = PositionBook.replay([.order(market(pid, .open, .buy, "200", price: "1000", 0)), .order(closeRow)])
+        XCTAssertTrue(b.openPositions.isEmpty)
+        XCTAssertTrue(b.warnings.isEmpty, "\(b.warnings)")
+    }
+
+    /// 1 回の操作の行（ドテンの 2 行など）は 1 回の write でまとめて追記する。既存の行は残る
+    func testAppendBatchWritesAllRowsTogether() throws {
+        let dir = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let log = EventLog(folder: dir)
+        let p = UUID(), q = UUID()
+        let first: PaperEvent = .order(market(p, .open, .buy, "200", price: "1000", 0))
+        try log.append(first)
+        let flip: [PaperEvent] = [.order(market(p, .close, .sell, "200", price: "1010", 10)),
+                                  .order(market(q, .open, .sell, "100", price: "1010", 10))]
+        try log.append(contentsOf: flip)
+        try log.append(contentsOf: [])
+        let r = try log.load()
+        XCTAssertEqual(r.badLines, 0)
+        XCTAssertEqual(r.events, [first] + flip)
+
+        // 書けない時は 1 行も書かずに投げる
+        try FileManager.default.setAttributes([.posixPermissions: 0o444], ofItemAtPath: log.fileURL.path)
+        XCTAssertThrowsError(try log.append(contentsOf: flip))
+        try FileManager.default.setAttributes([.posixPermissions: 0o644], ofItemAtPath: log.fileURL.path)
+        XCTAssertEqual(try log.load().events.count, 3)
+    }
+
     func testBrokenLinesAreSkipped() throws {
         let dir = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         defer { try? FileManager.default.removeItem(at: dir) }

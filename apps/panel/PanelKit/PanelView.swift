@@ -7,6 +7,7 @@ public struct PanelView: View {
     /// プレビュー描画で経過時間を固定するため
     var now: Date?
     @FocusState private var memoFocused: Bool
+    @Environment(\.colorScheme) private var colorScheme
 
     public init(store: PanelStore, openSettings: @escaping () -> Void, now: Date? = nil) {
         self.store = store
@@ -34,7 +35,7 @@ public struct PanelView: View {
         .padding(10)
         .frame(minWidth: 340, idealWidth: 360)
         .onHover { inside in
-            if inside { store.refreshSymbolFromScreen() }
+            if inside { store.hoverEntered() }
         }
         .onChange(of: store.memoFocusRequest) { _, _ in memoFocused = true }
     }
@@ -80,6 +81,7 @@ public struct PanelView: View {
                 orderButton("買い", side: .buy, tint: .red)
                 orderButton("売り", side: .sell, tint: .blue)
             }
+            planPreview
             if store.dataFolder == nil {
                 Button("データフォルダを選ぶ…") { store.chooseDataFolder() }
             }
@@ -87,15 +89,60 @@ public struct PanelView: View {
     }
 
     private func orderButton(_ title: String, side: Side, tint: Color) -> some View {
-        Button {
+        let armed = store.armedFlip == side
+        return Button {
             store.placeOrder(side: side)
         } label: {
-            Text(title)
-                .font(.title2.bold())
+            Text(armed ? "もう一度でドテン" : title)
+                .font(armed ? .headline : .title2.bold())
                 .frame(maxWidth: .infinity, minHeight: 36)
         }
-        .buttonStyle(SolidButtonStyle(color: tint))
+        .buttonStyle(SolidButtonStyle(color: armed ? .orange : tint))
         .disabled(!store.canOrder)
+    }
+
+    /// 押す前に、それぞれのボタンで何が起きるかを 1 行ずつ出す（ドテンになる方は橙の帯）
+    private var planPreview: some View {
+        VStack(alignment: .leading, spacing: 2) {
+            ForEach([Side.buy, .sell], id: \.self) { side in
+                if let plan = store.previewPlan(side: side) {
+                    if plan.isFlip {
+                        // ライトの白地では素の橙が読みにくいので、濃い橙の文字＋薄い橙の帯にする
+                        flipText(plan)
+                            .foregroundStyle(colorScheme == .dark ? Color.orange : Color(red: 0.60, green: 0.26, blue: 0))
+                            .lineLimit(2)
+                            .fixedSize(horizontal: false, vertical: true)
+                            .padding(.horizontal, 6)
+                            .padding(.vertical, 3)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                            .background(RoundedRectangle(cornerRadius: 5)
+                                .fill(Color.orange.opacity(colorScheme == .dark ? 0.2 : 0.14)))
+                    } else {
+                        Text(plan.summary)
+                            .font(.caption.monospacedDigit())
+                            .foregroundStyle(.secondary)
+                            .lineLimit(2)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
+                }
+            }
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+    }
+
+    /// ドテンの 1 行。決済数・新規数は太字（何株決済して何株建てるかを一目で）
+    private func flipText(_ plan: OrderPlan) -> Text {
+        guard case .flip(let closeQty, let openQty) = plan.kind else { return Text(plan.summary) }
+        var s = AttributedString(plan.summary)
+        // Text 全体の fontWeight は run ごとのフォントより優先されて太字が消えるので、太さはすべて run 側で付ける
+        s.font = .caption.monospacedDigit().weight(.medium)
+        for (label, n) in [("決済 ", closeQty), ("新規\(plan.side == .buy ? "買い" : "売り") ", openQty)] {
+            if let r = s.range(of: label + n.contractString) {
+                let numStart = s.index(r.lowerBound, offsetByCharacters: label.count)
+                s[numStart..<r.upperBound].font = .caption.monospacedDigit().weight(.heavy)
+            }
+        }
+        return Text(s)
     }
 
     // MARK: 建玉
@@ -117,10 +164,13 @@ public struct PanelView: View {
     private var pendingSection: some View {
         VStack(alignment: .leading, spacing: 4) {
             Text("待機中の指値").font(.headline)
-            ForEach(store.book.pendingLimits, id: \.id) { o in
+            // ドテンの 2 行（決済＋新規）は 1 行にまとめる。約定・取消は 2 行そろって記録される
+            ForEach(store.book.pendingLimits.filter { !(store.book.flipPartner(of: $0.id) != nil && $0.intent == .open) }, id: \.id) { o in
                 HStack(spacing: 6) {
-                    Text("\(o.symbol) \(intentLabel(o)) \(o.qty)株 @\(o.limitPrice ?? "-")")
+                    Text("\(o.symbol) \(pendingLabel(o)) @\(o.limitPrice ?? "-")")
                         .font(.system(.callout, design: .monospaced))
+                        .lineLimit(1)
+                        .minimumScaleFactor(0.7)
                     Text(JST.clock(o.ts)).font(.caption).foregroundStyle(.secondary)
                     Spacer()
                     Button("約定した") { store.markFilled(orderID: o.id) }
@@ -129,6 +179,14 @@ public struct PanelView: View {
                 .controlSize(.small)
             }
         }
+    }
+
+    private func pendingLabel(_ o: OrderEvent) -> String {
+        if let partner = store.book.flipPartner(of: o.id) {
+            let total = (Decimal(contract: o.qty) ?? 0) + (Decimal(contract: partner.qty) ?? 0)
+            return "ドテン\(o.side.label) \(total.contractString)株"
+        }
+        return "\(intentLabel(o)) \(o.qty)株"
     }
 
     private func intentLabel(_ o: OrderEvent) -> String {
@@ -177,40 +235,30 @@ struct PositionRow: View {
     let position: Position
     let now: Date?
     @ObservedObject var store: PanelStore
-    @State private var qty: String = ""
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 2) {
-            HStack(spacing: 6) {
-                Text(position.direction == .buy ? "買" : "売")
-                    .font(.callout.bold())
-                    .foregroundStyle(position.direction == .buy ? Color.red : Color.blue)
-                Text(position.symbol).font(.system(.callout, design: .monospaced).bold())
-                Text("\(position.qty.contractString)株")
-                Text(position.avgPrice.map { "@\($0.displayString)" } ?? "@不明")
-                    .foregroundStyle(position.avgPrice == nil ? .secondary : .primary)
-                Spacer()
-                if let now {
-                    Text(elapsed(now)).font(.caption.monospacedDigit()).foregroundStyle(.secondary)
-                } else {
-                    TimelineView(.periodic(from: .now, by: 1)) { ctx in
-                        Text(elapsed(ctx.date)).font(.caption.monospacedDigit()).foregroundStyle(.secondary)
-                    }
+        // 一部決済・ドテンは上の大きな「買い」「売り」で行う。ここは成行の全決済だけ
+        HStack(spacing: 6) {
+            Text(position.direction == .buy ? "買" : "売")
+                .font(.callout.bold())
+                .foregroundStyle(position.direction == .buy ? Color.red : Color.blue)
+            Text(position.symbol).font(.system(.callout, design: .monospaced).bold())
+            Text("\(position.qty.contractString)株")
+            Text(position.avgPrice.map { "@\($0.displayString)" } ?? "@不明")
+                .foregroundStyle(position.avgPrice == nil ? .secondary : .primary)
+            Spacer()
+            if let now {
+                Text(elapsed(now)).font(.caption.monospacedDigit()).foregroundStyle(.secondary)
+            } else {
+                TimelineView(.periodic(from: .now, by: 1)) { ctx in
+                    Text(elapsed(ctx.date)).font(.caption.monospacedDigit()).foregroundStyle(.secondary)
                 }
             }
-            .font(.system(.callout, design: .monospaced))
-            HStack(spacing: 6) {
-                TextField("数量", text: $qty)
-                    .frame(width: 64)
-                    .font(.system(.callout, design: .monospaced))
-                Button("決済（成行）") { store.close(positionID: position.id, qtyText: qty, type: .market) }
-                Button("決済（指値）") { store.close(positionID: position.id, qtyText: qty, type: .limit) }
-                    .help("上の「価格」欄の値で指値を置く")
-            }
-            .controlSize(.small)
+            Button("全決済") { store.closeAll(positionID: position.id) }
+                .controlSize(.small)
+                .help("保有全数を成行で決済する（この建玉の待機中の指値は取り消す）")
         }
-        .onAppear { qty = position.closableQty.contractString }
-        .onChange(of: position.closableQty) { _, v in qty = v.contractString }
+        .font(.system(.callout, design: .monospaced))
     }
 
     private func elapsed(_ now: Date) -> String {

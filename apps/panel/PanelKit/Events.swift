@@ -29,13 +29,23 @@ public struct Shot: Codable, Equatable, Sendable {
     public var price: String?
     public var symbolText: String?
     public var confidence: Double?
+    /// 撮影が終わった時刻（ts との差が押下から撮影完了までの遅延）。旧い行には無い
+    public var capturedAt: Date?
+    /// 撮ったウィンドウのタイトル（例「全板　フジクラ(5803)」）。取れなければ無い
+    public var windowTitle: String?
+    /// 全画面 OCR のサイドカー（data/paper/ からの相対パス）。書き込みは後から。ファイルがまだ無いことがある
+    public var ocrPath: String?
 
-    public init(path: String, priceText: String? = nil, price: String? = nil, symbolText: String? = nil, confidence: Double? = nil) {
+    public init(path: String, priceText: String? = nil, price: String? = nil, symbolText: String? = nil, confidence: Double? = nil,
+                capturedAt: Date? = nil, windowTitle: String? = nil, ocrPath: String? = nil) {
         self.path = path
         self.priceText = priceText
         self.price = price
         self.symbolText = symbolText
         self.confidence = confidence
+        self.capturedAt = capturedAt
+        self.windowTitle = windowTitle
+        self.ocrPath = ocrPath
     }
 
     enum CodingKeys: String, CodingKey {
@@ -44,9 +54,13 @@ public struct Shot: Codable, Equatable, Sendable {
         case price
         case symbolText = "symbol_text"
         case confidence
+        case capturedAt = "captured_at"
+        case windowTitle = "window_title"
+        case ocrPath = "ocr_path"
     }
 
-    // 契約上 null を明示するキーは省略せず null で書く（合成実装は nil を省略してしまう）
+    // 契約上 null を明示するキーは省略せず null で書く（合成実装は nil を省略してしまう）。
+    // 後から足した任意のキー（captured_at / window_title / ocr_path）は値がある時だけ書く
     public func encode(to encoder: Encoder) throws {
         var c = encoder.container(keyedBy: CodingKeys.self)
         try c.encode(path, forKey: .path)
@@ -54,6 +68,21 @@ public struct Shot: Codable, Equatable, Sendable {
         try c.encode(price, forKey: .price)
         try c.encode(symbolText, forKey: .symbolText)
         try c.encode(confidence, forKey: .confidence)
+        try c.encodeIfPresent(capturedAt.map(JST.format), forKey: .capturedAt)
+        try c.encodeIfPresent(windowTitle, forKey: .windowTitle)
+        try c.encodeIfPresent(ocrPath, forKey: .ocrPath)
+    }
+
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        path = try c.decode(String.self, forKey: .path)
+        priceText = try c.decodeIfPresent(String.self, forKey: .priceText)
+        price = try c.decodeIfPresent(String.self, forKey: .price)
+        symbolText = try c.decodeIfPresent(String.self, forKey: .symbolText)
+        confidence = try c.decodeIfPresent(Double.self, forKey: .confidence)
+        capturedAt = try c.decodeIfPresent(String.self, forKey: .capturedAt).flatMap(JST.parse)
+        windowTitle = try c.decodeIfPresent(String.self, forKey: .windowTitle)
+        ocrPath = try c.decodeIfPresent(String.self, forKey: .ocrPath)
     }
 }
 

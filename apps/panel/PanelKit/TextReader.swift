@@ -34,7 +34,7 @@ public struct ReadResult: Equatable, Sendable {
 
 /// Vision で画面の文字を読む（端末内で完結。ネットワークは使わない）
 public enum TextReader {
-    public static func read(_ image: CGImage, region: RelRect?) -> ReadResult {
+    public static func read(_ image: CGImage, region: RelRect?, languages: [String] = ["en-US"]) -> ReadResult {
         let target: CGImage
         if let region {
             guard let rect = region.pixelRect(width: image.width, height: image.height),
@@ -48,7 +48,7 @@ public enum TextReader {
         let request = VNRecognizeTextRequest()
         request.recognitionLevel = .accurate
         request.usesLanguageCorrection = false
-        request.recognitionLanguages = ["en-US"]
+        request.recognitionLanguages = languages
         let handler = VNImageRequestHandler(cgImage: prepared, options: [:])
         do {
             try handler.perform([request])

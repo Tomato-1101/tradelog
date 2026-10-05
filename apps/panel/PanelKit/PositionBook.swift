@@ -3,6 +3,8 @@ import Foundation
 /// events.jsonl を頭から再生して、建玉と待機中の指値を復元する（再起動しても状態が戻る）。
 /// 成行は押した時点で約定したものとして数量に反映する（価格は shot.price。読めなければ平均建値は不明）。
 /// 指値は fill_mark が来た時点で数量に反映する（価格は指値）。
+/// 新しい記録は「1 銘柄に建玉は 1 つ（ネッティング）」で panel が書く（plan(...) を参照）。
+/// 再生は記録された position_id・intent のとおりに行うので、旧ルールの両建ての記録もそのまま再生できる（警告に残すだけ）。
 public struct Position: Identifiable, Equatable, Sendable {
     public let id: UUID            // position_id
     public let symbol: String
@@ -32,9 +34,23 @@ public struct PositionBook: Equatable, Sendable {
 
     public init() {}
 
-    public static func replay(_ events: [PaperEvent]) -> PositionBook {
+    /// 全画面 OCR で後から読めた現在値（order の id → 価格）。shot.price が無い成行の建値の表示にだけ使う（記録には書かない）
+    public private(set) var autoPrices: [UUID: String] = [:]
+
+    /// ドテンの 2 行の片方に fill_mark / cancel が来た: 次の行で相方にも同じ ts で同じものが来るはず（来なければ書きかけ）
+    struct AwaitedRef: Equatable, Sendable {
+        let orderID: UUID
+        let ts: Date
+        let fill: Bool
+    }
+    private var awaitedPartner: AwaitedRef?
+    private var previousEvent: PaperEvent?
+
+    public static func replay(_ events: [PaperEvent], autoPrices: [UUID: String] = [:]) -> PositionBook {
         var b = PositionBook()
+        b.autoPrices = autoPrices
         for e in events { b.apply(e) }
+        b.finishReplay()
         return b
     }
 
@@ -58,6 +74,8 @@ public struct PositionBook: Equatable, Sendable {
     }
 
     public mutating func apply(_ event: PaperEvent) {
+        checkFlipPair(event)
+        defer { previousEvent = event }
         switch event {
         case .order(let o):
             applyOrder(o)
@@ -92,6 +110,47 @@ public struct PositionBook: Equatable, Sendable {
         }
     }
 
+    /// 書きかけ（旧ログ・途中で落ちた・行が壊れた）のドテンの検出。panel は組の行を 1 回の write で隣り合わせに書くので、
+    /// 片方しか無ければ警告だけ出す（状態は書かれた行のとおりに再生し、勝手に補わない）。
+    /// 成行ドテンの close 行だけが残った場合は全決済と見分けられないが、両建てにはならないので全決済として扱う。
+    private mutating func checkFlipPair(_ event: PaperEvent) {
+        if let w = awaitedPartner {
+            awaitedPartner = nil
+            let matched: Bool
+            switch event {
+            case .fillMark(let r): matched = w.fill && r.orderID == w.orderID && r.ts == w.ts
+            case .cancel(let r): matched = !w.fill && r.orderID == w.orderID && r.ts == w.ts
+            default: matched = false
+            }
+            if !matched { warnHalfPair(w) }
+        }
+        switch event {
+        case .fillMark(let r):
+            if let partner = flipPartner(of: r.orderID) { awaitedPartner = AwaitedRef(orderID: partner.id, ts: r.ts, fill: true) }
+        case .cancel(let r):
+            if let partner = flipPartner(of: r.orderID) { awaitedPartner = AwaitedRef(orderID: partner.id, ts: r.ts, fill: false) }
+        case .order(let o) where o.intent == .open:
+            // ドテンの open 行は 1 行目（close）の id の画像を共有する → 直前の行がその close でなければ決済行が欠けている
+            guard let name = o.shot?.path.split(separator: "/").last, let shotID = UUID(uuidString: String(name.prefix(36))),
+                  shotID != o.id else { return }
+            if case .order(let prev)? = previousEvent, prev.id == shotID, prev.intent == .close, prev.ts == o.ts { return }
+            warnings.append("ドテンの決済行が無い（書きかけ・破損）: \(o.id)")
+        default:
+            break
+        }
+    }
+
+    private mutating func finishReplay() {
+        if let w = awaitedPartner {
+            awaitedPartner = nil
+            warnHalfPair(w)
+        }
+    }
+
+    private mutating func warnHalfPair(_ w: AwaitedRef) {
+        warnings.append("ドテンの片方だけ\(w.fill ? "約定" : "取消")（書きかけ）。残った指値: \(w.orderID)")
+    }
+
     private mutating func applyOrder(_ o: OrderEvent) {
         guard let q = Decimal(contract: o.qty), q > 0 else {
             warnings.append("数量が読めない注文: \(o.id)")
@@ -114,7 +173,7 @@ public struct PositionBook: Equatable, Sendable {
         positions[o.positionID]?.lastOrderID = o.id
         switch o.orderType {
         case .market:
-            fill(o, price: Decimal(contract: o.shot?.price), at: o.ts)
+            fill(o, price: Decimal(contract: o.shot?.price ?? autoPrices[o.id]), at: o.ts)
         case .limit:
             pendingLimits.append(o)
             if o.intent == .close { positions[o.positionID]?.pendingCloseQty += q }
@@ -132,6 +191,9 @@ public struct PositionBook: Equatable, Sendable {
             } else {
                 p.priceUnknown = true
                 p.avgPrice = nil
+            }
+            if p.qty == 0, positions.values.contains(where: { $0.id != p.id && $0.symbol == p.symbol && $0.isOpen && $0.direction != p.direction }) {
+                warnings.append("両建て（旧ルールの記録）: \(p.symbol)")
             }
             p.qty += q
             p.everFilled = true

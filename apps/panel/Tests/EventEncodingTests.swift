@@ -78,6 +78,25 @@ final class EventEncodingTests: XCTestCase {
         XCTAssertTrue(s["confidence"] is NSNull)
     }
 
+    /// 新しい shot のキー（captured_at / window_title / ocr_path）は値がある時だけ書く（旧形式の行と見本はそのまま）
+    func testShotCaptureFieldsAreOptional() throws {
+        let plain = try XCTUnwrap(try object(.order(OrderEvent(id: oid, ts: ts, positionID: pos, intent: .open, symbol: "7203", side: .buy,
+                                                               qty: "100", orderType: .market, shot: Shot(path: "shots/a.png"))))["shot"] as? [String: Any])
+        XCTAssertEqual(Set(plain.keys), ["path", "price_text", "price", "symbol_text", "confidence"])
+
+        let captured = try XCTUnwrap(JST.parse(JST.format(ts.addingTimeInterval(0.085))))
+        let shot = Shot(path: "shots/2026-10-05/a.png", capturedAt: captured, windowTitle: "全板　フジクラ(5803)",
+                        ocrPath: "shots/2026-10-05/a.ocr.json")
+        let e = PaperEvent.order(OrderEvent(id: oid, ts: ts, positionID: pos, intent: .open, symbol: "5803", side: .buy,
+                                            qty: "100", orderType: .market, shot: shot))
+        let s = try XCTUnwrap(try object(e)["shot"] as? [String: Any])
+        XCTAssertEqual(s["captured_at"] as? String, JST.format(captured))
+        XCTAssertEqual(s["window_title"] as? String, "全板　フジクラ(5803)")
+        XCTAssertEqual(s["ocr_path"] as? String, "shots/2026-10-05/a.ocr.json")
+        XCTAssertTrue(s["price"] is NSNull, "price は領域の読み取りだけ（領域が無ければ null）")
+        XCTAssertEqual(try EventCoding.decode(line: EventCoding.line(e)), e)
+    }
+
     func testFillMarkCancelMemo() throws {
         let f = try object(.fillMark(RefEvent(id: pos, ts: ts, orderID: oid)))
         XCTAssertEqual(Set(f.keys), ["v", "id", "type", "ts", "order_id"])

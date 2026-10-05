@@ -19,6 +19,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.mainMenu = makeMainMenu()
         store.restoreDataFolder()
+        // Vision の初回はモデルの読み込みで十数秒かかるので、最初の発注より前に裏で 1 回読んでおく
+        Task.detached(priority: .utility) { BoardReader.warmUp() }
+        // 撮影対象のウィンドウを覚えておき、発注時は撮るだけにする（マウスが乗った時にも作り直す）
+        store.startBackgroundRefresh()
 
         panel = FloatingPanel(contentRect: NSRect(x: 0, y: 0, width: 360, height: 560),
                               styleMask: [.titled, .closable, .resizable, .utilityWindow, .nonactivatingPanel],

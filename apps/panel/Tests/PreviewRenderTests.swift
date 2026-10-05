@@ -85,12 +85,49 @@ final class PreviewRenderTests: XCTestCase {
 
     func testRenderSettings() throws {
         let (store, _) = try sampleStore()
-        store.settings.priceRegion = RelRect(x: 0.66, y: 0.72, w: 0.24, h: 0.1)
+        store.settings.priceRegion = RelRect(x: 0.66, y: 0.72, w: 0.165, h: 0.1)
         store.settings.symbolRegion = RelRect(x: 0.02, y: 0.02, w: 0.12, h: 0.07)
         let fakeWindow = TestImages.render(width: 1200, height: 800, labels: [
             .init(text: "7203", origin: CGPoint(x: 40, y: 30), fontSize: 28),
+            .init(text: "現在値", origin: CGPoint(x: 660, y: 606), fontSize: 30),
             .init(text: "3,021.5", origin: CGPoint(x: 820, y: 600), fontSize: 40),
+            .init(text: "C 15:30", origin: CGPoint(x: 1010, y: 606), fontSize: 30),
         ])
-        try render(SettingsView(store: store, preview: fakeWindow), size: CGSize(width: 600, height: 900), dark: false, name: "settings")
+        try render(SettingsView(store: store, preview: fakeWindow, previewTitle: "全板　トヨタ自動車(7203)"),
+                   size: CGSize(width: 600, height: 1000), dark: false, name: "settings")
+    }
+
+    /// ネッティングの表示: 押す前の 1 行（買い増し／ドテン）、ドテンの予告、待機中のドテン指値（1 行にまとめる）
+    func testRenderNettingAndFlipPreview() throws {
+        let dir = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        addTeardownBlock { try? FileManager.default.removeItem(at: dir) }
+        let settings = PanelSettings(defaults: UserDefaults(suiteName: "panel-preview-\(UUID().uuidString)")!)
+        let log = EventLog(folder: dir)
+        let t0 = JST.parse("2026-10-05T09:12:00.000+09:00")!
+        let long = UUID(), short = UUID()
+        let events: [PaperEvent] = [
+            .order(OrderEvent(ts: t0, positionID: long, intent: .open, symbol: "5803", side: .buy, qty: "200", orderType: .market,
+                              shot: Shot(path: "shots/a.png", priceText: "5,566", price: "5566"))),
+            .order(OrderEvent(ts: t0.addingTimeInterval(30), positionID: short, intent: .open, symbol: "285A", side: .sell, qty: "300",
+                              orderType: .market, shot: Shot(path: "shots/b.png", priceText: "2,810", price: "2810"))),
+            // 285A の指値ドテン（決済 300 ＋ 新規買い 100）が待機中
+            .order(OrderEvent(ts: t0.addingTimeInterval(90), positionID: short, intent: .close, symbol: "285A", side: .buy, qty: "300",
+                              orderType: .limit, limitPrice: "2780", shot: nil)),
+            .order(OrderEvent(ts: t0.addingTimeInterval(90), positionID: UUID(), intent: .open, symbol: "285A", side: .buy, qty: "100",
+                              orderType: .limit, limitPrice: "2780", shot: nil)),
+        ]
+        for e in events { try log.append(e) }
+        let store = PanelStore(settings: settings, shotTaker: FakeShotTaker { _, _, _ in nil })
+        store.open(folder: dir)
+        store.symbol = "5803"
+        store.qtyText = "300"
+        store.orderType = .market
+        let now = t0.addingTimeInterval(200)
+        try render(PanelView(store: store, openSettings: {}, now: now), size: CGSize(width: 360, height: 620), dark: false,
+                   name: "panel-netting-light")
+        store.placeOrder(side: .sell)  // ドテンなので 1 回目は予告だけ
+        XCTAssertEqual(store.armedFlip, .sell)
+        try render(PanelView(store: store, openSettings: {}, now: now), size: CGSize(width: 360, height: 620), dark: true,
+                   name: "panel-flip-armed-dark")
     }
 }

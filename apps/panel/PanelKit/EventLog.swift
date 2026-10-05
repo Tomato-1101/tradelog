@@ -30,23 +30,40 @@ public final class EventLog {
     }
 
     public func append(_ event: PaperEvent) throws {
-        let data = Data((try EventCoding.line(event) + "\n").utf8)
-        let fm = FileManager.default
-        try fm.createDirectory(at: folder, withIntermediateDirectories: true)
-        if !fm.fileExists(atPath: fileURL.path) {
-            fm.createFile(atPath: fileURL.path, contents: nil)
+        try append(contentsOf: [event])
+    }
+
+    /// 1 回の操作で書く行（ドテンの 2 行・先に書く取消・相方の約定など）を 1 つのバッファにまとめ、O_APPEND の 1 回の write で追記する。
+    /// 行ごとに書くと、途中で落ちたり失敗したりした時に片側だけ残る（open だけ残れば両建て）ため。
+    public func append(contentsOf events: [PaperEvent]) throws {
+        guard !events.isEmpty else { return }
+        // 先に全行をエンコードする（ここで失敗したら 1 行も書かない）
+        let data = Data(try events.map { try EventCoding.line($0) + "\n" }.joined().utf8)
+        try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+        let fd = Darwin.open(fileURL.path, O_WRONLY | O_APPEND | O_CREAT, 0o644)
+        guard fd >= 0 else { throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO) }
+        defer { Darwin.close(fd) }
+        let before = lseek(fd, 0, SEEK_END)
+        let written = data.withUnsafeBytes { Darwin.write(fd, $0.baseAddress, $0.count) }
+        if written != data.count {
+            let code = written < 0 ? (POSIXErrorCode(rawValue: errno) ?? .EIO) : .EIO
+            // 一部だけ書けた（ディスクが一杯等）なら、書きかけの行を残さない
+            if written > 0, before >= 0 { _ = ftruncate(fd, before) }
+            throw POSIXError(code)
         }
-        let h = try FileHandle(forWritingTo: fileURL)
-        defer { try? h.close() }
-        try h.seekToEnd()
-        try h.write(contentsOf: data)
-        // 取引中に落ちても記録が残るよう、1 件ごとにディスクへ書き切る
-        try h.synchronize()
+        // 取引中に落ちても記録が残るよう、操作ごとにディスクへ書き切る
+        guard fsync(fd) == 0 else { throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO) }
     }
 
     /// スクショの置き場所（data/paper からの相対パスと絶対 URL）
     public func shotLocation(eventID: UUID, ts: Date) -> (relative: String, url: URL) {
         let rel = "shots/\(JST.day(ts))/\(eventID.uuidString.lowercased()).png"
+        return (rel, folder.appendingPathComponent(rel))
+    }
+
+    /// 全画面 OCR のサイドカー（スクショと同じ場所に <event id>.ocr.json）
+    public func ocrLocation(eventID: UUID, ts: Date) -> (relative: String, url: URL) {
+        let rel = "shots/\(JST.day(ts))/\(eventID.uuidString.lowercased()).ocr.json"
         return (rel, folder.appendingPathComponent(rel))
     }
 }
