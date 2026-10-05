@@ -130,4 +130,81 @@ final class PreviewRenderTests: XCTestCase {
         try render(PanelView(store: store, openSettings: {}, now: now), size: CGSize(width: 360, height: 620), dark: true,
                    name: "panel-flip-armed-dark")
     }
+
+    // MARK: 録画リプレイ練習
+
+    /// data/paper/replay/recordings/ に合成の録画を置き、その練習中の小窓・再生ウィンドウを描く
+    private func replayStore() async throws -> (PanelStore, ReplaySession, URL) {
+        let dir = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        addTeardownBlock { try? FileManager.default.removeItem(at: dir) }
+        let settings = PanelSettings(defaults: UserDefaults(suiteName: "panel-preview-\(UUID().uuidString)")!)
+        let started = JST.parse("2026-10-06T08:53:12.345+09:00")!
+        let id = "20261006-085300"
+        let files = RecordingPaths.files(dataFolder: dir, id: id, day: "2026-10-06")
+        let img = ReplayModeTests.twoBoards()
+        try await SyntheticVideo.write(url: files.mp4, width: 1200, height: 400, frames: [(ms: 0, image: img)], endMs: 2000)
+        var meta = RecordingMeta(id: id, status: .done, width: 1200, height: 400, plannedMinutes: 37, startedAt: started)
+        meta.endedAt = started.addingTimeInterval(37 * 60)
+        meta.samples = [RecSample(tMs: 0, windows: [ReplayModeTests.left, ReplayModeTests.right])]
+        try meta.write(to: files.json)
+        let store = PanelStore(settings: settings, shotTaker: FakeShotTaker { _, _, _ in nil })
+        store.makeReplayTaker = { _ in
+            FakeShotTaker { id, ts, log in Shot(path: log.shotLocation(eventID: id, ts: ts).relative, priceText: "3,021.5", price: "3021.5",
+                                                capturedAt: ts) }
+        }
+        store.open(folder: dir)
+        let entry = try XCTUnwrap(RecordingEntry.scan(dataFolder: dir).first)
+        let session = try XCTUnwrap(ReplaySession(entry: entry))
+        await store.enterReplay(session)
+        return (store, session, dir)
+    }
+
+    func testRenderReplayPanel() async throws {
+        let (store, session, _) = try await replayStore()
+        session.windowOpen = true
+        session.isPlaying = true
+        session.positionOverride = 483_123
+        store.symbol = "6758"
+        store.qtyText = "100"
+        store.orderType = .market
+        store.placeOrder(side: .buy)
+        await store.flush()
+        store.memoText = "板の厚い 3,020 で拾う"
+        let now = ReplayClock.ts(startedAt: session.startedAt, videoMs: 540_000)
+        try render(PanelView(store: store, openSettings: {}, now: now), size: CGSize(width: 360, height: 620), dark: false,
+                   name: "panel-replay-light")
+        session.isPlaying = false
+        try render(PanelView(store: store, openSettings: {}, now: now), size: CGSize(width: 360, height: 620), dark: true,
+                   name: "panel-replay-paused-dark")
+        await store.exitReplay()
+    }
+
+    func testRenderReplayPlayer() async throws {
+        let (store, session, _) = try await replayStore()
+        session.windowOpen = true
+        session.positionOverride = 483_123
+        try render(ReplayPlayerView(session: session), size: CGSize(width: 1100, height: 520), dark: false, name: "replay-player")
+        await store.exitReplay()
+    }
+
+    /// 設定の「録画」: 録画中の状態、保存済みの一覧（成功・失敗・途中で止めた録画）と合計サイズ
+    func testRenderSettingsRecording() async throws {
+        let (store, _, dir) = try await replayStore()
+        await store.exitReplay()
+        let started = JST.parse("2026-10-07T08:53:04.120+09:00")!
+        var failed = RecordingMeta(id: "20261007-085300", status: .failed)
+        failed.endedAt = started
+        failed.issues = [RecIssue(at: started, tMs: nil, kind: "no_permission", message: "画面収録の許可がありません")]
+        try failed.write(to: RecordingPaths.files(dataFolder: dir, id: failed.id, day: "2026-10-07").json)
+        let s2 = JST.parse("2026-10-08T08:53:03.500+09:00")!
+        var stopped = RecordingMeta(id: "20261008-085300", status: .stopped, width: 1200, height: 400, plannedMinutes: 37, startedAt: s2)
+        stopped.endedAt = s2.addingTimeInterval(21 * 60)
+        stopped.issues = [RecIssue(at: s2.addingTimeInterval(300), tMs: 300_000, kind: "black", message: "画面が真っ黒です（ロック・スリープの疑い）")]
+        let f2 = RecordingPaths.files(dataFolder: dir, id: stopped.id, day: "2026-10-08")
+        try stopped.write(to: f2.json)
+        try Data(repeating: 0, count: 180_000_000 / 1000).write(to: f2.mp4)
+        store.recording.isRecording = true
+        store.recording.statusLine = "録画中 08:57 / 残り 33 分"
+        try render(SettingsView(store: store), size: CGSize(width: 600, height: 1400), dark: false, name: "settings-recording")
+    }
 }

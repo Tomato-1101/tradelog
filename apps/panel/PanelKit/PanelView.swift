@@ -17,6 +17,9 @@ public struct PanelView: View {
 
     public var body: some View {
         VStack(alignment: .leading, spacing: 8) {
+            if let replay = store.replay {
+                ReplayBanner(session: replay, store: store)
+            }
             orderSection
             Divider()
             positionsSection
@@ -26,6 +29,7 @@ public struct PanelView: View {
             }
             Divider()
             memoSection
+            RecordingStatusLine(recording: store.recording)
             Text(store.status)
                 .font(.caption)
                 .foregroundStyle(.secondary)
@@ -33,6 +37,8 @@ public struct PanelView: View {
                 .frame(maxWidth: .infinity, alignment: .leading)
         }
         .padding(10)
+        // リプレイ中は窓全体を紫がかった色にして、通常のペーパーと取り違えないようにする
+        .background(store.replay == nil ? Color.clear : Color.purple.opacity(0.10))
         .frame(minWidth: 340, idealWidth: 360)
         .onHover { inside in
             if inside { store.hoverEntered() }
@@ -174,7 +180,9 @@ public struct PanelView: View {
                     Text(JST.clock(o.ts)).font(.caption).foregroundStyle(.secondary)
                     Spacer()
                     Button("約定した") { store.markFilled(orderID: o.id) }
+                        .disabled(store.replayBlocked)
                     Button("取消") { store.cancel(orderID: o.id) }
+                        .disabled(store.replayBlocked)
                 }
                 .controlSize(.small)
             }
@@ -251,11 +259,14 @@ struct PositionRow: View {
                 Text(elapsed(now)).font(.caption.monospacedDigit()).foregroundStyle(.secondary)
             } else {
                 TimelineView(.periodic(from: .now, by: 1)) { ctx in
-                    Text(elapsed(ctx.date)).font(.caption.monospacedDigit()).foregroundStyle(.secondary)
+                    // リプレイ中は録画上の実時刻で経過を出す（建玉の時刻も録画上の時刻なので）
+                    let t = store.replay.map { ReplayClock.ts(startedAt: $0.startedAt, videoMs: $0.currentVideoMs()) } ?? ctx.date
+                    Text(elapsed(t)).font(.caption.monospacedDigit()).foregroundStyle(.secondary)
                 }
             }
             Button("全決済") { store.closeAll(positionID: position.id) }
                 .controlSize(.small)
+                .disabled(store.replayBlocked)
                 .help("保有全数を成行で決済する（この建玉の待機中の指値は取り消す）")
         }
         .font(.system(.callout, design: .monospaced))
@@ -266,6 +277,58 @@ struct PositionRow: View {
         let s = max(Int(now.timeIntervalSince(opened)), 0)
         if s >= 3600 { return String(format: "%d時間%02d分", s / 3600, (s % 3600) / 60) }
         return String(format: "%d分%02d秒", s / 60, s % 60)
+    }
+}
+
+/// リプレイ練習中の帯: 録画上の実時刻と、発注できるかどうか
+struct ReplayBanner: View {
+    @ObservedObject var session: ReplaySession
+    @ObservedObject var store: PanelStore
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            Text("リプレイ: \(ReplaySession.label(session.realTime))")
+                .font(.headline.monospacedDigit())
+                .foregroundStyle(.white)
+            HStack(spacing: 6) {
+                Text(session.canTrade ? "再生中（録画上の時刻で記録）" : session.windowOpen ? "一時停止中・発注できません" : "再生ウィンドウが閉じています")
+                    .font(.caption)
+                    .foregroundStyle(.white.opacity(0.9))
+                Spacer()
+                if !session.windowOpen {
+                    Button("再生画面") { store.showReplayWindow() }
+                }
+                Button("練習を終える") { Task { await store.exitReplay() } }
+            }
+            .controlSize(.small)
+            if let notice = session.floorNotice {
+                Text(notice)
+                    .font(.caption)
+                    .foregroundStyle(.white)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+        }
+        .padding(8)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(RoundedRectangle(cornerRadius: 6).fill(session.canTrade ? Color.purple : Color.purple.opacity(0.55)))
+    }
+}
+
+/// 録画の状態（録画中・直前の録画の結果）。録画していなければ何も出さない
+struct RecordingStatusLine: View {
+    @ObservedObject var recording: RecordingController
+
+    var body: some View {
+        if let line = recording.statusLine {
+            HStack(spacing: 4) {
+                Image(systemName: recording.isRecording ? "record.circle" : "film")
+                    .foregroundStyle(recording.isRecording ? Color.red : Color.secondary)
+                Text(line)
+                    .lineLimit(2)
+            }
+            .font(.caption.monospacedDigit())
+            .frame(maxWidth: .infinity, alignment: .leading)
+        }
     }
 }
 

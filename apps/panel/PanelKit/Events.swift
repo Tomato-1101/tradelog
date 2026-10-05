@@ -256,6 +256,69 @@ public enum EventCoding {
     public static func decode(line: String) throws -> PaperEvent {
         try JSONDecoder().decode(PaperEvent.self, from: Data(line.utf8))
     }
+
+    /// リプレイ練習の行: 通常の行に `replay` キーを足す（同じオブジェクトに並べる。v は 1 のまま）
+    public static func line(_ event: PaperEvent, replay: ReplayRef) throws -> String {
+        let enc = JSONEncoder()
+        enc.outputFormatting = [.sortedKeys, .withoutEscapingSlashes]
+        let data = try enc.encode(Tagged(event: event, replay: replay))
+        return String(decoding: data, as: UTF8.self)
+    }
+
+    /// 行の `replay`（通常の行なら nil）
+    public static func replayRef(line: String) -> ReplayRef? {
+        (try? JSONDecoder().decode(Probe.self, from: Data(line.utf8)))?.replay
+    }
+
+    private struct Tagged: Encodable {
+        let event: PaperEvent
+        let replay: ReplayRef
+        enum Keys: String, CodingKey { case replay }
+        func encode(to encoder: Encoder) throws {
+            try event.encode(to: encoder)
+            var c = encoder.container(keyedBy: Keys.self)
+            try c.encode(replay, forKey: .replay)
+        }
+    }
+
+    private struct Probe: Decodable { var replay: ReplayRef? }
+}
+
+/// リプレイ練習の行に付ける `replay`（docs/paper-events.md「リプレイ」）
+public struct ReplayRef: Codable, Equatable, Sendable {
+    public var recordingID: String
+    public var sessionID: UUID
+    public var videoMs: Int
+
+    public init(recordingID: String, sessionID: UUID, videoMs: Int) {
+        self.recordingID = recordingID
+        self.sessionID = sessionID
+        self.videoMs = videoMs
+    }
+
+    enum CodingKeys: String, CodingKey {
+        case recordingID = "recording_id"
+        case sessionID = "session_id"
+        case videoMs = "video_ms"
+    }
+
+    public func encode(to encoder: Encoder) throws {
+        var c = encoder.container(keyedBy: CodingKeys.self)
+        try c.encode(recordingID, forKey: .recordingID)
+        try c.encode(sessionID.uuidString.lowercased(), forKey: .sessionID)
+        try c.encode(videoMs, forKey: .videoMs)
+    }
+
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        recordingID = try c.decode(String.self, forKey: .recordingID)
+        let s = try c.decode(String.self, forKey: .sessionID)
+        guard let u = UUID(uuidString: s) else {
+            throw DecodingError.dataCorruptedError(forKey: .sessionID, in: c, debugDescription: "UUID ではない: \(s)")
+        }
+        sessionID = u
+        videoMs = try c.decode(Int.self, forKey: .videoMs)
+    }
 }
 
 /// 時刻は常に JST（+09:00）のミリ秒付き ISO8601 で書く

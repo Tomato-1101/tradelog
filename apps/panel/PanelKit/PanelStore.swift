@@ -1,4 +1,5 @@
 import AppKit
+import Combine
 import Foundation
 
 /// 小窓の状態。本物の発注は存在せず、やることは events.jsonl への追記だけ。
@@ -24,9 +25,20 @@ public final class PanelStore: ObservableObject {
     @Published public private(set) var armedFlip: Side?
     /// 直近の発注の、押下から撮影完了までのミリ秒（小窓の状態表示用）
     @Published public private(set) var lastShotLatencyMs: Int?
+    /// リプレイ練習中の録画（nil なら通常のペーパー）。記録先・時刻・撮影がすべて録画側に切り替わる
+    @Published public private(set) var replay: ReplaySession?
 
     public let settings: PanelSettings
     let shotTaker: ShotTaking
+    /// 録画（開始・停止・一覧）
+    public let recording = RecordingController()
+    /// 再生ウィンドウを出す・閉じる（アプリ側が入れる）
+    public var presentReplayWindow: ((ReplaySession) -> Void)?
+    public var dismissReplayWindow: (() -> Void)?
+    /// リプレイの撮影（テストで差し替える）
+    var makeReplayTaker: (ReplaySession) -> ShotTaking = { ReplayShotTaker(session: $0) }
+    private var replayTaker: ShotTaking?
+    private var replayObservation: AnyCancellable?
     private var log: EventLog?
     /// 書き込みを押した順に直列化する（発注の撮影待ちの間に押したメモ等が先に書かれないように）
     private var writeChain: Task<Void, Never>?
@@ -54,7 +66,20 @@ public final class PanelStore: ObservableObject {
         shotTaker.onAutoRead = { [weak self] path, auto in
             Task { @MainActor in self?.applyAutoRead(path: path, auto: auto) }
         }
+        recording.dataFolder = { [weak self] in self?.dataFolder }
     }
+
+    /// いま使う撮影（リプレイ中は録画のフレーム）
+    private var taker: ShotTaking { replayTaker ?? shotTaker }
+
+    /// 押した瞬間の時刻。リプレイ中は録画上の実時刻（started_at ＋ 再生位置）
+    private func now() -> Date {
+        guard let replay else { return JST.nowMillis() }
+        return ReplayClock.ts(startedAt: replay.startedAt, videoMs: replay.currentVideoMs())
+    }
+
+    /// リプレイ中で、一時停止中か再生ウィンドウが無い（時刻が決まらないので発注・約定・取消・全決済を押せない）
+    public var replayBlocked: Bool { replay.map { !$0.canTrade } ?? false }
 
     // MARK: データフォルダ
 
@@ -70,6 +95,11 @@ public final class PanelStore: ObservableObject {
 
     /// フォルダを開く（テストやプレビューでは bookmark を介さずに直接渡す）
     public func open(folder: URL) {
+        // リプレイ中に通常の events.jsonl を読み込むと、リプレイの印の無い行が通常側に書かれてしまう
+        guard replay == nil else {
+            status = Self.folderLockedInReplay
+            return
+        }
         let log = EventLog(folder: folder)
         do {
             let r = try log.load()
@@ -90,7 +120,13 @@ public final class PanelStore: ObservableObject {
         }
     }
 
+    static let folderLockedInReplay = "リプレイ練習中は記録先を変えられません（「練習を終える」の後に選び直してください）"
+
     public func chooseDataFolder() {
+        guard replay == nil else {
+            status = Self.folderLockedInReplay
+            return
+        }
         let panel = NSOpenPanel()
         panel.canChooseDirectories = true
         panel.canChooseFiles = false
@@ -114,7 +150,7 @@ public final class PanelStore: ObservableObject {
     // MARK: 発注
 
     public var canOrder: Bool {
-        log != nil && SymbolParser.isValid(symbol) && QtyParser.parse(qtyText) != nil
+        log != nil && !replayBlocked && SymbolParser.isValid(symbol) && QtyParser.parse(qtyText) != nil
             && (orderType == .market || PriceParser.parse(limitPriceText) != nil)
     }
 
@@ -128,7 +164,7 @@ public final class PanelStore: ObservableObject {
     /// 大きな「買い」「売り」。銘柄ごとに建玉は 1 つ（ネッティング）で、新規・買い増し・決済・ドテンをここだけで行う。
     /// ドテンになる時だけ、1 回目は予告して止まり、3 秒以内のもう一度で書く
     public func placeOrder(side: Side) {
-        let ts = JST.nowMillis()
+        let ts = now()
         guard canOrder, let qty = QtyParser.parse(qtyText),
               let plan = book.plan(symbol: symbol, side: side, qty: qty, orderType: orderType,
                                    limitPrice: orderType == .limit ? PriceParser.parse(limitPriceText) : nil, ts: ts)
@@ -147,8 +183,8 @@ public final class PanelStore: ObservableObject {
 
     /// 建玉の行の「全決済」。成行で保有全数を反対売買する（その建玉の待機中の指値は取り消す）
     public func closeAll(positionID: UUID) {
-        let ts = JST.nowMillis()
-        guard log != nil, let p = book.positions[positionID], p.isOpen,
+        let ts = now()
+        guard log != nil, !replayBlocked, let p = book.positions[positionID], p.isOpen,
               let plan = book.plan(symbol: p.symbol, side: p.direction.opposite, qty: p.qty.contractString, orderType: .market,
                                    limitPrice: nil, ts: ts, target: p.id)
         else { return }
@@ -188,11 +224,11 @@ public final class PanelStore: ObservableObject {
         status = "\(head) 撮影中…"
 
         let previous = writeChain
-        let taker = shotTaker
+        let taker = taker
         let failuresAtPress = writeFailures
         writeChain = Task { [weak self] in
             // ドテンの 2 行は同じ画像・同じ OCR を共有する（ファイル名は 1 行目の id）
-            let shot = await taker.takeShot(eventID: first.id, ts: first.ts, log: log)
+            let shot = await taker.takeShot(eventID: first.id, ts: first.ts, log: log, symbol: first.symbol)
             await previous?.value
             guard let self else { return }
             let finals = plan.orders.map { o -> OrderEvent in
@@ -225,8 +261,8 @@ public final class PanelStore: ObservableObject {
     public func cancel(orderID: UUID) { appendRefs(orderID, fill: false, done: "取消を記録しました") }
 
     private func appendRefs(_ orderID: UUID, fill: Bool, done: String) {
-        guard log != nil else { return }
-        let batch = book.refEvents(orderID: orderID, fill: fill, ts: JST.nowMillis())
+        guard log != nil, !replayBlocked else { return }
+        let batch = book.refEvents(orderID: orderID, fill: fill, ts: now())
         guard !batch.isEmpty else { return }
         // 建玉が変わるので、ドテンの予告は解除する（変わった数量を確認なしに書かない）
         disarmFlip()
@@ -244,7 +280,8 @@ public final class PanelStore: ObservableObject {
 
     public func saveMemo() {
         guard canSaveMemo, let target = memoTarget else { return }
-        let e = PaperEvent.memo(MemoEvent(ts: JST.nowMillis(), positionID: target,
+        // リプレイ中は一時停止していても、再生位置の時刻で書ける
+        let e = PaperEvent.memo(MemoEvent(ts: now(), positionID: target,
                                           orderID: book.positions[target]?.lastOrderID, text: memoText))
         events.append(e)
         recompute()
@@ -256,7 +293,7 @@ public final class PanelStore: ObservableObject {
 
     /// 小窓にマウスが乗った: 撮影対象のウィンドウを探し直しておき（発注時は撮るだけにする）、銘柄コードを読む
     public func hoverEntered() {
-        if autoCaptureAllowed() { shotTaker.refreshTarget() }
+        if replay == nil, autoCaptureAllowed() { shotTaker.refreshTarget() }
         refreshSymbolFromScreen()
     }
 
@@ -276,9 +313,10 @@ public final class PanelStore: ObservableObject {
     /// 前回読んだコードから変わった時だけ欄を上書きする（手で直した値は、HYPER SBI 2 側で銘柄を切り替えるまで残る）
     public func refreshSymbolFromScreen(force: Bool = false) {
         // 権限が無いうちはマウスが乗るたびに OS のダイアログを出さない
-        guard force || (autoCaptureAllowed() && Date().timeIntervalSince(lastSymbolRead) >= autoReadInterval) else { return }
+        // リプレイ中は録画のメタから読むので、画面収録の権限は要らない
+        guard force || ((replay != nil || autoCaptureAllowed()) && Date().timeIntervalSince(lastSymbolRead) >= autoReadInterval) else { return }
         lastSymbolRead = Date()
-        let taker = shotTaker
+        let taker = taker
         Task { [weak self] in
             guard let code = await taker.readSymbol(), let self else { return }
             if force || code != self.lastAutoSymbol {
@@ -294,6 +332,77 @@ public final class PanelStore: ObservableObject {
     public func flush() async {
         await writeChain?.value
         await shotTaker.waitForBackground()
+        await replayTaker?.waitForBackground()
+    }
+
+    // MARK: リプレイ練習
+
+    /// 保存済みの録画で練習を始める（設定の一覧・メニューから）
+    public func startReplay(_ entry: RecordingEntry) {
+        Task {
+            // 一覧の確認がまだでも、開く前に mp4 が再生できるかを確かめる
+            guard entry.canReplay, await RecordingEntry.hasPlayableVideo(entry.mp4), let session = ReplaySession(entry: entry) else {
+                status = "この録画は再生できません（\(entry.id)）"
+                return
+            }
+            await enterReplay(session)
+        }
+    }
+
+    /// 記録先を data/paper/replay/events.jsonl に切り替え、新しい練習（建玉は空）を始める。通常のペーパーの建玉とは混ぜない
+    public func enterReplay(_ session: ReplaySession) async {
+        await writeChain?.value
+        guard let folder = dataFolder else {
+            status = "データフォルダが未設定です（設定で選んでください）"
+            return
+        }
+        replay?.close()
+        let tag = ReplayTag(recordingID: session.meta.id, sessionID: session.sessionID, startedAt: session.startedAt)
+        log = EventLog(folder: RecordingPaths.replayFolder(folder), replay: tag)
+        let t = makeReplayTaker(session)
+        t.onAutoRead = { [weak self] path, auto in
+            Task { @MainActor in self?.applyAutoRead(path: path, auto: auto) }
+        }
+        replayTaker = t
+        replay = session
+        // 発注できるかどうか（再生中・ウィンドウあり）が変わったら小窓を描き直す
+        replayObservation = session.$isPlaying.combineLatest(session.$windowOpen)
+            .removeDuplicates { $0 == $1 }
+            .sink { [weak self] _ in self?.objectWillChange.send() }
+        events = []
+        badLines = 0
+        autoByPath = [:]
+        disarmFlip()
+        recompute()
+        memoTarget = nil
+        lastAutoSymbol = nil
+        status = "リプレイ練習 \(session.meta.id)（再生すると発注できます）"
+        presentReplayWindow?(session)
+    }
+
+    /// 再生ウィンドウを出し直す（閉じた後に小窓から）
+    public func showReplayWindow() {
+        if let replay { presentReplayWindow?(replay) }
+    }
+
+    /// 練習を終えて通常のペーパーに戻る（events.jsonl を読み直す）
+    public func exitReplay() async {
+        guard let session = replay else { return }
+        await writeChain?.value
+        await replayTaker?.waitForBackground()
+        session.close()
+        dismissReplayWindow?()
+        replay = nil
+        replayTaker = nil
+        replayObservation = nil
+        lastAutoSymbol = nil
+        if let folder = dataFolder {
+            open(folder: folder)
+        } else {
+            log = nil
+            events = []
+            recompute()
+        }
     }
 
     // MARK: 内部
@@ -356,5 +465,11 @@ public final class PanelStore: ObservableObject {
             }
         }
         book = PositionBook.replay(events, autoPrices: auto)
+        if let replay {
+            // 最後に記録した発注・約定・取消より前には戻さない（メモは一時停止中も書けるので床にしない）
+            let floor = events.lazy.filter { if case .memo = $0 { return false } else { return true } }
+                .map { ReplayClock.videoMs(ts: $0.ts, startedAt: replay.startedAt) }.max() ?? 0
+            replay.setFloor(floor)
+        }
     }
 }

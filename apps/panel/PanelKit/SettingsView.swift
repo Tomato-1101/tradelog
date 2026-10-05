@@ -21,6 +21,12 @@ public struct SettingsView: View {
                         .truncationMode(.middle)
                     Spacer()
                     Button("選ぶ…") { store.chooseDataFolder() }
+                        .disabled(store.replay != nil)
+                }
+                if store.replay != nil {
+                    Text("リプレイ練習中は変えられません（「練習を終える」の後に選び直してください）")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
                 }
             }
             Section("画面収録の権限") {
@@ -86,12 +92,112 @@ public struct SettingsView: View {
                         .padding(.top, 14)  // 枠のラベルが上にはみ出して説明文に重ならないように
                 }
             }
+            RecordingSection(recording: store.recording, store: store)
             if let message = model.message {
                 Text(message).font(.caption).foregroundStyle(.red)
             }
         }
         .formStyle(.grouped)
         .frame(minWidth: 560, minHeight: 640)
+    }
+}
+
+/// 録画（リプレイ練習）: 今すぐ録画・保存済みの録画の一覧と合計サイズ・練習を始める・ゴミ箱へ移す（自動では消さない）
+struct RecordingSection: View {
+    @ObservedObject var recording: RecordingController
+    @ObservedObject var store: PanelStore
+    @State private var minutes = 37
+
+    var body: some View {
+        Section("録画（リプレイ練習）") {
+            HStack {
+                Text(recording.statusLine ?? "録画していません")
+                    .font(.callout.monospacedDigit())
+                    .foregroundStyle(recording.isRecording ? Color.red : Color.primary)
+                Spacer()
+                if recording.isRecording {
+                    Button("録画を止める") { recording.stop() }
+                } else {
+                    Stepper("\(minutes) 分", value: $minutes, in: 1...240, step: 1)
+                        .fixedSize()
+                    Button("今すぐ録画（\(minutes) 分）") { recording.start(minutes: minutes) }
+                        .disabled(store.dataFolder == nil)
+                }
+            }
+            Text("scripts/launchd/install.sh で登録すると平日 8:53 から 37 分自動で録画。Mac・HYPER SBI 2（ログイン済み）・この小窓を起動したままにしておく。全板とチャートは同じ画面に置く（録るのは HYPER SBI 2 が一番大きく出ている画面 1 枚）")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+            HStack {
+                Text("保存済み \(recording.entries.count) 本・合計 \(Self.size(recording.totalBytes))・空き \(recording.freeBytes.map(Self.size) ?? "不明")")
+                Spacer()
+                Button("一覧を更新") { recording.reloadList() }
+            }
+            Text("空きが \(Self.size(RecordingController.minFreeBytes)) 未満の時は録画しません。ゴミ箱に移しただけでは空き容量は戻りません（ゴミ箱を空にする）")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+            ForEach(recording.entries) { e in
+                RecordingRow(entry: e, active: e.id == recording.activeID,
+                             replay: { store.startReplay(e) }, trash: { recording.trash(e) })
+            }
+            if let message = recording.message {
+                Text(message).font(.caption).foregroundStyle(.secondary)
+            }
+        }
+        .onAppear { recording.reloadList() }
+    }
+
+    static func size(_ bytes: Int64) -> String {
+        ByteCountFormatter.string(fromByteCount: bytes, countStyle: .file)
+    }
+}
+
+struct RecordingRow: View {
+    let entry: RecordingEntry
+    let active: Bool
+    let replay: () -> Void
+    let trash: () -> Void
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 2) {
+            HStack {
+                Text(title).font(.system(.callout, design: .monospaced))
+                Spacer()
+                Button("練習する", action: replay)
+                    .disabled(active || !entry.canReplay)
+                Button("ゴミ箱へ移動", action: trash)
+                    .disabled(active)
+            }
+            Text(detail)
+                .font(.caption)
+                .foregroundStyle(problems.isEmpty ? Color.secondary : Color.orange)
+                .lineLimit(2)
+        }
+    }
+
+    private var title: String {
+        guard let s = entry.meta?.startedAt else { return "\(entry.day) \(entry.id)" }
+        return "\(JST.day(s)) \(JST.clock(s))"
+    }
+
+    private var problems: [RecIssue] {
+        (entry.meta?.issues ?? []).filter { !["unlocked", "black_end", "frames_back"].contains($0.kind) }
+    }
+
+    private var detail: String {
+        var parts: [String] = []
+        if active { parts.append("録画中") }
+        if let d = entry.meta?.durationSeconds { parts.append("\(d / 60)分\(String(format: "%02d", d % 60))秒") }
+        parts.append(RecordingSection.size(entry.bytes))
+        switch entry.meta?.status {
+        case .failed?: parts.append("録れていない")
+        case .stopped?: parts.append("途中で停止")
+        case .recording? where !active: parts.append("途中で終わった（落ちた・スリープ）")
+        case nil: parts.append("メタなし")
+        default: break
+        }
+        if !entry.hasVideo { parts.append("動画なし") }
+        if let last = problems.last { parts.append("問題 \(problems.count) 件: \(last.message)") }
+        return parts.joined(separator: "・")
     }
 }
 

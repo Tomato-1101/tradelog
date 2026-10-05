@@ -5,6 +5,8 @@ import os
 /// 発注時の撮影と読み取り。失敗しても発注の記録は残すので、ここは nil を返すだけで例外を外に出さない。
 public protocol ShotTaking: AnyObject {
     func takeShot(eventID: UUID, ts: Date, log: EventLog) async -> Shot?
+    /// 発注銘柄も渡す版（リプレイでは、どの全板を切り出すかに使う）。既定は銘柄を使わずに上を呼ぶ
+    func takeShot(eventID: UUID, ts: Date, log: EventLog, symbol: String) async -> Shot?
     /// 銘柄コード欄の自動入力用（ウィンドウタイトルの「(5803)」→ 無ければ銘柄コード領域を撮って読む。画像は保存しない）
     func readSymbol() async -> String?
     /// 撮影対象のウィンドウを探し直して覚えておく（発注時は撮るだけにするため）
@@ -13,6 +15,12 @@ public protocol ShotTaking: AnyObject {
     func waitForBackground() async
     /// 全画面 OCR が終わってサイドカーを書いた時に呼ぶ（引数は shot.ocr_path と自動読み取りの結果）
     var onAutoRead: ((String, AutoRead) -> Void)? { get set }
+}
+
+public extension ShotTaking {
+    func takeShot(eventID: UUID, ts: Date, log: EventLog, symbol: String) async -> Shot? {
+        await takeShot(eventID: eventID, ts: ts, log: log)
+    }
 }
 
 public final class ScreenShotTaker: ShotTaking, @unchecked Sendable {
