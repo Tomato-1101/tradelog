@@ -70,6 +70,8 @@ h2 { font-size: 13px; font-weight: 600; color: var(--muted); margin: 28px 0 10px
 .top a[aria-current='page'] { color: var(--fg); background: var(--surface-2); }
 .top .brand { font-weight: 700; margin-right: 12px; color: var(--fg); letter-spacing: -0.01em; display: inline-flex; align-items: center; gap: 7px; }
 .top .brand::before { content: ''; width: 10px; height: 10px; border-radius: 3px; background: linear-gradient(135deg, var(--up), var(--gold)); }
+.daily-alert { padding: 6px 16px; border-bottom: 1px solid var(--border); background: var(--warn-soft); color: var(--warn); font-size: 12px; line-height: 1.6; }
+.daily-alert code { font-family: var(--mono); font-size: 11px; color: var(--fg); overflow-wrap: anywhere; }
 main { padding: 20px 16px 48px; max-width: 1280px; margin: 0 auto; }
 
 /* --- 切り替え（タブ・期間） --- */
@@ -244,6 +246,7 @@ dialog img { max-width: 92vw; max-height: 86vh; display: block; }
   main { padding: 14px 12px 40px; }
   .top { padding: 0 8px; gap: 0; }
   .top .brand { margin-right: 4px; }
+  .daily-alert { padding: 6px 12px; }
   .hero { align-items: flex-start; }
   .hero .result { text-align: left; }
   .hero .result .big { font-size: 28px; }

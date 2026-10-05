@@ -4,7 +4,8 @@
 
 import fs from 'node:fs';
 import path from 'node:path';
-import { prisma } from '@/lib/db';
+import { DB_FILE, prisma } from '@/lib/db';
+import { dailyResult, dailyStatusPath, writeDailyStatus } from '@/lib/daily-status';
 import { fetchAndStoreBars, planBarFetches } from '@/lib/bars/store';
 import { ingestPaperEvents, resolvePaperExecutions } from '@/lib/paper/ingest';
 import { rebuildRounds } from '@/lib/rounds/rebuild';
@@ -17,17 +18,27 @@ function arg(name: string): string | undefined {
   return i >= 0 ? process.argv[i + 1] : undefined;
 }
 
+// 状態ファイル（web の上部の警告）に書く件数。main の途中で例外が出ても、そこまでの件数を残す
+const counts = { barFailures: 0, sidecarErrors: 0, ordersIngested: 0 };
+const startedAt = new Date();
+
 async function main() {
-  const now = new Date();
+  const now = startedAt;
   const eventsPath = path.resolve(arg('--events') ?? path.join(ROOT, 'data/paper/events.jsonl'));
   const outDir = path.resolve(arg('--out') ?? path.join(ROOT, 'data/ai'));
   const noFetch = process.argv.includes('--no-fetch');
 
   // 1. events
   const text = fs.existsSync(eventsPath) ? fs.readFileSync(eventsPath, 'utf-8') : '';
-  const ing = await ingestPaperEvents(prisma, text, now);
+  // サイドカー（ocr.json）のパスは events.jsonl と同じ data/paper/ からの相対
+  const ing = await ingestPaperEvents(prisma, text, now, { paperDir: path.dirname(eventsPath) });
   console.log(`[events] ${eventsPath}: ${ing.lines} 行 / 採用 ${ing.accepted} / 新規 ${ing.newEvents} / 契約違反 ${ing.errors.length}`);
   for (const e of ing.errors) console.log(`  [契約違反] ${e.line} 行目${e.id ? `（${e.id}）` : ''}: ${e.message}`);
+  counts.ordersIngested = ing.orders;
+  const sc = ing.sidecars;
+  counts.sidecarErrors = sc.errors.length;
+  console.log(`[ocr] サイドカー 読込 ${sc.loaded} / まだ無い ${sc.missing} / 読めず ${sc.errors.length}`);
+  for (const e of sc.errors) console.log(`  [サイドカー] ${e.path}: ${e.message}（次回の daily で読み直す）`);
 
   // 2. 足（1 回目の約定確定・再構築の前に、建玉の日付が分かっている分を取る。未決済の延長は 2 周目で拾う）
   if (!noFetch) {
@@ -40,6 +51,7 @@ async function main() {
       }
       const rep = await fetchAndStoreBars(prisma, plan.needs, { now });
       console.log(`[bars] ${pass} 周目: ${todo} 日分 / リクエスト ${rep.requests} / 保存 ${rep.stored} 本 / 失敗 ${rep.failures.length} / 遡れず ${plan.unavailable} 日`);
+      counts.barFailures += rep.failures.length;
       for (const f of rep.failures) console.log(`  [取得失敗] ${f.symbol} ${f.timeframe} ${f.dates.join(',')}: ${f.error}`);
       // 2 周目は再構築で未決済と分かった建玉の今日までを取る
       if (pass === 1) {
@@ -67,9 +79,22 @@ async function main() {
   console.log(`[ai] ${ex.tradesPath}（${ex.trades} 件、1 分足あり ${ex.withBars}）/ ${ex.summaryPath}`);
 }
 
+function writeStatus(error: string | null) {
+  const file = dailyStatusPath(DB_FILE);
+  try {
+    const result = dailyResult(counts, error);
+    writeDailyStatus(file, { v: 1, startedAt: startedAt.toISOString(), finishedAt: new Date().toISOString(), result, error, ...counts });
+    console.log(`[status] ${result} → ${file}`);
+  } catch (e) {
+    console.error(`[status] ${file} に書けない: ${(e as Error).message}`);
+  }
+}
+
 main()
+  .then(() => writeStatus(null))
   .catch((e) => {
     console.error(e);
     process.exitCode = 1;
+    writeStatus(String((e as Error)?.message ?? e).split('\n')[0].slice(0, 300));
   })
   .finally(() => prisma.$disconnect());

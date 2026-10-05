@@ -1,6 +1,7 @@
 # Node / Next.js
 node_modules/
 .next/
+.next.prev/
 out/
 dist/
 .turbo/
@@ -69,6 +70,7 @@ apps/api-py/.python-version
 data/paper/
 data/ai/
 data/legacy/
+data/daily-status.json*
 
 # 第三者著作物の参照画像（社内参照用・リポジトリ非公開）
 docs/design-references/markers/

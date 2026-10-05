@@ -113,10 +113,10 @@ describe('規則 3: 指値', () => {
     const r = resolveOrder(lmt({ side: 'sell', limitPrice: '990' }), [bar('10:00', 995, 1005)], null);
     expect(r).toMatchObject({ price: '1000', priceStatus: 'CONFIRMED', priceBasis: 'SCREEN' });
   });
-  it('即約定の指値で現在値が足の外なら終値を仮置きし、指値で頭打ち', () => {
-    const r = resolveOrder(lmt({ limitPrice: '1002' }), [bar('10:00', 1001, 1009, 1008)], null);
-    expect(r).toMatchObject({ price: '1002', priceStatus: 'NEEDS_REVIEW', priceBasis: 'BAR' });
-    expect((r as { priceNote: string }).priceNote).toMatch(/頭打ち/);
+  it('画面の現在値が足の外（検証できない）なら即約定にせず、通常の指値として以降の足で判定', () => {
+    expect(resolveOrder(lmt({ limitPrice: '1002' }), [bar('10:00', 1001, 1009, 1008)], null)).toEqual({ kind: 'NO_FILL', reason: 'PENDING' });
+    const r = resolveOrder(lmt({ limitPrice: '1002', state: 'FILL_MARKED', fillMarkedAt: jst('10:00:50.000') }), [bar('10:00', 1001, 1009, 1008)], null);
+    expect(r).toMatchObject({ price: '1002', priceStatus: 'CONFIRMED', priceBasis: 'LIMIT' });
   });
   it('即約定は fill_mark より優先（発注時刻で約定）', () => {
     const r = resolveOrder(lmt({ limitPrice: '1001', state: 'FILL_MARKED', fillMarkedAt: jst('10:30:00.000') }), [bar('10:00', 995, 1005)], null);

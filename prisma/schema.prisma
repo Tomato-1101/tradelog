@@ -70,7 +70,8 @@ enum PriceStatus {
 enum PriceBasis {
   OPEN_AUCTION
   CLOSE_AUCTION
-  SCREEN
+  SCREEN // 発注時の画面（手で囲んだ領域の読み取り）
+  SCREEN_AUTO // 発注時の画面（小窓の自動読み取り。サイドカー ocr.json の auto.price）
   BAR
   LIMIT
   MANUAL
@@ -204,11 +205,23 @@ model Shot {
   id           String     @id @default(cuid())
   paperOrderId String     @unique
   paperOrder   PaperOrder @relation(fields: [paperOrderId], references: [id])
-  path         String // data/paper/ からの相対パス
+  path         String // data/paper/ からの相対パス。ドテンの 2 注文は同じ path を共有する
+  // 以下 4 つは手で囲んだ領域の読み取り結果
   priceText    String?
   price        String?
   symbolText   String?
   confidence   Float?
+  capturedAt     DateTime? // 撮影完了時刻（UTC）
+  captureDelayMs Int? // 撮影の遅れ = capturedAt − 発注時刻（ms）
+  windowTitle    String?
+  ocrPath        String? // サイドカー（data/paper/ からの相対パス）。order の後に非同期で書かれる
+  // サイドカーの auto（画面全体の自動読み取り）。サイドカーを読めたときだけ埋まる
+  ocrReadAt      DateTime?
+  autoPrice      String?
+  autoPriceText  String?
+  autoPriceTime  String? // 画面に出ていた現在値の時刻（HH:MM）
+  autoSymbol     String?
+  autoSource     String? // region / label / null
 }
 
 model Bar {

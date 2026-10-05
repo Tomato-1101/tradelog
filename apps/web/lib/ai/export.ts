@@ -96,6 +96,11 @@ export async function exportForAi(db: PrismaClient, outDir: string, now: Date): 
         limit_price: e.paperOrder?.limitPrice ?? null,
         placed_at: iso(e.paperOrder?.placedAt ?? null),
         screen_price: e.paperOrder?.shot?.price ?? null,
+        // 画面全体の自動読取（サイドカー auto）。price_basis が SCREEN_AUTO ならこちらで確定している
+        screen_auto_price: e.paperOrder?.shot?.autoPrice ?? null,
+        screen_auto_source: e.paperOrder?.shot?.autoSource ?? null,
+        // 撮影の遅れ（撮影完了 − 発注、ms）。大きいと画面の値が発注の瞬間からずれている
+        capture_delay_ms: e.paperOrder?.shot?.captureDelayMs ?? null,
         shot: e.paperOrder?.shot ? `data/paper/${e.paperOrder.shot.path}` : null,
       })),
       memos: r.memos.map((m) => ({ at: iso(m.ts), order_id: m.orderId, text: m.text })),

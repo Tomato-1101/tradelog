@@ -12,9 +12,14 @@
 //    その分の分足があれば [low, high] 内で確定、範囲外はその分の close を仮置きして要確認（BAR）。
 //    分足が無ければ日足 [low, high] で照合し、範囲内で確定、範囲外は（仮置きできる分足も無いので）未確定。
 //    shot.price が読めないときは分足 close を仮置きして要確認、分足も無ければ未確定。
+//    shot.price（手で囲んだ領域）が読めない・その分の足の外のときは、サイドカーの auto.price（画面全体の自動読取）を
+//    次の候補にし、その分の分足の [low, high] 内なら確定（SCREEN_AUTO）。範囲外・分足が無いときは上の規則のまま。
+//    auto.symbol が読めていて発注銘柄と違うときは、別の銘柄の画面なので shot.price も auto.price も候補にしない。
+//    ここで確定に使う値（verifiedCurrentPrice）を「検証済みの現在値」と呼ぶ。
 // 3. 指値 → 板寄せの時間帯に出した指値は、板寄せの価格が指値以内（買い: ≤ / 売り: ≥）ならその価格で確定。
-//    連続売買中に shot.price で即約定する指値は、成行と同じ規則 2 で価格を決め、指値で頭打ちにする
-//    （実際の約定は指値ではなく現在値付近。指値で約定させると買いが不利側に寄る）。
+//    連続売買中は、規則 2 の検証済みの現在値が指値以内なら、発注時刻・その現在値で即約定（指値ではない。
+//    実際の約定は現在値付近で、指値で約定させると買いが不利側に寄る）。判定と価格に同じ値を使うので、
+//    誤読（足の外の値）で即約定と判定したまま別の値で約定させることはない。検証済みの現在値が無ければ下の通常の判定。
 //    それ以外は fill_mark の時刻・指値で約定とし、発注の分〜fill_mark の分の分足が指値を「越えて」いれば確定
 //    （買い: low < 指値 / 売り: high > 指値。同値は越えていない）。越えていない場合、連続売買の分に欠けが無ければ
 //    要確認（指値を仮置き）、欠けがあれば判定できないので未確定。
@@ -23,12 +28,12 @@
 
 import Decimal from 'decimal.js';
 import { floorToMinute, isContinuousSessionMinute, isPreOpen, jstAt, jstMinuteOfDay, jstYmd, SESSION } from '@/lib/time';
-import { isMarketableLimit, type DerivedState } from './events';
+import type { DerivedState } from './events';
 
 export type BarLite = { ts: Date; open: number; high: number; low: number; close: number };
 
 export type PriceStatus = 'CONFIRMED' | 'NEEDS_REVIEW' | 'UNRESOLVED';
-export type PriceBasis = 'OPEN_AUCTION' | 'CLOSE_AUCTION' | 'SCREEN' | 'BAR' | 'LIMIT' | 'MANUAL';
+export type PriceBasis = 'OPEN_AUCTION' | 'CLOSE_AUCTION' | 'SCREEN' | 'SCREEN_AUTO' | 'BAR' | 'LIMIT' | 'MANUAL';
 
 export type ResolveOrder = {
   orderType: 'market' | 'limit';
@@ -38,6 +43,13 @@ export type ResolveOrder = {
   state: DerivedState;
   fillMarkedAt: Date | null;
   shotPrice: string | null;
+  /** サイドカーの auto.price（画面全体の自動読取）。サイドカーがまだ無ければ null */
+  autoPrice?: string | null;
+  /** auto.source（region / label）。注記に使う */
+  autoSource?: string | null;
+  /** 発注銘柄と auto.symbol。両方あって違えば auto.price を使わない */
+  symbol?: string;
+  autoSymbol?: string | null;
 };
 
 export type Fill = {
@@ -95,11 +107,12 @@ export function resolveOrder(o: ResolveOrder, minuteBars: BarLite[], dailyBar: B
   if (auction && auction !== 'AFTER_CLOSE' && auction.price !== null && within(auction.price)) {
     return fill(auction.at, auction.price, 'CONFIRMED', auction.basis, `${auction.what}で約定する指値`);
   }
-  if (auction === null && isMarketableLimit(o.side, o.limitPrice, o.shotPrice)) {
-    const r = resolveContinuousMarket(o, byMinute, dailyBar);
-    const note = `発注時の現在値 ${o.shotPrice} で即約定する指値`;
-    if (r.price === null || within(r.price)) return { ...r, priceNote: r.priceNote ? `${note}。${r.priceNote}` : note };
-    return { ...r, price: o.limitPrice, priceNote: `${note}。${r.priceNote}。指値で頭打ち` };
+  if (auction === null) {
+    const v = verifiedCurrentPrice(o, minuteBarOf(o, byMinute), dailyBar);
+    if (v && within(v.price)) {
+      const note = `発注時の現在値 ${v.price} で即約定する指値`;
+      return fill(o.placedAt, v.price, 'CONFIRMED', v.basis, v.note ? `${note}。${v.note}` : note);
+    }
   }
   if (o.state !== 'FILL_MARKED' || !o.fillMarkedAt) {
     return { kind: 'NO_FILL', reason: o.state === 'EXPIRED' ? 'EXPIRED' : 'PENDING' };
@@ -150,35 +163,75 @@ export function auctionFor(placedAt: Date, byMinute: Map<number, BarLite>, daily
   return null;
 }
 
-/** 規則 2: 連続売買中の成行（即約定の指値もこれで価格を決める） */
+const minuteBarOf = (o: ResolveOrder, byMinute: Map<number, BarLite>) => byMinute.get(floorToMinute(o.placedAt).getTime()) ?? null;
+
+/** auto.symbol が読めていて発注銘柄と違うか（別の銘柄の画面を撮った） */
+function autoSymbolMismatch(o: ResolveOrder): boolean {
+  const s = o.autoSymbol?.trim();
+  return !!s && o.symbol !== undefined && s !== o.symbol;
+}
+/** 候補にできる現在値（同じ画面から読むので、銘柄が違えば領域・自動読取とも null） */
+const usableShot = (o: ResolveOrder) => (autoSymbolMismatch(o) ? null : o.shotPrice);
+const usableAuto = (o: ResolveOrder) => (autoSymbolMismatch(o) ? null : (o.autoPrice ?? null));
+const autoWhat = (o: ResolveOrder) => `画面の自動読取${o.autoSource ? `（${o.autoSource}）` : ''}の現在値 ${o.autoPrice}`;
+
+/**
+ * 検証済みの現在値（規則 2）。領域の値がその分の分足内 → SCREEN、だめなら auto.price が分足内 → SCREEN_AUTO。
+ * その分の分足が無ければ領域の値を日足で照合する（自動読取は日足の幅では誤読を見分けられないので照合しない）。
+ * 成行の約定価格と、指値の即約定の判定・価格の両方にこの同じ値を使う。どれも外れなら null。
+ */
+function verifiedCurrentPrice(
+  o: ResolveOrder,
+  bar: BarLite | null,
+  dailyBar: BarLite | null,
+): { price: string; basis: 'SCREEN' | 'SCREEN_AUTO'; note: string | null } | null {
+  const shot = usableShot(o);
+  if (bar) {
+    if (shot !== null && inRange(shot, bar)) return { price: shot, basis: 'SCREEN', note: null };
+    const auto = usableAuto(o);
+    if (auto !== null && inRange(auto, bar)) {
+      const range = `その分の足 [${barPrice(bar.low)}, ${barPrice(bar.high)}]`;
+      const why = shot === null ? '手で囲んだ領域の現在値が読めない' : `手で囲んだ領域の現在値 ${shot} が${range} の外`;
+      return { price: auto, basis: 'SCREEN_AUTO', note: `${why}。${autoWhat(o)} で確定` };
+    }
+    return null;
+  }
+  if (shot !== null && dailyBar && inRange(shot, dailyBar)) {
+    return { price: shot, basis: 'SCREEN', note: 'その分の分足が無く、日足の範囲で照合' };
+  }
+  return null;
+}
+
+/** 規則 2: 連続売買中の成行 */
 function resolveContinuousMarket(o: ResolveOrder, byMinute: Map<number, BarLite>, dailyBar: BarLite | null): Fill {
-  const bar = byMinute.get(floorToMinute(o.placedAt).getTime()) ?? null;
-  if (o.shotPrice !== null) {
-    if (bar) {
-      if (inRange(o.shotPrice, bar)) return fill(o.placedAt, o.shotPrice, 'CONFIRMED', 'SCREEN', null);
-      return fill(
-        o.placedAt,
-        barPrice(bar.close),
-        'NEEDS_REVIEW',
-        'BAR',
-        `画面の現在値 ${o.shotPrice} がその分の足 [${barPrice(bar.low)}, ${barPrice(bar.high)}] の外。足の終値を仮置き`,
-      );
+  const bar = minuteBarOf(o, byMinute);
+  const v = verifiedCurrentPrice(o, bar, dailyBar);
+  if (v) return fill(o.placedAt, v.price, 'CONFIRMED', v.basis, v.note);
+  const shot = usableShot(o);
+  const auto = usableAuto(o);
+  const ignored = [o.shotPrice !== null ? `画面の現在値 ${o.shotPrice}` : null, o.autoPrice ? autoWhat(o) : null].filter((x) => x !== null);
+  const skipped =
+    autoSymbolMismatch(o) && ignored.length ? `（画面の銘柄 ${o.autoSymbol?.trim()} が発注 ${o.symbol} と違うので${ignored.join('・')} は使わない）` : '';
+  if (bar) {
+    const range = `その分の足 [${barPrice(bar.low)}, ${barPrice(bar.high)}]`;
+    const reads = [shot !== null ? `画面の現在値 ${shot}` : null, auto !== null ? autoWhat(o) : null].filter((x) => x !== null);
+    if (reads.length) {
+      return fill(o.placedAt, barPrice(bar.close), 'NEEDS_REVIEW', 'BAR', `${reads.join('・')} が${range} の外。足の終値を仮置き${skipped}`);
     }
-    if (dailyBar && inRange(o.shotPrice, dailyBar)) {
-      return fill(o.placedAt, o.shotPrice, 'CONFIRMED', 'SCREEN', 'その分の分足が無く、日足の範囲で照合');
-    }
+    return fill(o.placedAt, barPrice(bar.close), 'NEEDS_REVIEW', 'BAR', `画面の現在値が読めない。足の終値を仮置き${skipped}`);
+  }
+  if (shot !== null) {
     return fill(
       o.placedAt,
       null,
       'UNRESOLVED',
       null,
       dailyBar
-        ? `画面の現在値 ${o.shotPrice} が日足 [${barPrice(dailyBar.low)}, ${barPrice(dailyBar.high)}] の外で、その分の分足も無い`
+        ? `画面の現在値 ${shot} が日足 [${barPrice(dailyBar.low)}, ${barPrice(dailyBar.high)}] の外で、その分の分足も無い`
         : 'その分の分足も日足も無い',
     );
   }
-  if (bar) return fill(o.placedAt, barPrice(bar.close), 'NEEDS_REVIEW', 'BAR', '画面の現在値が読めない。足の終値を仮置き');
-  return fill(o.placedAt, null, 'UNRESOLVED', null, '画面の現在値が読めず、その分の分足も無い');
+  return fill(o.placedAt, null, 'UNRESOLVED', null, `画面の現在値が読めず${auto !== null ? `（${autoWhat(o)}）` : ''}、その分の分足も無い${skipped}`);
 }
 
 /** 手入力での確定（規則 4）。DB 側はこれで上書きし、以降の自動確定で上書きしない */

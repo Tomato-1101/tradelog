@@ -239,9 +239,19 @@ export type RoundDetail = {
     shareNote: string | null;
     posAfter: string | null;
     avgAfter: string | null;
+    /** 撮影の遅れ（撮影完了 − 発注、ms）。ペーパーで小窓が記録したときだけ */
+    captureDelayMs: number | null;
   }>;
   memos: Array<{ id: string; ts: Date; text: string; orderId: string | null }>;
-  shots: Array<{ orderId: string; placedAt: Date; path: string; priceText: string | null; price: string | null; confidence: number | null }>;
+  shots: Array<{
+    orderId: string;
+    placedAt: Date;
+    path: string;
+    priceText: string | null;
+    price: string | null;
+    confidence: number | null;
+    autoPrice: string | null;
+  }>;
   chart: {
     kind: '1m' | '1d';
     bars: ChartBar[];
@@ -396,11 +406,22 @@ export async function loadRoundDetail(db: PrismaClient, id: string, now: Date): 
       source: e.source,
       posAfter: tl.get(e.id)?.pos ?? null,
       avgAfter: tl.get(e.id)?.avg ?? null,
+      captureDelayMs: e.paperOrder?.shot?.captureDelayMs ?? null,
     })),
     memos: r.memos.map((m) => ({ id: m.id, ts: m.ts, text: m.text, orderId: m.orderId })),
     shots: r.executions.flatMap((e) =>
       e.paperOrder?.shot
-        ? [{ orderId: e.paperOrder.id, placedAt: e.paperOrder.placedAt, path: e.paperOrder.shot.path, priceText: e.paperOrder.shot.priceText, price: e.paperOrder.shot.price, confidence: e.paperOrder.shot.confidence }]
+        ? [
+            {
+              orderId: e.paperOrder.id,
+              placedAt: e.paperOrder.placedAt,
+              path: e.paperOrder.shot.path,
+              priceText: e.paperOrder.shot.priceText,
+              price: e.paperOrder.shot.price,
+              confidence: e.paperOrder.shot.confidence,
+              autoPrice: e.paperOrder.shot.autoPrice,
+            },
+          ]
         : [],
     ),
     chart: {

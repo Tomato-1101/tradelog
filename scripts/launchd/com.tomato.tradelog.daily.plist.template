@@ -1,0 +1,41 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- 引け後の daily（取り込み → 足の取得 → 約定確定 → ラウンド → data/ai/ 書き出し）を平日 15:45 に実行する。
+     AI の呼び出しはしない（書き出しまで）。スリープ中に時刻を過ぎた分は、復帰時に launchd が 1 回実行する。
+     祝日は足が無いだけで害は無いので、そのまま動かす。
+     __REPO__ / __NODE_DIR__ / __LOG_DIR__ は install.sh が埋める。 -->
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.tomato.tradelog.daily</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/bin/bash</string>
+    <string>__REPO__/scripts/launchd/daily-run.sh</string>
+  </array>
+  <key>WorkingDirectory</key>
+  <string>__REPO__/apps/web</string>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key>
+    <string>__NODE_DIR__:/usr/bin:/bin:/usr/sbin:/sbin</string>
+    <!-- 起動スクリプトが 5MB 超で .1 に回す（StandardOutPath と同じファイル） -->
+    <key>TRADELOG_LOG</key>
+    <string>__LOG_DIR__/daily.log</string>
+  </dict>
+  <key>StartCalendarInterval</key>
+  <array>
+    <dict><key>Weekday</key><integer>1</integer><key>Hour</key><integer>15</integer><key>Minute</key><integer>45</integer></dict>
+    <dict><key>Weekday</key><integer>2</integer><key>Hour</key><integer>15</integer><key>Minute</key><integer>45</integer></dict>
+    <dict><key>Weekday</key><integer>3</integer><key>Hour</key><integer>15</integer><key>Minute</key><integer>45</integer></dict>
+    <dict><key>Weekday</key><integer>4</integer><key>Hour</key><integer>15</integer><key>Minute</key><integer>45</integer></dict>
+    <dict><key>Weekday</key><integer>5</integer><key>Hour</key><integer>15</integer><key>Minute</key><integer>45</integer></dict>
+  </array>
+  <key>RunAtLoad</key>
+  <false/>
+  <key>StandardOutPath</key>
+  <string>__LOG_DIR__/daily.log</string>
+  <key>StandardErrorPath</key>
+  <string>__LOG_DIR__/daily.log</string>
+</dict>
+</plist>

@@ -8,10 +8,18 @@ import { buildPaperRounds, buildSbiRounds } from './builder';
 import { computeExcursion } from './excursion';
 import type { ExecForRound, RoundDraft } from './types';
 
+/** 撮影画面の自動読取の銘柄が発注銘柄と違うか。読めていない（null・空）ときは比べない */
+export function screenSymbolMismatch(screen: string | null, order: string): { screen: string; order: string } | null {
+  const s = screen?.trim();
+  return s && s !== order ? { screen: s, order } : null;
+}
+
 export type RebuildReport = { rounds: number; paper: number; sbi: number; deleted: number; warnings: string[] };
 
 export async function rebuildRounds(db: PrismaClient, now: Date): Promise<RebuildReport> {
-  const execs = await db.execution.findMany({ include: { paperOrder: { select: { positionId: true } } } });
+  const execs = await db.execution.findMany({
+    include: { instrument: { select: { symbol: true } }, paperOrder: { select: { positionId: true, shot: { select: { autoSymbol: true } } } } },
+  });
   const toRound = (e: (typeof execs)[number]): ExecForRound => ({
     id: e.id,
     source: e.source,
@@ -28,6 +36,7 @@ export async function rebuildRounds(db: PrismaClient, now: Date): Promise<Rebuil
     fee: e.fee,
     priceStatus: e.priceStatus,
     dedupeHash: e.dedupeHash,
+    screenSymbolMismatch: screenSymbolMismatch(e.paperOrder?.shot?.autoSymbol ?? null, e.instrument.symbol),
   });
   const paper = buildPaperRounds(execs.filter((e) => e.source === 'PAPER').map(toRound));
   const sbi = buildSbiRounds(execs.filter((e) => e.source === 'SBI').map(toRound));

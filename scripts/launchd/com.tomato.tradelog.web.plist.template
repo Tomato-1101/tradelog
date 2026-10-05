@@ -1,0 +1,36 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- 振り返り画面（next start, 127.0.0.1:3000。LAN には出さない）をログイン時に起動し、落ちたら再起動する。
+     __REPO__ / __NODE_DIR__ / __LOG_DIR__ は install.sh が埋める（リポジトリには個人のパスを書かない）。 -->
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.tomato.tradelog.web</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/bin/bash</string>
+    <string>__REPO__/scripts/launchd/web-start.sh</string>
+  </array>
+  <key>WorkingDirectory</key>
+  <string>__REPO__/apps/web</string>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key>
+    <string>__NODE_DIR__:/usr/bin:/bin:/usr/sbin:/sbin</string>
+    <!-- 起動スクリプトが 5MB 超で .1 に回す（StandardOutPath と同じファイル） -->
+    <key>TRADELOG_LOG</key>
+    <string>__LOG_DIR__/web.log</string>
+  </dict>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <true/>
+  <!-- 起動に失敗し続けても 30 秒より短い間隔では再起動しない -->
+  <key>ThrottleInterval</key>
+  <integer>30</integer>
+  <key>StandardOutPath</key>
+  <string>__LOG_DIR__/web.log</string>
+  <key>StandardErrorPath</key>
+  <string>__LOG_DIR__/web.log</string>
+</dict>
+</plist>

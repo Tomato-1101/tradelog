@@ -35,6 +35,9 @@ function safeDecode(s: string): string {
 
 const INTENT_LABEL = { OPEN: '新規', ADD: '買い増し', CLOSE: '決済' } as const;
 
+/** 撮影の遅れ（撮影完了 − 発注）。小窓が記録していなければ null */
+const captureDelay = (ms: number | null) => (ms == null ? null : `撮影の遅れ ${ms.toLocaleString('ja-JP')}ms`);
+
 export default async function TradePage({ params }: { params: Promise<{ id: string }> }) {
   const { id: raw } = await params;
   const id = safeDecode(raw);
@@ -55,7 +58,8 @@ export default async function TradePage({ params }: { params: Promise<{ id: stri
     if (!url) return [];
     const px = s.price != null ? `OCR読取価格 ${fmtPrice(s.price)}円` : `読み取れず${s.priceText ? `（${s.priceText}）` : ''}`;
     const conf = s.confidence != null ? `／読取信頼度${Math.round(s.confidence * 100)}%` : '';
-    return [{ url, caption: `${fmtJst(s.placedAt, 'ms', true).slice(6)}／${px}${conf}` }];
+    const auto = s.autoPrice != null ? `／自動読取 ${fmtPrice(s.autoPrice)}円` : '';
+    return [{ url, caption: `${fmtJst(s.placedAt, 'ms', true).slice(6)}／${px}${conf}${auto}` }];
   });
 
   return (
@@ -135,6 +139,7 @@ export default async function TradePage({ params }: { params: Promise<{ id: stri
                 {e.intent && `・${INTENT_LABEL[e.intent]}`}
                 {e.priceBasis && `・${PRICE_BASIS_LABEL[e.priceBasis as keyof typeof PRICE_BASIS_LABEL]}`}
                 {e.shareNote ? `・${e.shareNote}` : e.priceNote ? `・${e.priceNote}` : ''}
+                {e.captureDelayMs != null && `・${captureDelay(e.captureDelayMs)}`}
               </div>
               {e.source === 'PAPER' && (pending || e.priceBasis === 'MANUAL') && (
                 <ManualPriceForm executionId={e.id} initial={e.price} label={pending ? '確定' : '修正'} />
@@ -167,6 +172,7 @@ export default async function TradePage({ params }: { params: Promise<{ id: stri
                   <td style={{ whiteSpace: 'nowrap' }}>
                     {when(e.executedAt, true)}
                     {e.intent && <span className="sub">{INTENT_LABEL[e.intent]}{e.orderType === 'LIMIT' ? `・指値${e.limitPrice ? ` ${fmtPrice(e.limitPrice)}` : ''}` : ''}</span>}
+                    {e.captureDelayMs != null && <span className="sub">{captureDelay(e.captureDelayMs)}</span>}
                   </td>
                   <td><span className={`side ${e.side === 'BUY' ? 'buy' : 'sell'}`}>{SIDE_LABEL[e.side]}</span></td>
                   <td className="num">{fmtPrice(e.qty)}{e.shareNote && <span className="muted" title={e.shareNote}> *</span>}</td>

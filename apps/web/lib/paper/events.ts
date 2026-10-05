@@ -2,15 +2,20 @@
 // 契約違反の行はエラーとして報告し、その行だけ捨てて他の行は続ける。
 // ファイルは追記専用なので、毎回全行を読み直して検証し、DB への書き込みは id で冪等にする（ingest.ts）。
 
-import Decimal from 'decimal.js';
-import { closeOf, isContinuousSessionMinute, jstMinuteOfDay, jstYmd } from '@/lib/time';
+import { closeOf, jstYmd } from '@/lib/time';
 
 export type Shot = {
   path: string;
+  /** 以下 4 つは手で囲んだ領域の読み取り結果（無ければ null） */
   priceText: string | null;
   price: string | null;
   symbolText: string | null;
   confidence: number | null;
+  /** 任意フィールド（キーが無い行では undefined）。撮影完了時刻 */
+  capturedAt?: Date | null;
+  windowTitle?: string | null;
+  /** サイドカー（data/paper/ からの相対パス）。order 行の後に非同期で書かれるので、ファイルが無いこともある */
+  ocrPath?: string | null;
 };
 
 type Base = { id: string; ts: Date; raw: Record<string, unknown>; line: number };
@@ -51,6 +56,7 @@ const KEYS: Record<PaperEvent['type'], { required: string[]; optional: string[] 
   memo: { required: ['v', 'id', 'type', 'ts', 'position_id', 'text'], optional: ['order_id'] },
 };
 const SHOT_KEYS = ['path', 'price_text', 'price', 'symbol_text', 'confidence'];
+const SHOT_OPTIONAL_KEYS = ['captured_at', 'window_title', 'ocr_path'];
 
 class ContractError extends Error {}
 const fail = (m: string): never => {
@@ -81,22 +87,37 @@ function parseShot(v: unknown): Shot | null {
   if (v === null) return null;
   if (typeof v !== 'object' || Array.isArray(v)) fail('shot がオブジェクトでも null でもない');
   const o = v as Record<string, unknown>;
-  exactKeys(o, SHOT_KEYS, [], 'shot.');
+  exactKeys(o, SHOT_KEYS, SHOT_OPTIONAL_KEYS, 'shot.');
   const conf = o.confidence;
   if (conf !== null && (typeof conf !== 'number' || !(conf >= 0 && conf <= 1))) {
     fail(`shot.confidence は 0〜1 の数値か null: ${JSON.stringify(conf)}`);
   }
-  const path = str(o, 'path');
-  if (path === '' || path.startsWith('/') || path.split('/').includes('..')) {
-    fail(`shot.path は data/paper/ からの相対パス: ${JSON.stringify(path)}`);
-  }
-  return {
+  const path = relPath(str(o, 'path'), 'shot.path');
+  const shot: Shot = {
     path,
     priceText: strOrNull(o, 'price_text'),
     price: strOrNull(o, 'price', PRICE),
     symbolText: strOrNull(o, 'symbol_text'),
     confidence: conf as number | null,
   };
+  // 任意フィールドはキーがあるときだけ載せる（無い行の結果は従来と同じ形のまま）
+  if ('captured_at' in o) {
+    const c = strOrNull(o, 'captured_at', TS);
+    shot.capturedAt = c === null ? null : new Date(c);
+    if (shot.capturedAt && Number.isNaN(shot.capturedAt.getTime())) fail('shot.captured_at が日時として不正');
+  }
+  if ('window_title' in o) shot.windowTitle = strOrNull(o, 'window_title');
+  if ('ocr_path' in o) {
+    const p = strOrNull(o, 'ocr_path');
+    shot.ocrPath = p === null ? null : relPath(p, 'shot.ocr_path');
+  }
+  return shot;
+}
+
+/** data/paper/ からの相対パスか（絶対パス・親ディレクトリへの参照を弾く） */
+function relPath(p: string, key: string): string {
+  if (p === '' || p.startsWith('/') || p.split('/').includes('..')) fail(`${key} は data/paper/ からの相対パス: ${JSON.stringify(p)}`);
+  return p;
 }
 
 /** 1 行を契約どおりにパースする。違反は例外（ContractError）ではなく結果で返す */
@@ -246,16 +267,10 @@ export function parseEventsText(text: string): ParsedEvents {
 
 export type DerivedState = 'MARKET' | 'PENDING' | 'FILL_MARKED' | 'CANCELLED' | 'EXPIRED';
 
-/** 指値が発注時の現在値で即約定するか（買い: 指値 ≥ 現在値 / 売り: 指値 ≤ 現在値） */
-export function isMarketableLimit(side: 'buy' | 'sell', limitPrice: string | null, shotPrice: string | null): boolean {
-  if (limitPrice === null || shotPrice === null) return false;
-  const lim = new Decimal(limitPrice);
-  return side === 'buy' ? lim.gte(shotPrice) : lim.lte(shotPrice);
-}
-
 /**
- * 注文の状態。指値は当日限り: 発注日の大引け（15:30 JST）を過ぎても fill_mark も cancel も無く、
- * 即約定でもないものは EXPIRED。
+ * 注文の状態（足を見ない）。指値は当日限り: 発注日の大引け（15:30 JST）を過ぎても fill_mark も cancel も無ければ EXPIRED。
+ * 即約定かどうかは足で検証した現在値でしか決められないので、ここでは見ない（resolve が判定し、
+ * 即約定した指値は resolvePaperExecutions が MARKET に直す）。
  */
 export function deriveOrderState(
   o: OrderEvent,
@@ -266,7 +281,5 @@ export function deriveOrderState(
   if (o.orderType === 'market') return 'MARKET';
   if (fillMark) return 'FILL_MARKED';
   if (cancel) return 'CANCELLED';
-  // 即約定の判定は連続売買中だけ（寄り前・昼休み・引け板寄せの画面の値では約定しない。resolve の auctionFor を参照）
-  if (isContinuousSessionMinute(jstMinuteOfDay(o.ts)) && isMarketableLimit(o.side, o.limitPrice, o.shot?.price ?? null)) return 'PENDING';
   return now.getTime() >= closeOf(jstYmd(o.ts)).getTime() ? 'EXPIRED' : 'PENDING';
 }

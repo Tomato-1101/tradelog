@@ -27,6 +27,8 @@ export type ExecForRound = {
   priceStatus: PriceStatus;
   /** SBI のみ。Round の安定 ID の元 */
   dedupeHash: string | null;
+  /** PAPER のみ: 撮影画面の自動読取の銘柄（サイドカー auto.symbol）が発注銘柄と違うとき、その組 */
+  screenSymbolMismatch?: { screen: string; order: string } | null;
 };
 
 export type ExecutionRole = 'OPEN' | 'SCALE_IN' | 'SCALE_OUT' | 'CLOSE' | 'FLIP';

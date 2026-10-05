@@ -4,7 +4,7 @@ import path from 'node:path';
 
 // Prisma 7 + SQLite + better-sqlite3 アダプタ。
 // 接続 URL は prisma.config.ts と統一して apps/web から ../../data/app.db。
-const DB_FILE = process.env.DATABASE_URL
+export const DB_FILE = process.env.DATABASE_URL
   ?? `file:${path.resolve(process.cwd(), '../../data/app.db')}`;
 
 declare global {

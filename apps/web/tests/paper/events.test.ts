@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { deriveOrderState, isMarketableLimit, parseEventLine, parseEventsText, type OrderEvent } from '@/lib/paper/events';
+import { deriveOrderState, parseEventLine, parseEventsText, type OrderEvent } from '@/lib/paper/events';
 
 const U = (n: number) => `00000000-0000-4000-8000-${String(n).padStart(12, '0')}`;
 const POS = U(900);
@@ -221,19 +221,13 @@ describe('注文の状態', () => {
     expect(deriveOrderState(o, undefined, undefined, new Date(close.getTime() - 1))).toBe('PENDING');
     expect(deriveOrderState(o, undefined, undefined, close)).toBe('EXPIRED');
   });
-  it('即約定の指値は引け後も PENDING のまま（約定は resolve 側）', () => {
+  it('追加2: 生の shot.price で即約定に見える指値も、状態は時刻だけで決める（引け後は EXPIRED。即約定かは resolve が検証済みの現在値で決める）', () => {
     const m = { ...o, limitPrice: '2900' };
-    expect(deriveOrderState(m, undefined, undefined, new Date(close.getTime() + 86400_000))).toBe('PENDING');
+    expect(deriveOrderState(m, undefined, undefined, new Date(close.getTime() - 1))).toBe('PENDING');
+    expect(deriveOrderState(m, undefined, undefined, new Date(close.getTime() + 86400_000))).toBe('EXPIRED');
   });
   it('寄り前の指値は画面の値で即約定扱いにしない（引け後は EXPIRED。寄りでの約定は resolve 側）', () => {
     const m = { ...o, limitPrice: '2900', ts: new Date('2026-10-05T08:50:00.000+09:00') };
     expect(deriveOrderState(m, undefined, undefined, close)).toBe('EXPIRED');
-  });
-  it('isMarketableLimit: 同値は即約定', () => {
-    expect(isMarketableLimit('buy', '100', '100')).toBe(true);
-    expect(isMarketableLimit('buy', '99.9', '100')).toBe(false);
-    expect(isMarketableLimit('sell', '100', '100')).toBe(true);
-    expect(isMarketableLimit('sell', '100.1', '100')).toBe(false);
-    expect(isMarketableLimit('buy', '100', null)).toBe(false);
   });
 });

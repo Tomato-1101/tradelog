@@ -77,6 +77,7 @@ export const PRICE_BASIS_LABEL = {
   OPEN_AUCTION: '寄りの板寄せ',
   CLOSE_AUCTION: '引けの板寄せ',
   SCREEN: '発注時の画面',
+  SCREEN_AUTO: '発注時の画面（自動読取）',
   BAR: '足の終値（仮）',
   LIMIT: '指値',
   MANUAL: '手入力',

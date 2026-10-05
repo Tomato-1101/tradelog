@@ -48,6 +48,29 @@ cd apps/web && npm run import:sbi -- ../../data/raw/sbi/*.csv   # 本番の約�
 - 画面を撮れなかった・読めなかった約定は「要確認」「未確定」になる。画面の「要確認」から価格を手入力して確定する。
 - SBI の CSV は日付だけで時刻が無い。同じ日の売買は「買い → 売り」の順とみなすため、取り込み期間より前に買った株をその日に売り、同じ日に買い直した場合は、損益が実際とずれることがある。
 - 現物で、持っている株数を超える売りは「期間外に買った株の売却」として扱う（建値が分からないので損益は計算しない）。
+- 手で囲んだ領域の現在値が読めない・その分の 1 分足の外のときは、小窓のサイドカー（`shots/…/<注文 id>.ocr.json`）の自動読取の値で照合する（根拠「発注時の画面（自動読取）」）。サイドカーは後から書かれるので、daily を回し直すと要確認から確定に上がることがある（手入力した値は上書きしない）。
+
+### 常駐と自動実行（macOS の launchd）
+
+```sh
+./scripts/launchd/install.sh     # 常駐と自動実行を入れる（入れ直しも同じ）
+./scripts/launchd/uninstall.sh   # 止めて外す（ログは残す）
+```
+
+- 振り返り画面（`com.tomato.tradelog.web`）: ログイン時に本番ビルド（`next start`、http://127.0.0.1:3000）で起動し、落ちたら再起動する。
+  この Mac からだけ見える（LAN には出さない）。スマホで見るなら認証が要るので別途。
+  起動のたびに、ソースが前回のビルドより新しければ `next build` してから起動する。コードを変えた後は
+  `launchctl kickstart -k gui/$(id -u)/com.tomato.tradelog.web` で再起動すると作り直される。ビルドに失敗したら前回のビルドのまま起動する（web.log に出る）。
+- web・daily とも起動前に未適用の migration を調べ、あれば `scripts/backup-db.sh` → `prisma migrate deploy` してから進む（失敗したら止まり、ログに復旧手順を出す）。
+- daily（`com.tomato.tradelog.daily`）: 平日 15:45 に `npm run daily` と同じ処理を実行する。スリープ中に過ぎた分は復帰時に 1 回実行される。
+  祝日は足が無いだけでそのまま動く。AI の呼び出し（分析）はしない（`data/ai/` への書き出しまで）。
+  今すぐ 1 回回す: `launchctl kickstart gui/$(id -u)/com.tomato.tradelog.daily`
+  結果は `data/daily-status.json` に残り、失敗・一部失敗（足の取得失敗など）・2 営業日以上未実行のときだけ画面の上部に警告が出る。
+- ログ: `~/Library/Logs/tradelog/web.log` / `daily.log`（5MB を超えたら `.1` に回して 1 世代だけ残す）。状態: `launchctl print gui/$(id -u)/com.tomato.tradelog.web`
+- 一時的に止める: `launchctl bootout gui/$(id -u)/com.tomato.tradelog.web`（daily も同様）。戻すときは `install.sh` を再実行する。
+- node は install 時に見つけた場所（`NODE_BIN=/path/to/node` で指定可）を使う。node を入れ替えたら `install.sh` を再実行する
+  （better-sqlite3 が合わなければ先に `cd apps/web && npm rebuild better-sqlite3`）。
+- install.sh は 3000 番を別のプロセスが使っていたら、その PID とコマンドを出して登録を中止する。常駐中は 3000 番を使うので、開発時は `./scripts/dev.sh` の前に止めるか、`cd apps/web && npx next dev -p 3001` のように別の番号で起動する。
 
 ## 開発
 

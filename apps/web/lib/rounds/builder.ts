@@ -123,6 +123,7 @@ function finalize(a: Acc): RoundDraft {
 }
 
 export const PRIOR_HOLDING_SALE_WARNING = '期間外に買った株の売却（建値不明・損益は計算しない）';
+export const SCREEN_SYMBOL_MISMATCH_WARNING = '撮影画面の銘柄と発注銘柄が違う';
 
 /**
  * 建玉の無い現物売り（期間外に買った株の売却）を 1 本の決済済みラウンドにする。
@@ -267,6 +268,16 @@ export function buildPaperRounds(execs: ExecForRound[]): RoundDraft[] {
     if (cycles.length > 1) {
       for (const c of cycles) {
         c.warnings.push(`建玉 ID ${positionId} が 0 に戻った後にも約定があり、${cycles.length} 本に分割した`);
+      }
+    }
+    // 銘柄は小窓が決めた order の symbol を正とし、撮影画面の読取と食い違えば警告だけ残す
+    const byId = new Map(arr.map((e) => [e.id, e]));
+    for (const c of cycles) {
+      for (const x of c.executions) {
+        const m = byId.get(x.id)?.screenSymbolMismatch;
+        if (!m) continue;
+        const w = `${SCREEN_SYMBOL_MISMATCH_WARNING}（画面 ${m.screen} / 発注 ${m.order}）`;
+        if (!c.warnings.includes(w)) c.warnings.push(w);
       }
     }
     out.push(...cycles);

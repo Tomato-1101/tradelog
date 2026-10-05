@@ -6,10 +6,20 @@ import { floorToMinute, jstAt, jstMinuteOfDay, jstYmd, SESSION } from '@/lib/tim
 import { loadDailyBar, loadMinuteBars } from '@/lib/bars/store';
 import { deriveOrderState, parseEventsText, type EventError } from './events';
 import { manualResolution, resolveOrder } from './resolve';
+import { readSidecar } from './sidecar';
 
 export const PAPER_ACCOUNT = 'paper';
 
-export type IngestReport = { lines: number; accepted: number; newEvents: number; errors: EventError[] };
+export type IngestReport = {
+  lines: number;
+  /** 取り込んだ注文（order 行）の数 */
+  orders: number;
+  accepted: number;
+  newEvents: number;
+  errors: EventError[];
+  /** サイドカー（ocr.json）: 読めた数 / まだ無い数 / 読めなかったもの（書きかけ等。次回の daily で読み直す） */
+  sidecars: { loaded: number; missing: number; errors: Array<{ orderId: string; path: string; message: string }> };
+};
 
 async function instrumentId(db: PrismaClient, symbol: string): Promise<number> {
   const i = await db.instrument.upsert({
@@ -20,8 +30,10 @@ async function instrumentId(db: PrismaClient, symbol: string): Promise<number> {
   return i.id;
 }
 
-export async function ingestPaperEvents(db: PrismaClient, text: string, now: Date): Promise<IngestReport> {
+/** @param opts.paperDir サイドカーの基準ディレクトリ（data/paper）。省略時はサイドカーを読まない */
+export async function ingestPaperEvents(db: PrismaClient, text: string, now: Date, opts: { paperDir?: string } = {}): Promise<IngestReport> {
   const p = parseEventsText(text);
+  const sidecars: IngestReport['sidecars'] = { loaded: 0, missing: 0, errors: [] };
   const logged = new Set((await db.paperEventLog.findMany({ select: { id: true } })).map((x) => x.id));
 
   for (const o of p.orders) {
@@ -52,10 +64,38 @@ export async function ingestPaperEvents(db: PrismaClient, text: string, now: Dat
     });
     if (o.shot) {
       const s = o.shot;
+      // order 行由来の値は不変だが、列を足す前に取り込んだ行にも入るよう毎回書く（同じ値なので冪等）
+      const fromOrder = {
+        capturedAt: s.capturedAt ?? null,
+        captureDelayMs: s.capturedAt ? s.capturedAt.getTime() - o.ts.getTime() : null,
+        windowTitle: s.windowTitle ?? null,
+        ocrPath: s.ocrPath ?? null,
+      };
+      // サイドカーは後から書かれる。読めたときだけ反映し、まだ無い・読めないときは前回の値を残す
+      let fromSidecar = {};
+      if (s.ocrPath && opts.paperDir) {
+        const sc = readSidecar(opts.paperDir, s.ocrPath);
+        if (sc === null) sidecars.missing++;
+        else if (!sc.ok) sidecars.errors.push({ orderId: o.id, path: s.ocrPath, message: sc.message });
+        else {
+          sidecars.loaded++;
+          const a = sc.auto;
+          fromSidecar = { ocrReadAt: now, autoPrice: a.price, autoPriceText: a.priceText, autoPriceTime: a.priceTime, autoSymbol: a.symbol, autoSource: a.source };
+        }
+      }
       await db.shot.upsert({
         where: { paperOrderId: o.id },
-        create: { paperOrderId: o.id, path: s.path, priceText: s.priceText, price: s.price, symbolText: s.symbolText, confidence: s.confidence },
-        update: {},
+        create: {
+          paperOrderId: o.id,
+          path: s.path,
+          priceText: s.priceText,
+          price: s.price,
+          symbolText: s.symbolText,
+          confidence: s.confidence,
+          ...fromOrder,
+          ...fromSidecar,
+        },
+        update: { ...fromOrder, ...fromSidecar },
       });
     }
   }
@@ -72,9 +112,11 @@ export async function ingestPaperEvents(db: PrismaClient, text: string, now: Dat
   }
   return {
     lines: text.split('\n').filter((l) => l.trim() !== '').length,
+    orders: p.orders.length,
     accepted: p.accepted.length,
     newEvents: fresh.length,
     errors: p.errors,
+    sidecars,
   };
 }
 
@@ -83,7 +125,7 @@ export type ResolveReport = { confirmed: number; needsReview: number; unresolved
 /** すべての注文の約定を規則どおりに確定し直す。手入力（MANUAL）で確定済みのものは上書きしない */
 export async function resolvePaperExecutions(db: PrismaClient): Promise<ResolveReport> {
   const rep: ResolveReport = { confirmed: 0, needsReview: 0, unresolved: 0, manualKept: 0, noFill: 0, removed: 0 };
-  const orders = await db.paperOrder.findMany({ include: { shot: true, execution: true }, orderBy: { placedAt: 'asc' } });
+  const orders = await db.paperOrder.findMany({ include: { shot: true, execution: true, instrument: { select: { symbol: true } } }, orderBy: { placedAt: 'asc' } });
   for (const o of orders) {
     if (o.execution?.priceBasis === 'MANUAL') {
       rep.manualKept++;
@@ -104,6 +146,11 @@ export async function resolvePaperExecutions(db: PrismaClient): Promise<ResolveR
         state: o.state,
         fillMarkedAt: o.fillMarkedAt,
         shotPrice: o.shot?.price ?? null,
+        autoPrice: o.shot?.autoPrice ?? null,
+        autoSource: o.shot?.autoSource ?? null,
+        // 撮影画面の銘柄が違えば auto.price は使わない（ラウンドの警告は rebuild 側で残る）
+        symbol: o.instrument.symbol,
+        autoSymbol: o.shot?.autoSymbol ?? null,
       },
       minuteBars,
       dailyBar,
@@ -115,6 +162,11 @@ export async function resolvePaperExecutions(db: PrismaClient): Promise<ResolveR
         rep.removed++;
       }
       continue;
+    }
+    // fill_mark 無しで約定した指値（検証済みの現在値で即約定・板寄せで約定）は、時刻だけで決めた EXPIRED / PENDING のままにせず
+    // MARKET（成行と同じく発注で約定した）にする。失効の件数に数えないため
+    if (o.orderType === 'LIMIT' && !o.fillMarkedAt && (o.state === 'EXPIRED' || o.state === 'PENDING')) {
+      await db.paperOrder.update({ where: { id: o.id }, data: { state: 'MARKET' } });
     }
     const data = {
       executedAt: r.executedAt,

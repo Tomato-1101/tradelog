@@ -1,0 +1,11 @@
+-- AlterTable
+ALTER TABLE "Shot" ADD COLUMN "autoPrice" TEXT;
+ALTER TABLE "Shot" ADD COLUMN "autoPriceText" TEXT;
+ALTER TABLE "Shot" ADD COLUMN "autoPriceTime" TEXT;
+ALTER TABLE "Shot" ADD COLUMN "autoSource" TEXT;
+ALTER TABLE "Shot" ADD COLUMN "autoSymbol" TEXT;
+ALTER TABLE "Shot" ADD COLUMN "captureDelayMs" INTEGER;
+ALTER TABLE "Shot" ADD COLUMN "capturedAt" DATETIME;
+ALTER TABLE "Shot" ADD COLUMN "ocrPath" TEXT;
+ALTER TABLE "Shot" ADD COLUMN "ocrReadAt" DATETIME;
+ALTER TABLE "Shot" ADD COLUMN "windowTitle" TEXT;
