@@ -66,7 +66,7 @@ cd apps/web && npm run import:sbi -- ../../data/raw/sbi/*.csv   # 本番の約�
   祝日は足が無いだけでそのまま動く。AI の呼び出し（分析）はしない（`data/ai/` への書き出しまで）。
   今すぐ 1 回回す: `launchctl kickstart gui/$(id -u)/com.tomato.tradelog.daily`
   結果は `data/daily-status.json` に残り、失敗・一部失敗（足の取得失敗など）・2 営業日以上未実行のときだけ画面の上部に警告が出る。
-- 録画（`com.tomato.tradelog.record`）: 平日 8:53 に `caffeinate -u -d -t 2700`（45 分は画面を消さない）を張ってから、小窓（TradePanel）に 37 分の録画を指示する
+- 録画（`com.tomato.tradelog.record`）: **既定では入れない**（HYPER SBI 2 は毎朝 6:30 頃に切断され、再ログインにスマホ認証が要るので無人では録れない）。入れるときは `RECORD=1 ./scripts/launchd/install.sh`。入れると平日 8:53 に `caffeinate -u -d -t 2700`（45 分は画面を消さない）を張ってから、小窓（TradePanel）に 37 分の録画を指示する
   （起動中なら `open -g -a TradePanel.app 'tradepanel://record?minutes=37'`、起動していなければ `--args --record-minutes 37` で起動。前面には出さない・ネットワークは使わない）。
   録画は小窓の中で行い、`data/paper/replay/recordings/` に残す（自動では消さない）。小窓は `apps/panel/build/Build/Products/Release/TradePanel.app` を使うので、
   ビルドし直したら起動中の小窓も起動し直す。ロック中・ディスプレイが消えている間は録れないことがある（録れなかった区間はメタの `issues` に残る）。詳しくは `apps/panel/README.md`「録画リプレイ練習」。

@@ -1,6 +1,6 @@
 #!/bin/bash
 # 振り返り画面の常駐（com.tomato.tradelog.web）と引け後の daily（com.tomato.tradelog.daily）、
-# 平日 8:53 の小窓への録画指示（com.tomato.tradelog.record）を
+# 平日 8:53 の小窓への録画指示（com.tomato.tradelog.record。既定は入れない。RECORD=1 ./install.sh の時だけ）を
 # ユーザーの LaunchAgents に入れて読み込む。何度実行してもよい（入れ直し）。
 # node の場所は NODE_BIN で指定できる。無ければ PATH → ログインシェル（nvm 等）→ nvm.sh の順に探す。
 set -euo pipefail
@@ -11,6 +11,12 @@ AGENTS="$HOME/Library/LaunchAgents"
 LOG_DIR="$HOME/Library/Logs/tradelog"
 DOMAIN="gui/$(id -u)"
 LABELS=(com.tomato.tradelog.web com.tomato.tradelog.daily com.tomato.tradelog.record)
+# 朝の自動録画は既定で切る（HYPER SBI 2 が毎朝 6:30 頃に切断され、無人では再ログインできないため。本人は自分で起きて取引する）
+if [ "${RECORD:-0}" != 1 ]; then
+  LABELS=(com.tomato.tradelog.web com.tomato.tradelog.daily)
+  launchctl bootout "$DOMAIN/com.tomato.tradelog.record" 2>/dev/null && echo "停止: com.tomato.tradelog.record（自動録画は既定で切。入れるなら RECORD=1）" || true
+  rm -f "$AGENTS/com.tomato.tradelog.record.plist"
+fi
 
 find_node() {
   if [ -n "${NODE_BIN:-}" ]; then echo "$NODE_BIN"; return; fi
