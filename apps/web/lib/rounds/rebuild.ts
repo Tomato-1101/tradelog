@@ -1,5 +1,5 @@
 // Execution（真実）から Round（キャッシュ）を作り直す。Round の ID は安定なので upsert し、消えたものだけ消す。
-// あわせて Execution.roundId / Memo.roundId を付け直し、ペーパーのラウンドは 1 分足から MAE/MFE を出す。
+// あわせて Execution.roundId / Memo.roundId を付け直し、ペーパーと時刻付きの SBI のラウンドは 1 分足から MAE/MFE を出す。
 
 import type { PrismaClient } from '@/generated/prisma/client';
 import { floorToMinute } from '@/lib/time';
@@ -60,6 +60,15 @@ export async function rebuildRounds(db: PrismaClient, now: Date, opts: { replayE
       excursion.set(r.id, null);
       continue;
     }
+    const bars = await loadMinuteBars(db, r.instrumentId, floorToMinute(r.openedAt), floorToMinute(end));
+    excursion.set(r.id, computeExcursion(r, bars, end));
+  }
+  // SBI は時刻付きのラウンドだけ、ペーパーと同じ計算（窓は建て〜決済、未決済は now）。
+  // 日付だけの約定を含むラウンドは窓の端が 09:00 に置かれて意味を持たないので出さない（日付だけのラウンドは従来どおり null）
+  const precisionOf = new Map(execs.map((e) => [e.id, e.timePrecision]));
+  for (const r of sbi) {
+    if (!r.executions.every((x) => precisionOf.get(x.id) === 'ms')) continue;
+    const end = r.closedAt ?? now;
     const bars = await loadMinuteBars(db, r.instrumentId, floorToMinute(r.openedAt), floorToMinute(end));
     excursion.set(r.id, computeExcursion(r, bars, end));
   }

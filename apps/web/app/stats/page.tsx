@@ -19,8 +19,11 @@ export default async function StatsPage({ searchParams }: { searchParams: Promis
   const sp = await searchParams;
   const source = parseSource(sp.source);
   const period = parsePeriodParams(sp);
+  // エクイティカーブの時間軸。SBI は日付だけの取引が同じ時刻に重なるので日ごと
   const precision = source === 'SBI' ? 'day' : 'ms';
   const rounds = await loadStatsRounds(prisma, source, period, new Date());
+  // 保有時間・時間帯別は時刻付きの取引だけで出す（SBI も注文履歴で時刻を付けたものは入る）
+  const timed = rounds.some((x) => x.timePrecision !== 'day');
   const st = computeStats(rounds);
   const provisional = await provisionalRoundCount(
     prisma,
@@ -71,7 +74,7 @@ export default async function StatsPage({ searchParams }: { searchParams: Promis
         {kv('ペイオフレシオ', ratio(st.payoffRatio))}
         {kv('プロフィットファクター', ratio(st.profitFactor))}
         {kv('最大ドローダウン(円)', st.maxDrawdown === '0' ? '0' : `-${fmtYen(st.maxDrawdown)}`, st.maxDrawdown === '0' ? '' : 'down')}
-        {precision === 'ms' && kv('平均保有時間', fmtHold(st.avgHoldSeconds == null ? null : Math.round(st.avgHoldSeconds), 'ms'))}
+        {timed && kv('平均保有時間', fmtHold(st.avgHoldSeconds == null ? null : Math.round(st.avgHoldSeconds), 'ms'))}
         {kv('平均利益(円)', fmtYen(st.avgWin, true), 'up')}
         {kv('平均損失(円)', fmtYen(st.avgLoss, true), 'down')}
         {kv('勝ち / 負け / 引分', `${st.wins} / ${st.losses} / ${st.draws}`)}
@@ -82,7 +85,10 @@ export default async function StatsPage({ searchParams }: { searchParams: Promis
       )}
       <p className="muted">
         保有中 {st.openCount} 件は集計に入らない。{st.excludedNoPnl > 0 && `損益が出せない ${st.excludedNoPnl} 件（価格未確定・期間外に買った株の売却）も件数から除外。`}
-        {precision === 'day' && '本番(SBI)は約定履歴に時刻が無いため、保有時間と時間帯別は出さない。'}
+        {precision === 'day' &&
+          (timed
+            ? '本番(SBI)の保有時間と時間帯別は、注文履歴で時刻を付けた取引だけで出す（日付だけの取引は入らない）。'
+            : '本番(SBI)は約定履歴に時刻が無いため、保有時間と時間帯別は出さない。')}
       </p>
 
       <h2>エクイティカーブ（累積損益）</h2>

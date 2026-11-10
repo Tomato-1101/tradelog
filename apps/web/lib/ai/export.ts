@@ -22,6 +22,7 @@ export function toJstIso(d: Date): string {
 const iso = (d: Date | null) => (d ? toJstIso(d) : null);
 
 export const BAR_WINDOW_MIN = 30;
+const ROUND_CHUNK = 500;
 
 export type ExportReport = { trades: number; withBars: number; tradesPath: string; summaryPath: string };
 
@@ -29,14 +30,21 @@ export type ExportReport = { trades: number; withBars: number; tradesPath: strin
 export async function exportForAi(db: PrismaClient, outDir: string, now: Date, opts: { replayEnd?: ReplayEndResolver } = {}): Promise<ExportReport> {
   const replayEnd = opts.replayEnd ?? replayEndResolver(paperDir());
   fs.mkdirSync(outDir, { recursive: true });
-  const rounds = await db.round.findMany({
-    include: {
-      instrument: true,
-      executions: { include: { paperOrder: { include: { shot: true } } }, orderBy: [{ executedAt: 'asc' }, { seq: 'asc' }] },
-      memos: { orderBy: { ts: 'asc' } },
-    },
-    orderBy: [{ openedAt: 'asc' }, { id: 'asc' }],
-  });
+  const order = [{ openedAt: 'asc' as const }, { id: 'asc' as const }];
+  const load = (ids: string[]) =>
+    db.round.findMany({
+      where: { id: { in: ids } },
+      include: {
+        instrument: true,
+        executions: { include: { paperOrder: { include: { shot: true } } }, orderBy: [{ executedAt: 'asc' }, { seq: 'asc' }] },
+        memos: { orderBy: { ts: 'asc' } },
+      },
+      orderBy: order,
+    });
+  // 関連の読み込みは「ラウンド ID の IN」になり、SQLite のパラメータ上限（999）を超えると失敗するので塊に分けて読む
+  const ids = (await db.round.findMany({ select: { id: true }, orderBy: order })).map((r) => r.id);
+  const rounds: Awaited<ReturnType<typeof load>> = [];
+  for (let i = 0; i < ids.length; i += ROUND_CHUNK) rounds.push(...(await load(ids.slice(i, i + ROUND_CHUNK))));
 
   const lines: string[] = [];
   let withBars = 0;
@@ -222,7 +230,7 @@ function renderSummary(
     `- 約定価格: 要確認 ${q.needsReview} 件 / 未確定 ${q.unresolved} 件（手入力で確定するまで、未確定を含むラウンドは損益が出ない）`,
     `- 失効した指値: ${q.expired} 件`,
     `- 足の取得: 失敗 ${q.barErrors} 日 / 遡れず取得不可 ${q.barUnavailable} 日`,
-    '- SBI の約定は日付だけ（時刻なし）なので、保有時間・時間帯別・1 分足・MAE/MFE は出ない',
+    '- SBI の約定は、注文履歴で時刻（秒まで）を付けたもの（time_precision=ms）だけ保有時間・時間帯別・1 分足・MAE/MFE が出る。日付だけ（time_precision=day）の取引は出ない',
     '- REPLAY の時刻は録画上の実時刻（押した現実の時刻ではない）。trades.jsonl の各ラウンドに recording_id / session_id、約定に replay.video_ms（再生位置）がある',
     '- 全体・直近 30 日には PAPER・SBI・REPLAY がすべて入る。種別ごとの成績は各節を見る',
     '',

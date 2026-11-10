@@ -1,5 +1,6 @@
 // 足の永続化と、不足分（取りこぼし日を含む）の計画・取得。取得の成否は BarFetch にデータ品質として残す。
-// 対象はペーパー・リプレイの建玉が存在した日（MAE/MFE・約定確定・AI 書き出しに使う）。SBI は時刻が無いので取らない。
+// 対象はペーパー・リプレイの建玉が存在した日（MAE/MFE・約定確定・AI 書き出しに使う）と、時刻付き（timePrecision=ms）の
+// SBI ラウンドの建て〜決済の日。日付だけの SBI ラウンドは 1 分足が使えないので取らない。
 // リプレイの日付は ts（録画上の実時刻）の JST 日付 = 録画の日。
 
 import type { PrismaClient } from '@/generated/prisma/client';
@@ -61,12 +62,19 @@ export async function planBarFetches(
     }
   }
   const wanted = new Map<number, { symbol: string; dates: Set<string> }>();
-  for (const [pos, s] of span) {
-    const to = openPositions.has(pos) ? today : s.to;
-    const w = wanted.get(s.instrumentId) ?? { symbol: s.symbol, dates: new Set<string>() };
-    for (const d of weekdaysBetween(s.from, to > today ? today : to)) w.dates.add(d);
-    wanted.set(s.instrumentId, w);
-  }
+  const addSpan = (instrumentId: number, symbol: string, from: string, to: string) => {
+    const w = wanted.get(instrumentId) ?? { symbol, dates: new Set<string>() };
+    for (const d of weekdaysBetween(from, to > today ? today : to)) w.dates.add(d);
+    wanted.set(instrumentId, w);
+  };
+  for (const [pos, s] of span) addSpan(s.instrumentId, s.symbol, s.from, openPositions.has(pos) ? today : s.to);
+
+  // SBI: 建て始めが時刻付きのラウンド（MAE/MFE と AI 書き出しの足はこのラウンドだけが使う）。未決済はペーパーと同じく今日まで
+  const sbiRounds = await db.round.findMany({
+    where: { source: 'SBI', timePrecision: 'ms' },
+    select: { instrumentId: true, openedAt: true, closedAt: true, instrument: { select: { symbol: true } } },
+  });
+  for (const r of sbiRounds) addSpan(r.instrumentId, r.instrument.symbol, jstYmd(r.openedAt), r.closedAt ? jstYmd(r.closedAt) : today);
 
   // 録画の銘柄（1m だけ）。銘柄がまだ無ければ登録する（取り込みと同じ TSE）
   const minuteOnly = new Map<number, { symbol: string; dates: Set<string> }>();
