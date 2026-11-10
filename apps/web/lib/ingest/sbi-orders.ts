@@ -95,6 +95,8 @@ export function parseSbiOrder(o: RawOrder): { fills: SbiOrderFill[]; warnings: S
     return { fills, warnings };
   }
   if (rows[0]?.[0] !== '日付') {
+    // 現引・現渡は市場で約定しないので、詳細に注文履歴の表が出ない（実データ 9875・9895 で確認）
+    if (rows.length === 0 && /^現(引|渡)/.test(list[4] ?? '')) return { fills, warnings };
     warn('no-header', '注文履歴の見出し行がありません');
     return { fills, warnings };
   }
