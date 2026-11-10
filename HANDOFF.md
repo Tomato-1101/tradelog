@@ -23,3 +23,11 @@
   実ピクセル録画 5120x2880 で 1 分 14.7MB、録画コマから BoardReader で 5,566 / 15:30 を読めた。実 DB に migration 適用済み（SBI 927 件・-524485.5 不変）。
 - 10-06 本人決定: **朝の自動録画はやめる**（本人が自分で起きて取引する）。launchd record は停止・削除済み、install.sh は RECORD=1 の時だけ入れる。
   理由: HYPER SBI 2 は毎日 6:30 頃のメンテで切断、再ログインはスマホの FIDO 認証が必須で無人では録れない。録画・リプレイ機能のコードは残す（手動の「今すぐ録画」は使える）。
+
+## 本番の癖分析・Windows 記録小窓（11-10 18:55 更新）
+- 目的: SBI 本番のエントリー時刻（秒）と 1 分足・記録ボタンの画像から「どんな形で入る癖があるか」を分析する。本人はデイトレを Windows で行う。
+- 現状: main に fa61eae まで取り込み済み（未 push）。常駐 web 再ビルド済み。SBI 注文履歴（詳細）を Chrome から収集 → data/raw/sbi-orders/part1・part2.json（10/16〜11/09）→ `npm run import:sbi-orders` で 564 件中 539 件に時刻。
+  1 分足 104 銘柄日取得済み、MAE/MFE 241 本。損益合計 -741715.5 不変。Windows（SSH 鍵 ~/.config/tradelog/ssh/win_ed25519、宛先は ~/.config/tradelog/win.conf）に apps/panel-win を配置、ログオン時起動タスク tradelog-panel。
+  Mac は launchd com.tomato.tradelog.pullwin が平日 8:30〜18:00 に 10 分おき回収 → data/real/ → daily が RealMemo に取り込み建て約定に結び付け。
+- 次: (1) HYPER SBI 2 窓の撮影経路が未確認。初の本物の記録の shots[].method（print/screen）と画像を見る。(2) 注文履歴は約 3 か月・セッション 2.5〜4 時間で切れる。定期的に Chrome で収集して import:sbi-orders（収集 JS は本セッションの記録にしかないので、要ならスクリプト化）。
+  (3) Yahoo 1 分足は 9:05 以降しか無く寄り 5 分の取引は形を測れない。
