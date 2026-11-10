@@ -71,6 +71,12 @@ data/paper/
 data/ai/
 data/legacy/
 data/daily-status.json*
+# 本番のエントリー記録（Windows の小窓 apps/panel-win から scripts/pull-win.sh で回収。本人の取引データ）
+data/real/
 
 # 第三者著作物の参照画像（社内参照用・リポジトリ非公開）
 docs/design-references/markers/
+
+# Windows 小窓のビルド生成物
+apps/panel-win/bin/
+apps/panel-win/obj/

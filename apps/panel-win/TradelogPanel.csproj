@@ -1,0 +1,18 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <TargetFramework>net9.0-windows</TargetFramework>
+    <UseWindowsForms>true</UseWindowsForms>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <AssemblyName>TradelogPanel</AssemblyName>
+    <RootNamespace>TradelogPanel</RootNamespace>
+    <!-- 4K + 125% スケーリングで窓矩形と画面座標を実ピクセルで揃えるため -->
+    <ApplicationHighDpiMode>PerMonitorV2</ApplicationHighDpiMode>
+    <!-- .NET 9 ランタイムが無くなっても新しいメジャーで動くように -->
+    <RollForward>Major</RollForward>
+    <SatelliteResourceLanguages>ja</SatelliteResourceLanguages>
+  </PropertyGroup>
+
+</Project>
