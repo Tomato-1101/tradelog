@@ -1,5 +1,6 @@
 // 日次バッチ: events 取り込み → 不足分の 1m/1d 足取得（取りこぼし日も遡って補う）→ 約定確定 → Round 再構築（MAE/MFE）→ AI 書き出し。
-// 使い方: npm run daily -- [--events <path>] [--replay-events <path>] [--out <dir>] [--no-fetch]
+// 使い方: npm run daily -- [--events <path>] [--replay-events <path>] [--real-events <path>] [--out <dir>] [--no-fetch]
+// 本番エントリー記録（Windows の記録小窓）は --real-events（既定は data/real/events.jsonl）。取り込んで SBI の建て約定に結び付ける。
 // リプレイ（録画を再生しながらの練習）は --replay-events（既定は --events と同じフォルダの replay/events.jsonl）。
 // 検証用に DATABASE_URL で別の DB に向けられる（lib/db.ts / prisma.config.ts）。
 
@@ -12,6 +13,7 @@ import { ingestPaperEvents, resolvePaperExecutions } from '@/lib/paper/ingest';
 import { recordedSymbolDays, replayEndResolver } from '@/lib/paper/recordings';
 import { rebuildRounds } from '@/lib/rounds/rebuild';
 import { exportForAi } from '@/lib/ai/export';
+import { ingestRealMemos, linkRealMemos } from '@/lib/real/memos';
 
 const ROOT = path.resolve(__dirname, '../../..');
 
@@ -59,6 +61,17 @@ async function main() {
   counts.sidecarErrors += rsc.errors.length;
   console.log(`[replay ocr] サイドカー 読込 ${rsc.loaded} / まだ無い ${rsc.missing} / 読めず ${rsc.errors.length}`);
   for (const e of rsc.errors) console.log(`  [サイドカー] ${e.path}: ${e.message}（次回の daily で読み直す）`);
+
+  // 1c. 本番エントリー記録（ファイルが無ければ何もしない）。結び付けは SBI の約定時刻が後から付くので毎回全件やり直す
+  const realPath = path.resolve(arg('--real-events') ?? path.join(ROOT, 'data/real/events.jsonl'));
+  const reing = await ingestRealMemos(prisma, fs.existsSync(realPath) ? fs.readFileSync(realPath, 'utf-8') : '');
+  const relink = await linkRealMemos(prisma);
+  console.log(
+    `[real] ${realPath}: ${reing.lines} 行 / 新規 ${reing.newMemos} / test 除外 ${reing.test} / 書きかけ ${reing.partial} / 契約違反 ${reing.errors.length}` +
+      ` / 記録 ${relink.memos} 件のうち建て約定に結び付いた ${relink.linked}（付け直し ${relink.changed}）`,
+  );
+  for (const e of reing.errors) console.log(`  [契約違反] ${e.line} 行目${e.id ? `（${e.id}）` : ''}: ${e.message}`);
+  counts.eventErrors += reing.errors.length;
 
   // 2. 足（1 回目の約定確定・再構築の前に、建玉の日付が分かっている分を取る。未決済の延長は 2 周目で拾う）
   if (!noFetch) {

@@ -152,6 +152,7 @@ model Execution {
   roundId       String?
   round         Round?        @relation(fields: [roundId], references: [id])
   rawJson       String
+  realMemos     RealMemo[]
 
   @@index([instrumentId, executedAt])
   @@index([roundId])
@@ -278,6 +279,25 @@ model ImportBatch {
   dupCount   Int
   warnings   String      @default("[]")
   executions Execution[]
+}
+
+// 本番エントリー記録（Windows の記録小窓の real_memo。data/real/events.jsonl、契約は docs/real-events.md）。
+// 取り込んだ行はそのまま残し、SBI の建て約定への結び付け（executionId）だけ daily のたびに付け直す。
+model RealMemo {
+  id                String     @id // イベントの id
+  ts                DateTime // UTC（押した瞬間）
+  tagsJson          String // tags（string[]）
+  shotsJson         String // shots[]（path は data/real/ からの相対）
+  activeWindowTitle String?
+  captureError      String?
+  rawJson           String // 取り込んだ行そのもの
+  importedAt        DateTime   @default(now())
+  // 結び付けた SBI の建て約定（lib/real/memos.ts の規則）。見つからなければ null。約定が消えたら null に戻す
+  executionId       String?
+  execution         Execution? @relation(fields: [executionId], references: [id], onDelete: SetNull)
+  linkDeltaMs       Int? // 約定時刻 − 記録時刻（ms）
+
+  @@index([executionId])
 }
 
 // events.jsonl の取り込み済みイベント id（冪等化用）

@@ -1,5 +1,5 @@
 // AI 分析用の書き出し。毎回全量を書き直す（追記しない）。
-//  - trades.jsonl: 1 行 1 ラウンド。約定・メモ・前後 30 分の 1 分足・スクショのパスまで、そのラウンドの判断材料を全部入れる。
+//  - trades.jsonl: 1 行 1 ラウンド。約定・メモ・前後 30 分の 1 分足・スクショのパス・本番エントリー記録まで、そのラウンドの判断材料を全部入れる。
 //    リプレイ（source=REPLAY）は録画 ID・セッション ID と、約定・メモごとの再生位置も入れる。
 //  - summary.md: 全体 / 直近 30 日 / PAPER / SBI / REPLAY の統計。
 // 時刻はすべて JST の ISO8601（+09:00）。金額・数量は 10 進数文字列、足の OHLCV は数値。
@@ -14,6 +14,7 @@ import { floorToMinute, isContinuousSessionMinute, jstMinuteOfDay } from '@/lib/
 import { barWindowTo } from '@/lib/rounds/excursion';
 import { paperDir } from '@/lib/paper/shots';
 import { replayEndResolver, type ReplayEndResolver } from '@/lib/paper/recordings';
+import { LINK_WINDOW_SEC } from '@/lib/real/memos';
 
 const JST_MS = 9 * 3600_000;
 export function toJstIso(d: Date): string {
@@ -22,7 +23,7 @@ export function toJstIso(d: Date): string {
 const iso = (d: Date | null) => (d ? toJstIso(d) : null);
 
 export const BAR_WINDOW_MIN = 30;
-const ROUND_CHUNK = 500;
+const ROUND_CHUNK = 100;
 
 export type ExportReport = { trades: number; withBars: number; tradesPath: string; summaryPath: string };
 
@@ -41,10 +42,16 @@ export async function exportForAi(db: PrismaClient, outDir: string, now: Date, o
       },
       orderBy: order,
     });
-  // 関連の読み込みは「ラウンド ID の IN」になり、SQLite のパラメータ上限（999）を超えると失敗するので塊に分けて読む
+  // 関連の読み込みは「親 ID の IN」になり、SQLite のパラメータ上限（999）を超えると失敗するので塊に分けて読む
+  // （約定 → 注文の段も IN になるので、1 塊の約定がペーパーで上限を超えない程度に小さくする）
   const ids = (await db.round.findMany({ select: { id: true }, orderBy: order })).map((r) => r.id);
   const rounds: Awaited<ReturnType<typeof load>> = [];
   for (let i = 0; i < ids.length; i += ROUND_CHUNK) rounds.push(...(await load(ids.slice(i, i + ROUND_CHUNK))));
+  // 本番エントリー記録は件数が少ないので、約定ごとの IN を避けて結び付いたものを一度に読む
+  const realByExec = new Map<string, Array<Awaited<ReturnType<typeof db.realMemo.findMany>>[number]>>();
+  for (const m of await db.realMemo.findMany({ where: { executionId: { not: null } }, orderBy: [{ ts: 'asc' }, { id: 'asc' }] })) {
+    realByExec.set(m.executionId!, [...(realByExec.get(m.executionId!) ?? []), m]);
+  }
 
   const lines: string[] = [];
   let withBars = 0;
@@ -128,6 +135,18 @@ export async function exportForAi(db: PrismaClient, outDir: string, now: Date, o
           : null,
       })),
       memos: r.memos.map((m) => ({ at: iso(m.ts), order_id: m.orderId, text: m.text, ...(m.replayRecordingId ? { video_ms: m.replayVideoMs } : {}) })),
+      // 本番エントリー記録（Windows の記録小窓）のうち、このラウンドの建て約定に結び付いたもの
+      real_memos: r.executions.flatMap((e) =>
+        (realByExec.get(e.id) ?? []).map((m) => ({
+          at: iso(m.ts),
+          execution_at: iso(e.executedAt),
+          delta_ms: m.linkDeltaMs,
+          tags: JSON.parse(m.tagsJson) as string[],
+          shots: (JSON.parse(m.shotsJson) as Array<{ path: string }>).map((x) => `data/real/${x.path}`),
+          active_window_title: m.activeWindowTitle,
+          capture_error: m.captureError,
+        })),
+      ),
       shots,
       bars_1m: bars,
     };
@@ -156,6 +175,8 @@ export async function exportForAi(db: PrismaClient, outDir: string, now: Date, o
     barErrors: await db.barFetch.count({ where: { status: 'ERROR' } }),
     barUnavailable: await db.barFetch.count({ where: { status: 'UNAVAILABLE' } }),
     expired: await db.paperOrder.count({ where: { state: 'EXPIRED' } }),
+    realMemos: await db.realMemo.count(),
+    realLinked: await db.realMemo.count({ where: { executionId: { not: null } } }),
   };
   const md = renderSummary(
     [
@@ -216,7 +237,7 @@ function renderSection(title: string, s: Stats): string {
 function renderSummary(
   sections: Array<[string, Stats]>,
   now: Date,
-  q: { needsReview: number; unresolved: number; barErrors: number; barUnavailable: number; expired: number },
+  q: { needsReview: number; unresolved: number; barErrors: number; barUnavailable: number; expired: number; realMemos: number; realLinked: number },
 ): string {
   return [
     '# 取引サマリ',
@@ -230,6 +251,7 @@ function renderSummary(
     `- 約定価格: 要確認 ${q.needsReview} 件 / 未確定 ${q.unresolved} 件（手入力で確定するまで、未確定を含むラウンドは損益が出ない）`,
     `- 失効した指値: ${q.expired} 件`,
     `- 足の取得: 失敗 ${q.barErrors} 日 / 遡れず取得不可 ${q.barUnavailable} 日`,
+    `- 本番エントリー記録（Windows の記録小窓）: ${q.realMemos} 件 / SBI の建て約定に結び付いた ${q.realLinked} 件（前後 ${LINK_WINDOW_SEC} 秒以内で最も近い時刻付きの建て約定。trades.jsonl の real_memos）`,
     '- SBI の約定は、注文履歴で時刻（秒まで）を付けたもの（time_precision=ms）だけ保有時間・時間帯別・1 分足・MAE/MFE が出る。日付だけ（time_precision=day）の取引は出ない',
     '- REPLAY の時刻は録画上の実時刻（押した現実の時刻ではない）。trades.jsonl の各ラウンドに recording_id / session_id、約定に replay.video_ms（再生位置）がある',
     '- 全体・直近 30 日には PAPER・SBI・REPLAY がすべて入る。種別ごとの成績は各節を見る',

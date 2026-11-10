@@ -15,8 +15,8 @@ function signedQty(side: Side, qty: Decimal): Decimal {
   return side === 'BUY' ? qty : qty.neg();
 }
 
-/** その約定が建て（新規）側か。日付しか分からない約定を同じ日の中で並べるのに使う */
-function isOpeningSide(e: Pick<ExecForRound, 'marginType' | 'side'>): boolean {
+/** その約定が建て（新規）側か。日付しか分からない約定を同じ日の中で並べる・本番エントリー記録を建て約定に結び付けるのに使う */
+export function isOpeningSide(e: Pick<ExecForRound, 'marginType' | 'side'>): boolean {
   if (e.marginType === 'MARGIN_SHORT') return e.side === 'SELL';
   return e.side === 'BUY'; // CASH / MARGIN_LONG
 }

@@ -33,3 +33,10 @@ Windows の記録小窓（`apps/panel-win`）が追記し、Mac の `scripts/pul
 | `method` | `print` / `screen` / `monitor` | `print`: 窓だけを PrintWindow で撮った。`screen`: PrintWindow が黒・失敗で窓の矩形を画面からコピー（上に重なった窓も写る）。`monitor`: HYPER SBI 2 が起動していない・窓が全部最小化 → 前面の窓があるモニタ全体 |
 
 撮るのは HYPER SBI 2（`HYPERSBI2.exe`）の見えているトップレベル窓すべて（Z 順で上から。最小化・非表示・小さな窓 120x80 未満は除く）。
+
+## 取り込みと SBI 約定への結び付け（web 側）
+- `npm run daily` が毎回 `data/real/events.jsonl` を読み、新しい `id` だけ DB（`RealMemo`）に入れる。`test` の行・書きかけの行は入れない。
+- 結び付けは daily のたびに全件やり直す（SBI の約定時刻は後から注文履歴で付くため）。
+  候補は SBI の時刻付き（`timePrecision=ms`）の建て約定（現物買・信用新規買・信用新規売）。記録の `ts` との差が **60 秒以内**のうち
+  差の絶対値が最小のもの。同じ差なら約定の早い方、同じ時刻なら約定 id の小さい方。無ければ結び付けない。実装は `apps/web/lib/real/memos.ts` が正。
+- AI 書き出し（`data/ai/trades.jsonl`）では、結び付いた記録がその約定のラウンドの `real_memos`（時刻・約定時刻・差・タグ・画像のパス）に入る。

@@ -20,7 +20,7 @@ export type DailyStatus = {
   sidecarErrors: number;
   /** events.jsonl から取り込んだ注文の数 */
   ordersIngested: number;
-  /** events.jsonl（通常のペーパーとリプレイの合計）で契約違反として捨てた行の数（この項目が無い古い状態ファイルは 0 とみなす） */
+  /** events.jsonl（通常のペーパー・リプレイ・本番エントリー記録の合計）で契約違反として捨てた行の数（この項目が無い古い状態ファイルは 0 とみなす） */
   eventErrors?: number;
 };
 export type DailyAlert = { kind: 'failed' | 'partial' | 'stale' | 'missing'; message: string };

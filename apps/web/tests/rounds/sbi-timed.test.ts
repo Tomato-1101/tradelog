@@ -13,6 +13,7 @@ import { applySbiOrderTimes } from '@/lib/ingest/sbi-orders-import';
 import { rebuildRounds } from '@/lib/rounds/rebuild';
 import { planBarFetches } from '@/lib/bars/store';
 import { exportForAi } from '@/lib/ai/export';
+import { ingestRealMemos, linkRealMemos } from '@/lib/real/memos';
 
 const MIGRATIONS = path.resolve(__dirname, '../../../../prisma/migrations');
 const NOW = new Date('2026-11-06T16:00:00+09:00');
@@ -114,5 +115,48 @@ describe('時刻付き SBI ラウンド', () => {
     expect(day.bars_1m).toBeNull();
     const summary = fs.readFileSync(path.join(out, 'summary.md'), 'utf8');
     expect(summary).toContain('時間帯別');
+  });
+});
+
+describe('本番エントリー記録（real_memo）', () => {
+  const line = (id: string, ts: string, o: Record<string, unknown> = {}) =>
+    JSON.stringify({ v: 1, type: 'real_memo', id, ts, tags: ['押し目'], shots: [{ path: `shots/2026-11-06/${id}-1.png`, window_title: '太陽誘電(6976)', process: 'HYPERSBI2', rect: [0, 0, 1, 1], method: 'print' }], active_window_title: 'HYPER SBI 2', ...o });
+  const EVENTS = [
+    line('m-entry', '2026-11-06T09:21:30.000+09:00'), // 建て（信用新規買 09:21:32）の 2 秒前
+    line('m-exit', '2026-11-06T09:40:04.000+09:00', { tags: [] }), // 近くにあるのは返済売だけ → 結び付けない
+    line('m-test', '2026-11-06T09:21:31.000+09:00', { test: true }),
+    '{"v":1,"type":"real_memo","id":"m-half"',
+  ].join('\n');
+
+  it('test と書きかけを飛ばして冪等に取り込み、前後 60 秒の建て約定にだけ結び付け、AI 書き出しに載せる', async () => {
+    await setup();
+    const r1 = await ingestRealMemos(db, EVENTS);
+    expect({ newMemos: r1.newMemos, test: r1.test, partial: r1.partial, errors: r1.errors.length }).toEqual({ newMemos: 2, test: 1, partial: 1, errors: 0 });
+    expect((await ingestRealMemos(db, EVENTS)).newMemos).toBe(0);
+    expect(await db.realMemo.count()).toBe(2);
+
+    expect(await linkRealMemos(db)).toEqual({ memos: 2, linked: 1, changed: 1 });
+    expect(await linkRealMemos(db), '2 回目は何も変えない').toEqual({ memos: 2, linked: 1, changed: 0 });
+    const entry = await db.realMemo.findUniqueOrThrow({ where: { id: 'm-entry' }, include: { execution: true } });
+    expect(entry.execution).toMatchObject({ side: 'BUY', marginType: 'MARGIN_LONG' });
+    expect(entry.linkDeltaMs).toBe(2000);
+    expect((await db.realMemo.findUniqueOrThrow({ where: { id: 'm-exit' } })).executionId).toBeNull();
+
+    const out = path.join(dir, 'ai');
+    await exportForAi(db, out, NOW, { replayEnd: () => null });
+    const lines = fs.readFileSync(path.join(out, 'trades.jsonl'), 'utf8').trim().split('\n').map((l) => JSON.parse(l));
+    expect(lines.find((l) => l.symbol === '6976').real_memos).toEqual([
+      {
+        at: '2026-11-06T09:21:30.000+09:00',
+        execution_at: '2026-11-06T09:21:32.000+09:00',
+        delta_ms: 2000,
+        tags: ['押し目'],
+        shots: ['data/real/shots/2026-11-06/m-entry-1.png'],
+        active_window_title: 'HYPER SBI 2',
+        capture_error: null,
+      },
+    ]);
+    expect(lines.find((l) => l.symbol === '7203').real_memos).toEqual([]);
+    expect(fs.readFileSync(path.join(out, 'summary.md'), 'utf8')).toContain('本番エントリー記録（Windows の記録小窓）: 2 件 / SBI の建て約定に結び付いた 1 件');
   });
 });
