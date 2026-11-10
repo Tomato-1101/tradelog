@@ -1,0 +1,35 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- Windows の記録小窓（apps/panel-win）の本番エントリー記録を 10 分おきに data/real/ へ回収する（scripts/pull-win.sh）。
+     --scheduled なので平日 8:30〜17:59 以外は何もしない。Windows が落ちていれば 1 行ログを残して終わる。
+     __REPO__ / __DATA__ / __LOG_DIR__ は install-pullwin.sh が埋める。 -->
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.tomato.tradelog.pullwin</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/bin/bash</string>
+    <string>__REPO__/scripts/pull-win.sh</string>
+    <string>--scheduled</string>
+  </array>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key>
+    <string>/usr/bin:/bin:/usr/sbin:/sbin</string>
+    <key>TRADELOG_DATA</key>
+    <string>__DATA__</string>
+    <!-- スクリプトが 5MB 超で .1 に回す（StandardOutPath と同じファイル） -->
+    <key>TRADELOG_LOG</key>
+    <string>__LOG_DIR__/pullwin.log</string>
+  </dict>
+  <key>StartInterval</key>
+  <integer>600</integer>
+  <key>RunAtLoad</key>
+  <false/>
+  <key>StandardOutPath</key>
+  <string>__LOG_DIR__/pullwin.log</string>
+  <key>StandardErrorPath</key>
+  <string>__LOG_DIR__/pullwin.log</string>
+</dict>
+</plist>
