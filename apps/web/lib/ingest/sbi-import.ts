@@ -5,7 +5,7 @@
 
 import Decimal from 'decimal.js';
 import type { PrismaClient } from '@/generated/prisma/client';
-import { jstYmd } from '@/lib/time';
+import { addDays, jstAt, jstYmd } from '@/lib/time';
 import { makeDedupeHash, sha256OfBuffer } from './dedupe';
 import { parseSbiCsvBuffer } from './sbi-csv';
 import type { ParseWarning, SbiCsvFormat } from './types';
@@ -20,6 +20,14 @@ export type SbiImportReport = {
   superseded: number;
   warnings: ParseWarning[];
 };
+
+/**
+ * CSV の期間（日付だけ、JST 09:00）を JST の日単位の範囲にする。
+ * 注文履歴で時刻を付けた約定（import:sbi-orders）は 09:00 以外（PTS は 08:20〜）にいるので、09:00 同士の範囲だと漏れる。
+ */
+function jstDayRange(earliest: Date, latest: Date): { gte: Date; lt: Date } {
+  return { gte: jstAt(jstYmd(earliest)), lt: jstAt(addDays(jstYmd(latest), 1)) };
+}
 
 export async function importSbiCsv(db: PrismaClient, buf: Buffer, fileName: string): Promise<SbiImportReport> {
   const parsed = parseSbiCsvBuffer(buf);
@@ -39,14 +47,14 @@ export async function importSbiCsv(db: PrismaClient, buf: Buffer, fileName: stri
 
   if (parsed.format === 'third-savefile' && parsed.earliestDate && parsed.latestDate) {
     const r = await db.execution.deleteMany({
-      where: { source: 'SBI', importBatch: { format: 'new-daily' }, executedAt: { gte: parsed.earliestDate, lte: parsed.latestDate } },
+      where: { source: 'SBI', importBatch: { format: 'new-daily' }, executedAt: jstDayRange(parsed.earliestDate, parsed.latestDate) },
     });
     report.superseded = r.count;
   }
   let covered = new Set<string>();
   if (parsed.format === 'new-daily' && parsed.earliestDate && parsed.latestDate) {
     const hist = await db.execution.findMany({
-      where: { source: 'SBI', importBatch: { format: 'third-savefile' }, executedAt: { gte: parsed.earliestDate, lte: parsed.latestDate } },
+      where: { source: 'SBI', importBatch: { format: 'third-savefile' }, executedAt: jstDayRange(parsed.earliestDate, parsed.latestDate) },
       select: { executedAt: true },
     });
     covered = new Set(hist.map((h) => jstYmd(h.executedAt)));
