@@ -3,7 +3,7 @@ using System.Text.Json.Nodes;
 
 namespace TradelogPanel;
 
-// 常に最前面の小窓。上 2 行 = 監視の状態と最後に見た注文、下 = 理由の入力欄（Win+H の音声入力のまま入れて Enter）。
+// 常に最前面の小窓。上 2 行 = 監視の状態と最後に見た注文、下 = 理由の入力欄（本人は voicekey で声から入力する。小窓は普通の入力欄で、Enter で保存）。
 // 起動時はフォーカスを奪わない。入力欄をクリックした時かホットキーの時だけ前に出て、保存したら元の窓へフォーカスを返す
 sealed class PanelForm : Form
 {
@@ -48,7 +48,7 @@ sealed class PanelForm : Form
         {
             Multiline = true, WordWrap = true, AcceptsReturn = false, ScrollBars = ScrollBars.Vertical,
             Location = new Point(gap, gap + lineH * 2 + 4), Size = new Size(width - gap * 2, noteH),
-            PlaceholderText = "理由（Win+H で音声入力）→ Enter で保存",
+            PlaceholderText = "理由 → Enter で保存",
         };
         saved = Line(gap + lineH * 2 + 4 + noteH + 2);
         saved.ForeColor = SystemColors.GrayText;

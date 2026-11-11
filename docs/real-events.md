@@ -70,7 +70,7 @@ Windows の記録小窓（`apps/panel-win`）が追記し、Mac の `scripts/pul
 | `type` | `real_note` | |
 | `id` | string(UUID) | |
 | `ts` | string | 保存した時刻 |
-| `text` | string | 入力欄の文（音声入力のまま。前後の空白は除く。空なら行を出さない） |
+| `text` | string | 入力欄の文（voicekey の入力のまま。前後の空白は除く。空なら行を出さない） |
 | `last_order` | object \| null | 保存した時点で最後に見た `board_order` の `{order_key, event, side, price, ts}`。手がかりで、結び付けの正は Mac |
 | `test` | true（任意） | |
 
