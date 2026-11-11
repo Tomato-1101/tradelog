@@ -75,7 +75,7 @@ describe.skipIf(jsons.length === 0)('ゴールデン: 実 JSON の注文履歴�
       expect(at.get(hit[0].id)?.toISOString()).toBe('2026-11-06T00:21:32.000Z');
     });
 
-    it('割り当てた約定は市場・単価・売買・日付が CSV 行と同じ。時刻を付けてもラウンドの損益の合計は変わらない', () => {
+    it('割り当てた約定は市場・単価・売買・日付が CSV 行と同じ。時刻を付けても（建玉が残っていない銘柄の）ラウンドの損益の合計は変わらない', () => {
       for (const a of match.assignments) {
         const x = byHash.get(a.id)!;
         for (const f of a.fills) {
@@ -85,11 +85,15 @@ describe.skipIf(jsons.length === 0)('ゴールデン: 実 JSON の注文履歴�
         }
       }
       const timed = all.map((x) => (at.has(x.id) ? { ...x, executedAt: at.get(x.id)!, timePrecision: 'ms' as const } : x));
-      const total = (xs: typeof all) => buildSbiRounds(xs).reduce((s, r) => s.plus(r.netPnl ?? 0), new Decimal(0));
+      // 建玉が残っている銘柄（銘柄 × 信用の種類）は比べない: 時刻が無いとその日の約定が 1 つの OPEN ラウンドにまとまり、
+      // 途中までの損益の切り方が時刻付きと変わる（11-11 の ERTH・HENNGE の買い建てが持ち越しで発覚）。決済し切った銘柄は一致するはず
+      const key = (r: { instrumentId: number; marginType: string | null }) => `${r.instrumentId} ${r.marginType}`;
+      const open = new Set([...buildSbiRounds(all), ...buildSbiRounds(timed)].filter((r) => r.status === 'OPEN').map(key));
+      const total = (xs: typeof all) => buildSbiRounds(xs).filter((r) => !open.has(key(r))).reduce((s, r) => s.plus(r.netPnl ?? 0), new Decimal(0));
       const count = (reason: string) => match.unmatchedExecs.filter((u) => u.reason === reason).length;
       console.log(
         `[golden-orders] 約定 ${parsed.fills.length} / 対象の CSV 行 ${match.candidates} / 時刻付き ${match.assignments.length} / ` +
-          `注文履歴に無い ${count('no-fill')} / 見送り ${count('bucket-incomplete')} / 損益合計 ${total(all)} → ${total(timed)}`,
+          `注文履歴に無い ${count('no-fill')} / 見送り ${count('bucket-incomplete')} / 建玉が残る銘柄 ${open.size} / 損益合計 ${total(all)} → ${total(timed)}`,
       );
       expect(total(timed).toString()).toBe(total(all).toString());
     });

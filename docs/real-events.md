@@ -73,6 +73,14 @@ Windows の記録小窓（`apps/panel-win`）が追記し、Mac の `scripts/pul
 | `text` | string | 入力欄の文（voicekey の入力のまま。前後の空白は除く。空なら行を出さない） |
 | `last_order` | object \| null | 保存した時点で最後に見た `board_order` の `{order_key, event, side, price, ts}`。手がかりで、結び付けの正は Mac |
 | `test` | true（任意） | |
+| `symbol` | string（任意） | 銘柄コード。手で書いたメモだけが持つ（下記） |
+| `position` | `LONG` \| `SHORT`（任意） | 建ての向き。`symbol` と組で使う |
+
+### 手で書いたメモ（`data/real/manual-notes.jsonl`、Mac だけ）
+- 小窓を使わなかった日の理由を後から入れる場所。形は `real_note` と同じで、`symbol`・`position` を付ける（`ts` は概算でよい）。
+- `events.jsonl` は Windows から丸ごと上書きされるので別ファイルにする。daily が両方を読む（`--manual-notes` で差し替え可）。
+- 結び付けは銘柄が書いてあれば銘柄を優先し、同じ日（日本時間）・同じ銘柄・同じ向きの建て約定に載せる（`linkMethod` = `symbol_day`）。
+  約定に時刻が無い日でも結び付く。時刻付きの約定が複数あればメモの時刻に最も近いもの。
 
 ## 取り込みと結び付け（web 側）
 - `npm run daily` が毎回 `data/real/events.jsonl` を読み、新しい `id` だけ DB に入れる。

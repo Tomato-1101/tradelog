@@ -1,5 +1,5 @@
 // 日次バッチ: events 取り込み → 不足分の 1m/1d 足取得（取りこぼし日も遡って補う）→ 約定確定 → Round 再構築（MAE/MFE）→ AI 書き出し。
-// 使い方: npm run daily -- [--events <path>] [--replay-events <path>] [--real-events <path>] [--out <dir>] [--no-fetch] [--no-llm]
+// 使い方: npm run daily -- [--events <path>] [--replay-events <path>] [--real-events <path>] [--manual-notes <path>] [--out <dir>] [--no-fetch] [--no-llm]
 // 本番エントリー記録（Windows の記録小窓）は --real-events（既定は data/real/events.jsonl）。取り込んで SBI の建て約定に結び付ける。
 // 同じファイルの v2（板の注文 board_order・理由のメモ real_note）も取り込んで結び付け、長い理由の文は Groq で要約する（--no-llm で飛ばす）。
 // リプレイ（録画を再生しながらの練習）は --replay-events（既定は --events と同じフォルダの replay/events.jsonl）。
@@ -68,7 +68,10 @@ async function main() {
 
   // 1c. 本番エントリー記録（ファイルが無ければ何もしない）。結び付けは SBI の約定時刻が後から付くので毎回全件やり直す
   const realPath = path.resolve(arg('--real-events') ?? path.join(ROOT, 'data/real/events.jsonl'));
-  const reing = await ingestRealMemos(prisma, fs.existsSync(realPath) ? fs.readFileSync(realPath, 'utf-8') : '');
+  // 手で書いた理由のメモ（Mac だけにある。events.jsonl は Windows から丸ごと上書きされるので別ファイル）も同じ形で読む
+  const manualPath = path.resolve(arg('--manual-notes') ?? path.join(ROOT, 'data/real/manual-notes.jsonl'));
+  const readOr = (p: string) => (fs.existsSync(p) ? fs.readFileSync(p, 'utf-8') : '');
+  const reing = await ingestRealMemos(prisma, `${readOr(realPath)}\n${readOr(manualPath)}`);
   const relink = await linkRealMemos(prisma);
   console.log(
     `[real] ${realPath}: ${reing.lines} 行 / 新規 ${reing.newMemos} / test 除外 ${reing.test} / 書きかけ ${reing.partial} / 契約違反 ${reing.errors.length}` +

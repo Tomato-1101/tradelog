@@ -56,7 +56,28 @@ export function assignFills(orders: FillOrder[], execs: FillCandidate[], windowS
   return out;
 }
 
-export type NoteLink = { executionId: string; method: 'order' | 'time'; deltaMs: number };
+export type NoteLink = { executionId: string; method: 'order' | 'time' | 'symbol_day'; deltaMs: number };
+
+export type DayCandidate = { id: string; executedAt: Date; timePrecision: string; seq: number; symbol: string; side: string; marginType: string | null };
+
+// 日付だけの約定は executedAt がその日の 00:00Z（日付そのもの）。時刻付きは実時刻なので日本時間に直して日付を取る
+const jstDay = (d: Date) => new Date(d.getTime() + 9 * 3600_000).toISOString().slice(0, 10);
+const execDay = (e: { executedAt: Date; timePrecision: string }) => (e.timePrecision === 'ms' ? jstDay(e.executedAt) : e.executedAt.toISOString().slice(0, 10));
+
+/**
+ * 銘柄と向きを持つメモ（手で書いたメモ）を、同じ日（日本時間）・同じ銘柄・同じ向きの建て約定に載せる（純粋関数）。
+ * 時刻で結び付けられない時の手がかり。LONG = 現物買い・信用新規買い、SHORT = 信用新規売り。
+ * 候補が複数なら、時刻付きはメモの時刻に最も近いもの、日付だけのものは行順 → id の早いもの（日付だけの日はどれも同じラウンドに属するので代表 1 件で足りる）
+ */
+export function pickNoteBySymbol(note: { ts: Date; symbol: string; position: 'LONG' | 'SHORT' }, execs: DayCandidate[]): NoteLink | null {
+  const day = jstDay(note.ts);
+  const hit = execs
+    .filter((e) => e.symbol === note.symbol && execDay(e) === day)
+    .filter((e) => (note.position === 'SHORT' ? e.marginType === 'MARGIN_SHORT' && e.side === 'SELL' : e.marginType !== 'MARGIN_SHORT' && e.side === 'BUY'))
+    .map((e) => ({ e, d: e.timePrecision === 'ms' ? Math.abs(e.executedAt.getTime() - note.ts.getTime()) : Number.MAX_SAFE_INTEGER }))
+    .sort((a, b) => a.d - b.d || a.e.seq - b.e.seq || (a.e.id < b.e.id ? -1 : a.e.id > b.e.id ? 1 : 0))[0]?.e;
+  return hit ? { executionId: hit.id, method: 'symbol_day', deltaMs: hit.executedAt.getTime() - note.ts.getTime() } : null;
+}
 
 /**
  * 理由のメモ 1 件を載せる約定（純粋関数）。
@@ -147,7 +168,7 @@ export async function linkBoardOrders(db: PrismaClient, windowSec = FILL_WINDOW_
 
 /** 理由のメモを全件付け直す（linkBoardOrders の後に呼ぶ） */
 export async function linkRealNotes(db: PrismaClient, windowSec = NOTE_WINDOW_SEC): Promise<{ notes: number; linked: number; byOrder: number; changed: number }> {
-  const notes = await db.realNote.findMany({ select: { id: true, ts: true, lastOrderKey: true, executionId: true, linkMethod: true, linkDeltaMs: true } });
+  const notes = await db.realNote.findMany({ select: { id: true, ts: true, lastOrderKey: true, executionId: true, linkMethod: true, linkDeltaMs: true, rawJson: true } });
   if (notes.length === 0) return { notes: 0, linked: 0, byOrder: 0, changed: 0 };
   // order_key → 結び付いた約定（同じ order_key に filled が複数あれば早い方）
   const orderExec = new Map<string, { id: string; executedAt: Date }>();
@@ -164,11 +185,28 @@ export async function linkRealNotes(db: PrismaClient, windowSec = NOTE_WINDOW_SE
       select: { id: true, executedAt: true, side: true, marginType: true },
     })
   ).filter(isOpeningSide);
+  // 手で書いたメモの銘柄と向き（rawJson にだけある）。その日の SBI 約定を時刻の有無に関係なく候補にする
+  const hint = new Map<string, { symbol: string; position: 'LONG' | 'SHORT' }>();
+  for (const n of notes) {
+    const r = JSON.parse(n.rawJson) as { symbol?: unknown; position?: unknown };
+    if (typeof r.symbol === 'string' && (r.position === 'LONG' || r.position === 'SHORT')) hint.set(n.id, { symbol: r.symbol, position: r.position });
+  }
+  const hinted = notes.filter((n) => hint.has(n.id));
+  const dayExecs: DayCandidate[] = hinted.length
+    ? (
+        await db.execution.findMany({
+          where: { source: 'SBI', instrument: { symbol: { in: [...new Set([...hint.values()].map((h) => h.symbol))] } }, executedAt: timeRange(hinted.map((n) => n.ts.getTime()), 86_400) },
+          select: { id: true, executedAt: true, timePrecision: true, seq: true, side: true, marginType: true, instrument: { select: { symbol: true } } },
+        })
+      ).map((e) => ({ ...e, symbol: e.instrument.symbol }))
+    : [];
   let linked = 0;
   let byOrder = 0;
   let changed = 0;
   for (const n of notes) {
-    const l = pickNoteExecution(n, orderExec, opening, windowSec);
+    const h = hint.get(n.id);
+    // 銘柄が書いてあるメモは銘柄を優先（時刻だけだと 5 分以内の別銘柄と取り違える）
+    const l = (h ? pickNoteBySymbol({ ts: n.ts, ...h }, dayExecs) : null) ?? pickNoteExecution(n, orderExec, opening, windowSec);
     if (l) linked++;
     if (l?.method === 'order') byOrder++;
     const data = { executionId: l?.executionId ?? null, linkMethod: l?.method ?? null, linkDeltaMs: l?.deltaMs ?? null };

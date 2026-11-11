@@ -33,6 +33,29 @@ if ! ensure_migrated; then
 fi
 
 log "開始（node $(node -v)）"
+
+# ダウンロードに落とした SBI の約定 CSV（SaveFile_*.csv）を data/raw/sbi へ写して取り込む。
+# 中身が同じ CSV は取り込み済みとして飛ばす（原本は上書きしない）。取り込みに失敗しても daily は続ける
+pick_sbi_csv() {
+  local dl="${TRADELOG_DOWNLOADS:-$HOME/Downloads}" raw="$ROOT/data/raw/sbi" f h dest have
+  local new=()
+  mkdir -p "$raw"
+  have="$(shasum -a 256 "$raw"/*.csv 2>/dev/null | cut -d' ' -f1)"
+  for f in "$dl"/SaveFile_*.csv; do
+    [ -f "$f" ] || continue
+    h="$(shasum -a 256 "$f" | cut -d' ' -f1)" || continue
+    grep -qx "$h" <<<"$have" && continue
+    dest="$raw/SaveFile_$(date -r "$f" '+%Y%m%d_%H%M%S')_$(basename "$f" .csv | sed 's/^SaveFile_//').csv"
+    [ -e "$dest" ] && continue
+    cp -n "$f" "$dest" || continue
+    new+=("$dest")
+    have+=$'\n'"$h"
+  done
+  if [ ${#new[@]} -eq 0 ]; then log "ダウンロードに新しい SBI の CSV なし"; return 0; fi
+  log "SBI の CSV を拾った: ${new[*]##*/}"
+  node_modules/.bin/tsx scripts/import-sbi.ts "${new[@]}" || log "SBI の CSV の取り込みに失敗（daily は続ける）"
+}
+pick_sbi_csv
 mark="$(mktemp)"
 touch -A -01 "$mark" # 同じ秒に書かれた状態ファイルも「新しい」と判定できるよう 1 秒戻す
 node_modules/.bin/tsx scripts/daily.ts

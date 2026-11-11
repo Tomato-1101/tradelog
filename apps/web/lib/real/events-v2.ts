@@ -25,6 +25,9 @@ export type RealNoteEvent = {
   ts: Date;
   text: string;
   lastOrder: (Record<string, unknown> & { order_key: string }) | null;
+  // 手で書いたメモ（data/real/manual-notes.jsonl）だけが持つ。約定に時刻が無い日でも、同じ日・同じ銘柄・同じ向きの建て約定に結び付ける
+  symbol: string | null;
+  position: 'LONG' | 'SHORT' | null;
   raw: string;
 };
 
@@ -75,9 +78,21 @@ export function parseV2Event(e: Record<string, unknown>, raw: string): V2Parsed 
         return 'last_order が order_key を持つオブジェクトか null でない';
       }
     }
+    if (!strOrNull(e.symbol)) return 'symbol が文字列か null でない';
+    if (e.position !== undefined && e.position !== null && e.position !== 'LONG' && e.position !== 'SHORT') {
+      return `position が LONG / SHORT でない（${JSON.stringify(e.position)}）`;
+    }
     return {
       kind: 'real_note',
-      event: { id, ts: new Date(e.ts), text: e.text.trim(), lastOrder: (lo as RealNoteEvent['lastOrder']) ?? null, raw },
+      event: {
+        id,
+        ts: new Date(e.ts),
+        text: e.text.trim(),
+        lastOrder: (lo as RealNoteEvent['lastOrder']) ?? null,
+        symbol: (e.symbol as string | null | undefined) ?? null,
+        position: (e.position as RealNoteEvent['position'] | undefined) ?? null,
+        raw,
+      },
     };
   }
   return `type が board_order / real_note でない（${JSON.stringify(e.type)}）`;

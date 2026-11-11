@@ -1,7 +1,7 @@
 // 本番の注文記録 v2（board_order / real_note）のパースと、結び付け・要約の対象選びの規則（純粋関数）。DB を通す確認は board-flow.test.ts
 import { describe, expect, it } from 'vitest';
 import { parseRealEvents } from '@/lib/real/memos';
-import { FILL_WINDOW_SEC, NOTE_WINDOW_SEC, assignFills, pickNoteExecution, type FillCandidate, type FillOrder } from '@/lib/real/board';
+import { FILL_WINDOW_SEC, NOTE_WINDOW_SEC, assignFills, pickNoteBySymbol, pickNoteExecution, type DayCandidate, type FillCandidate, type FillOrder } from '@/lib/real/board';
 import { SUMMARY_MIN_CHARS, pickNotesToSummarize } from '@/lib/real/summarize';
 
 const order = (o: Record<string, unknown> = {}) =>
@@ -138,6 +138,50 @@ describe('pickNoteExecution', () => {
     expect(pickNoteExecution({ ts, lastOrderKey: null }, orderExec, [at('edge', -NOTE_WINDOW_SEC)])).toMatchObject({ executionId: 'edge', method: 'time' });
     expect(pickNoteExecution({ ts, lastOrderKey: null }, orderExec, [at('far', NOTE_WINDOW_SEC + 1)])).toBeNull();
     expect(pickNoteExecution({ ts, lastOrderKey: 'k1' }, new Map(), [])).toBeNull();
+  });
+});
+
+describe('手で書いたメモ（symbol・position）', () => {
+  it('symbol・position を読む。無ければ null、position が LONG / SHORT 以外なら契約違反', () => {
+    const r = parseRealEvents([note({ id: 'm1', symbol: '6525', position: 'SHORT' }), note({ id: 'm2' }), note({ id: 'm3', symbol: '6525', position: 'BUY' })].join('\n'));
+    expect(r.notes.map((n) => [n.id, n.symbol, n.position])).toEqual([
+      ['m1', '6525', 'SHORT'],
+      ['m2', null, null],
+    ]);
+    expect(r.errors.map((e) => e.id)).toEqual(['m3']);
+  });
+
+  const day = (id: string, o: Partial<DayCandidate> = {}): DayCandidate => ({
+    id,
+    executedAt: new Date('2026-11-11T00:00:00.000Z'),
+    timePrecision: 'day',
+    seq: 0,
+    symbol: '6525',
+    side: 'BUY',
+    marginType: 'MARGIN_LONG',
+    ...o,
+  });
+  const ts = new Date('2026-11-11T09:24:00.000+09:00');
+
+  it('同じ日・同じ銘柄・同じ向きの建て約定。日付だけなら行順の早いもの', () => {
+    const execs = [
+      day('close', { side: 'SELL', seq: 1 }), // 買い建ての返済
+      day('short', { side: 'SELL', marginType: 'MARGIN_SHORT', seq: 2 }),
+      day('long-b', { seq: 9 }),
+      day('long-a', { seq: 5 }),
+      day('other', { symbol: '9984', seq: 0 }),
+      day('yesterday', { executedAt: new Date('2026-11-10T00:00:00.000Z'), seq: 0 }),
+    ];
+    expect(pickNoteBySymbol({ ts, symbol: '6525', position: 'LONG' }, execs)).toMatchObject({ executionId: 'long-a', method: 'symbol_day' });
+    expect(pickNoteBySymbol({ ts, symbol: '6525', position: 'SHORT' }, execs)).toMatchObject({ executionId: 'short' });
+    expect(pickNoteBySymbol({ ts, symbol: '4062', position: 'LONG' }, execs)).toBeNull();
+  });
+
+  it('時刻付きの約定はメモの時刻に最も近いもの。日本時間の日付で比べる', () => {
+    const at = (id: string, iso: string) => day(id, { timePrecision: 'ms', executedAt: new Date(iso) });
+    const execs = [at('early', '2026-11-11T00:01:00.000Z'), at('near', '2026-11-11T00:25:00.000Z'), at('prev-day', '2026-11-10T14:59:00.000Z')];
+    expect(pickNoteBySymbol({ ts, symbol: '6525', position: 'LONG' }, execs)).toMatchObject({ executionId: 'near', deltaMs: 60_000 });
+    expect(pickNoteBySymbol({ ts, symbol: '6525', position: 'LONG' }, [execs[2]])).toBeNull();
   });
 });
 
