@@ -24,10 +24,11 @@
 - 10-06 本人決定: **朝の自動録画はやめる**（本人が自分で起きて取引する）。launchd record は停止・削除済み、install.sh は RECORD=1 の時だけ入れる。
   理由: HYPER SBI 2 は毎日 6:30 頃のメンテで切断、再ログインはスマホの FIDO 認証が必須で無人では録れない。録画・リプレイ機能のコードは残す（手動の「今すぐ録画」は使える）。
 
-## 本番の癖分析・Windows 記録小窓（11-10 18:55 更新）
-- 目的: SBI 本番のエントリー時刻（秒）と 1 分足・記録ボタンの画像から「どんな形で入る癖があるか」を分析する。本人はデイトレを Windows で行う。
-- 現状: main に fa61eae まで取り込み済み（未 push）。常駐 web 再ビルド済み。SBI 注文履歴（詳細）を Chrome から収集 → data/raw/sbi-orders/part1・part2.json（10/16〜11/09）→ `npm run import:sbi-orders` で 564 件中 539 件に時刻。
-  1 分足 104 銘柄日取得済み、MAE/MFE 241 本。損益合計 -741715.5 不変。Windows（SSH 鍵 ~/.config/tradelog/ssh/win_ed25519、宛先は ~/.config/tradelog/win.conf）に apps/panel-win を配置、ログオン時起動タスク tradelog-panel。
-  Mac は launchd com.tomato.tradelog.pullwin が平日 8:30〜18:00 に 10 分おき回収 → data/real/ → daily が RealMemo に取り込み建て約定に結び付け。
-- 次: (1) HYPER SBI 2 窓の撮影経路が未確認。初の本物の記録の shots[].method（print/screen）と画像を見る。(2) 注文履歴は約 3 か月・セッション 2.5〜4 時間で切れる。定期的に Chrome で収集して import:sbi-orders（収集 JS は本セッションの記録にしかないので、要ならスクリプト化）。
-  (3) Yahoo 1 分足は 9:05 以降しか無く寄り 5 分の取引は形を測れない。
+## 本番の癖分析・Windows 記録小窓（11-11 11:05 更新）
+- 目的: SBI 本番の注文・約定の瞬間の板と、本人が声で入れた理由から「どんな形で入る癖があるか」を分析する。本人はデイトレを Windows（HYPER SBI 2）で行う。
+- 現状: 小窓 v2（apps/panel-win）は全板の売注・買注のマスを 1 秒約 30 回見て、注文・約定・取消を数字だけ events.jsonl に残す（契約 docs/real-events.md、画像は撮らない）。
+  2026-11-11 の実注文 4 件で 注文・取消・約定 の検出と値段・株数の OCR は正しいと本人確認済み。Windows に配備済み・自己テスト ALL OK（`scripts/win-panel.sh selftest`）。CPU は PC 全体の約 2.5%、場の外は 1 秒 1 回。
+  Mac: daily の [real v2] が取り込み → filled を前後 15 秒の SBI 約定に結び付け → 理由メモを結び付け → [llm] で Groq（openai/gpt-oss-120b、無料枠、実呼び出し 1 回で動作確認）が 80 字超の理由を要約 → trades.jsonl の board_orders / notes。本番 DB に migration real_v2 適用済み（損益 -741715.5・1632 ラウンド不変）。
+- 次: (1) 次の取引日に本人と実地確認: 訂正・空のマスへのマウスオーバー・スクロール・銘柄切り替え・理由の音声入力（Win+H 中に Deactivate で途中保存されないか）。
+  (2) 起動直後に小窓が 2 回「終了」した（11-11 10:58、原因不明。本人が閉じた可能性）。閉じる理由を panel.log に出すようにしたので再発したら reason を見る。
+  (3) 理由メモの時刻での結び付けは銘柄を見ていない（5 分以内に別銘柄を建てると取り違える）。(4) 注文履歴は約 3 か月で切れるので定期的に Chrome で収集して import:sbi-orders。(5) probe3/probe4 の Windows タスクとフォルダは片付け済み。

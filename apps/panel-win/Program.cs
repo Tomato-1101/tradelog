@@ -8,14 +8,16 @@ namespace TradelogPanel;
 static class Program
 {
     [STAThread]
-    static void Main()
+    static int Main(string[] args)
     {
+        // 配備のたびに SSH から回す自己テスト（窓は出さない。結果は logs\selftest.txt と終了コード）
+        if (args.Length > 0 && args[0] == "--selftest") return SelfTest.Run(args.Skip(1).ToArray());
         // ログオン時のタスクと schtasks /run が重なっても窓は 1 つだけにする
         using var mutex = new Mutex(true, @"Local\tradelog-panel-win", out bool created);
         if (!created)
         {
             Log.Write("既に起動しているので終了する");
-            return;
+            return 0;
         }
         ApplicationConfiguration.Initialize();
         Application.ThreadException += (_, e) => Log.Write("UI スレッドの例外: " + e.Exception);
@@ -28,6 +30,7 @@ static class Program
         Log.Write($"起動 pid={self.Id} session={self.SessionId} data={Paths.Data}");
         Application.Run(new PanelForm(settings, warn));
         Log.Write("終了");
+        return 0;
     }
 }
 
@@ -66,7 +69,6 @@ static class Log
 
 sealed class Settings
 {
-    public List<string> Tags { get; set; } = ["ブレイク", "押し目", "反発", "逆張り", "ニュース"];
     // "Ctrl+Shift+M" の形。空文字か null で無効
     public string? Hotkey { get; set; } = "Ctrl+Shift+M";
 
@@ -92,7 +94,6 @@ sealed class Settings
                 return (s, null);
             }
             var loaded = JsonSerializer.Deserialize<Settings>(File.ReadAllText(Paths.Settings), Options) ?? new Settings();
-            loaded.Tags = (loaded.Tags ?? []).Where(t => !string.IsNullOrWhiteSpace(t)).Select(t => t.Trim()).ToList();
             return (loaded, null);
         }
         catch (Exception e)
@@ -106,10 +107,7 @@ sealed class Settings
 static class Native
 {
     public const int WM_HOTKEY = 0x0312;
-    public const int WS_EX_NOACTIVATE = 0x08000000;
     public const uint PW_RENDERFULLCONTENT = 0x2;
-    public const int DWMWA_EXTENDED_FRAME_BOUNDS = 9;
-    public const int DWMWA_CLOAKED = 14;
 
     [StructLayout(LayoutKind.Sequential)]
     public struct RECT { public int Left, Top, Right, Bottom; }
@@ -127,8 +125,8 @@ static class Native
     [DllImport("user32.dll")] public static extern bool PrintWindow(IntPtr hWnd, IntPtr hdc, uint flags);
     [DllImport("user32.dll")] public static extern bool RegisterHotKey(IntPtr hWnd, int id, uint mods, uint vk);
     [DllImport("user32.dll")] public static extern bool UnregisterHotKey(IntPtr hWnd, int id);
-    [DllImport("dwmapi.dll")] public static extern int DwmGetWindowAttribute(IntPtr hWnd, int attr, out RECT value, int size);
-    [DllImport("dwmapi.dll")] public static extern int DwmGetWindowAttribute(IntPtr hWnd, int attr, out int value, int size);
+    [DllImport("user32.dll")] public static extern bool IsWindow(IntPtr hWnd);
+    [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr hWnd);
 
     public static string TitleOf(IntPtr hWnd)
     {

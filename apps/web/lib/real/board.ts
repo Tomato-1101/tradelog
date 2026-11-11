@@ -1,0 +1,181 @@
+// 本番の注文記録 v2（board_order / real_note。契約は docs/real-events.md）の取り込みと、SBI の約定への結び付け。
+// - 取り込みは id で冪等。行の読み取り（test・書きかけ・契約違反の除外）は parseRealEvents（lib/real/memos.ts）。
+// - 結び付けは daily のたびに全件やり直す（SBI の約定時刻は後から注文履歴で付くため）。
+//   filled の注文 → assignFills、理由のメモ → pickNoteExecution。同じ order_key の他の行は filled が結び付いた約定に間接的に属する。
+
+import Decimal from 'decimal.js';
+import type { PrismaClient } from '@/generated/prisma/client';
+import { isOpeningSide } from '@/lib/rounds/builder';
+import { pickEntryExecution, type RealParseResult } from '@/lib/real/memos';
+
+/** filled の時刻とこの秒数以内の約定だけを候補にする（全板で数字が消えた瞬間と SBI の約定時刻は秒単位でずれる） */
+export const FILL_WINDOW_SEC = 15;
+/** 注文に結び付かない理由のメモは、前後この秒数以内の建て約定に載せる */
+export const NOTE_WINDOW_SEC = 300;
+
+export type FillOrder = { id: string; ts: Date; side: 'BUY' | 'SELL'; price: string | null; symbol: string | null };
+export type FillCandidate = { id: string; executedAt: Date; side: 'BUY' | 'SELL'; price: string | null; symbol: string };
+export type FillLink = { executionId: string; deltaMs: number };
+
+const samePrice = (a: string, b: string) => new Decimal(a).eq(new Decimal(b));
+
+/**
+ * filled の注文と SBI の時刻付き約定の組を決める（純粋関数）。
+ * 候補: 同じ売買方向・同じ値段・（注文の symbol が null でなければ）同じ銘柄で、時刻差の絶対値が windowSec 秒以内。値段が読めなかった注文は結び付けない。
+ * 組み方: 全候補の組を「時刻差の小さい順 → 約定の早い順 → 約定 id の小さい順 → 注文の早い順 → 注文 id の小さい順」に並べ、
+ * 注文も約定もまだ使っていない組から採る。1 つの約定に複数の注文が当たったら差の小さい方だけが取り、負けた注文は残りの候補から選び直す。
+ */
+export function assignFills(orders: FillOrder[], execs: FillCandidate[], windowSec = FILL_WINDOW_SEC): Map<string, FillLink> {
+  const pairs: Array<{ o: FillOrder; e: FillCandidate; d: number }> = [];
+  for (const o of orders) {
+    if (o.price === null) continue;
+    for (const e of execs) {
+      if (e.side !== o.side || e.price === null || !samePrice(e.price, o.price)) continue;
+      if (o.symbol !== null && o.symbol !== e.symbol) continue;
+      const d = Math.abs(e.executedAt.getTime() - o.ts.getTime());
+      if (d > windowSec * 1000) continue;
+      pairs.push({ o, e, d });
+    }
+  }
+  const cmp = (a: number | string, b: number | string) => (a < b ? -1 : a > b ? 1 : 0);
+  pairs.sort(
+    (a, b) =>
+      a.d - b.d ||
+      a.e.executedAt.getTime() - b.e.executedAt.getTime() ||
+      cmp(a.e.id, b.e.id) ||
+      a.o.ts.getTime() - b.o.ts.getTime() ||
+      cmp(a.o.id, b.o.id),
+  );
+  const out = new Map<string, FillLink>();
+  const usedExec = new Set<string>();
+  for (const p of pairs) {
+    if (out.has(p.o.id) || usedExec.has(p.e.id)) continue;
+    out.set(p.o.id, { executionId: p.e.id, deltaMs: p.e.executedAt.getTime() - p.o.ts.getTime() });
+    usedExec.add(p.e.id);
+  }
+  return out;
+}
+
+export type NoteLink = { executionId: string; method: 'order' | 'time'; deltaMs: number };
+
+/**
+ * 理由のメモ 1 件を載せる約定（純粋関数）。
+ * 1. last_order.order_key の注文が約定に結び付いていればその約定（orderExec: order_key → 約定）
+ * 2. 無ければメモの時刻の前後 windowSec 秒以内で最も近い建て約定（openingExecs は呼び出し側で SBI・時刻付き・建て側に絞る。同点は pickEntryExecution の規則）
+ */
+export function pickNoteExecution(
+  note: { ts: Date; lastOrderKey: string | null },
+  orderExec: Map<string, { id: string; executedAt: Date }>,
+  openingExecs: Array<{ id: string; executedAt: Date }>,
+  windowSec = NOTE_WINDOW_SEC,
+): NoteLink | null {
+  const byOrder = note.lastOrderKey ? orderExec.get(note.lastOrderKey) : undefined;
+  if (byOrder) return { executionId: byOrder.id, method: 'order', deltaMs: byOrder.executedAt.getTime() - note.ts.getTime() };
+  const hit = pickEntryExecution(note.ts, openingExecs, windowSec);
+  return hit ? { executionId: hit.id, method: 'time', deltaMs: hit.executedAt.getTime() - note.ts.getTime() } : null;
+}
+
+/** 新しい v2 の行だけを DB に入れる（取り込み済みの id は触らない） */
+export async function ingestRealV2(db: PrismaClient, parsed: Pick<RealParseResult, 'boardOrders' | 'notes'>): Promise<{ newBoardOrders: number; newNotes: number }> {
+  const haveO = new Set((await db.boardOrder.findMany({ select: { id: true } })).map((x) => x.id));
+  const freshO = parsed.boardOrders.filter((x, i, xs) => !haveO.has(x.id) && xs.findIndex((y) => y.id === x.id) === i);
+  for (const o of freshO) {
+    await db.boardOrder.create({
+      data: {
+        id: o.id,
+        ts: o.ts,
+        orderKey: o.orderKey,
+        event: o.event,
+        side: o.side,
+        price: o.price === null ? null : String(o.price),
+        qty: o.qty === null ? null : Math.round(o.qty),
+        pendingMs: o.pendingMs === null ? null : Math.round(o.pendingMs),
+        symbol: o.symbol,
+        symbolName: o.symbolName,
+        boardJson: JSON.stringify(o.board),
+        rawJson: o.raw,
+      },
+    });
+  }
+  const haveN = new Set((await db.realNote.findMany({ select: { id: true } })).map((x) => x.id));
+  const freshN = parsed.notes.filter((x, i, xs) => !haveN.has(x.id) && xs.findIndex((y) => y.id === x.id) === i);
+  for (const n of freshN) {
+    await db.realNote.create({
+      data: {
+        id: n.id,
+        ts: n.ts,
+        text: n.text,
+        lastOrderKey: n.lastOrder?.order_key ?? null,
+        lastOrderJson: n.lastOrder ? JSON.stringify(n.lastOrder) : null,
+        rawJson: n.raw,
+      },
+    });
+  }
+  return { newBoardOrders: freshO.length, newNotes: freshN.length };
+}
+
+const timeRange = (times: number[], windowSec: number) => ({
+  gte: new Date(Math.min(...times) - windowSec * 1000),
+  lte: new Date(Math.max(...times) + windowSec * 1000),
+});
+
+/** filled の注文を全件付け直す。filled 以外の行に結び付きが残っていれば外す */
+export async function linkBoardOrders(db: PrismaClient, windowSec = FILL_WINDOW_SEC): Promise<{ filled: number; linked: number; changed: number }> {
+  const rows = await db.boardOrder.findMany({ select: { id: true, ts: true, event: true, side: true, price: true, symbol: true, executionId: true, linkDeltaMs: true } });
+  const fills = rows.filter((r) => r.event === 'filled');
+  const execs = fills.length
+    ? (
+        await db.execution.findMany({
+          where: { source: 'SBI', timePrecision: 'ms', executedAt: timeRange(fills.map((f) => f.ts.getTime()), windowSec) },
+          select: { id: true, executedAt: true, side: true, price: true, instrument: { select: { symbol: true } } },
+        })
+      ).map((e) => ({ id: e.id, executedAt: e.executedAt, side: e.side, price: e.price, symbol: e.instrument.symbol }))
+    : [];
+  const links = assignFills(fills, execs, windowSec);
+  let changed = 0;
+  for (const r of rows) {
+    const l = r.event === 'filled' ? links.get(r.id) : undefined;
+    const executionId = l?.executionId ?? null;
+    const linkDeltaMs = l?.deltaMs ?? null;
+    if (executionId !== r.executionId || linkDeltaMs !== r.linkDeltaMs) {
+      await db.boardOrder.update({ where: { id: r.id }, data: { executionId, linkDeltaMs } });
+      changed++;
+    }
+  }
+  return { filled: fills.length, linked: links.size, changed };
+}
+
+/** 理由のメモを全件付け直す（linkBoardOrders の後に呼ぶ） */
+export async function linkRealNotes(db: PrismaClient, windowSec = NOTE_WINDOW_SEC): Promise<{ notes: number; linked: number; byOrder: number; changed: number }> {
+  const notes = await db.realNote.findMany({ select: { id: true, ts: true, lastOrderKey: true, executionId: true, linkMethod: true, linkDeltaMs: true } });
+  if (notes.length === 0) return { notes: 0, linked: 0, byOrder: 0, changed: 0 };
+  // order_key → 結び付いた約定（同じ order_key に filled が複数あれば早い方）
+  const orderExec = new Map<string, { id: string; executedAt: Date }>();
+  for (const o of await db.boardOrder.findMany({
+    where: { event: 'filled', executionId: { not: null } },
+    select: { orderKey: true, execution: { select: { id: true, executedAt: true } } },
+    orderBy: [{ ts: 'asc' }, { id: 'asc' }],
+  })) {
+    if (o.execution && !orderExec.has(o.orderKey)) orderExec.set(o.orderKey, o.execution);
+  }
+  const opening = (
+    await db.execution.findMany({
+      where: { source: 'SBI', timePrecision: 'ms', executedAt: timeRange(notes.map((n) => n.ts.getTime()), windowSec) },
+      select: { id: true, executedAt: true, side: true, marginType: true },
+    })
+  ).filter(isOpeningSide);
+  let linked = 0;
+  let byOrder = 0;
+  let changed = 0;
+  for (const n of notes) {
+    const l = pickNoteExecution(n, orderExec, opening, windowSec);
+    if (l) linked++;
+    if (l?.method === 'order') byOrder++;
+    const data = { executionId: l?.executionId ?? null, linkMethod: l?.method ?? null, linkDeltaMs: l?.deltaMs ?? null };
+    if (data.executionId !== n.executionId || data.linkMethod !== n.linkMethod || data.linkDeltaMs !== n.linkDeltaMs) {
+      await db.realNote.update({ where: { id: n.id }, data });
+      changed++;
+    }
+  }
+  return { notes: notes.length, linked, byOrder, changed };
+}

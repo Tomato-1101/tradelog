@@ -1,6 +1,7 @@
 // 日次バッチ: events 取り込み → 不足分の 1m/1d 足取得（取りこぼし日も遡って補う）→ 約定確定 → Round 再構築（MAE/MFE）→ AI 書き出し。
-// 使い方: npm run daily -- [--events <path>] [--replay-events <path>] [--real-events <path>] [--out <dir>] [--no-fetch]
+// 使い方: npm run daily -- [--events <path>] [--replay-events <path>] [--real-events <path>] [--out <dir>] [--no-fetch] [--no-llm]
 // 本番エントリー記録（Windows の記録小窓）は --real-events（既定は data/real/events.jsonl）。取り込んで SBI の建て約定に結び付ける。
+// 同じファイルの v2（板の注文 board_order・理由のメモ real_note）も取り込んで結び付け、長い理由の文は Groq で要約する（--no-llm で飛ばす）。
 // リプレイ（録画を再生しながらの練習）は --replay-events（既定は --events と同じフォルダの replay/events.jsonl）。
 // 検証用に DATABASE_URL で別の DB に向けられる（lib/db.ts / prisma.config.ts）。
 
@@ -14,6 +15,8 @@ import { recordedSymbolDays, replayEndResolver } from '@/lib/paper/recordings';
 import { rebuildRounds } from '@/lib/rounds/rebuild';
 import { exportForAi } from '@/lib/ai/export';
 import { ingestRealMemos, linkRealMemos } from '@/lib/real/memos';
+import { ingestRealV2, linkBoardOrders, linkRealNotes } from '@/lib/real/board';
+import { groqSummarizer, readGroqKey, summarizeNotes } from '@/lib/real/summarize';
 
 const ROOT = path.resolve(__dirname, '../../..');
 
@@ -31,6 +34,7 @@ async function main() {
   const eventsPath = path.resolve(arg('--events') ?? path.join(ROOT, 'data/paper/events.jsonl'));
   const outDir = path.resolve(arg('--out') ?? path.join(ROOT, 'data/ai'));
   const noFetch = process.argv.includes('--no-fetch');
+  const noLlm = process.argv.includes('--no-llm');
   // リプレイの events は data/paper/replay/events.jsonl。shot.path / ocr_path はリプレイでも data/paper/ からの相対
   const replayPath = path.resolve(arg('--replay-events') ?? path.join(path.dirname(eventsPath), 'replay', 'events.jsonl'));
   // 録画のメタ（data/paper/replay/recordings/）。未決済のリプレイの評価の終わりと、録画した日の銘柄の 1 分足に使う
@@ -72,6 +76,14 @@ async function main() {
   );
   for (const e of reing.errors) console.log(`  [契約違反] ${e.line} 行目${e.id ? `（${e.id}）` : ''}: ${e.message}`);
   counts.eventErrors += reing.errors.length;
+  // v2 は同じファイルの読み取り結果を使う（契約違反は上の件数に入っている）
+  const v2 = await ingestRealV2(prisma, reing);
+  const bl = await linkBoardOrders(prisma);
+  const nl = await linkRealNotes(prisma);
+  console.log(
+    `[real v2] 板の注文 ${reing.boardOrders.length} 行（新規 ${v2.newBoardOrders}）/ 約定 filled ${bl.filled} 件のうち SBI 約定に結び付いた ${bl.linked}（付け直し ${bl.changed}）` +
+      ` / 理由のメモ ${nl.notes} 件（新規 ${v2.newNotes}）のうち結び付いた ${nl.linked}（注文経由 ${nl.byOrder}、付け直し ${nl.changed}）`,
+  );
 
   // 2. 足（1 回目の約定確定・再構築の前に、建玉の日付が分かっている分を取る。未決済の延長は 2 周目で拾う）
   if (!noFetch) {
@@ -109,6 +121,18 @@ async function main() {
   const rb = await rebuildRounds(prisma, now, { replayEnd });
   console.log(`[rounds] ${rb.rounds}（PAPER ${rb.paper} / REPLAY ${rb.replay} / SBI ${rb.sbi}）/ 削除 ${rb.deleted} / 警告 ${rb.warnings.length}`);
   for (const w of rb.warnings) console.log(`  [警告] ${w}`);
+
+  // 4b. 理由のメモの要約（長い文だけ。書き出しに載せるので書き出しの前）。鍵が無い・失敗は警告 1 行で続ける
+  if (noLlm) {
+    console.log('[llm] --no-llm のため要約しない');
+  } else {
+    const sm = await summarizeNotes(prisma, () => {
+      const key = readGroqKey();
+      return key ? groqSummarizer(key) : null;
+    });
+    console.log(`[llm] 要約 対象 ${sm.targets} 件 / 要約した ${sm.summarized}`);
+    if (sm.warning) console.log(`  [警告] ${sm.warning}`);
+  }
 
   // 5. AI 書き出し
   const ex = await exportForAi(prisma, outDir, now, { replayEnd });

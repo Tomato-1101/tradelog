@@ -1,5 +1,6 @@
 // AI 分析用の書き出し。毎回全量を書き直す（追記しない）。
 //  - trades.jsonl: 1 行 1 ラウンド。約定・メモ・前後 30 分の 1 分足・スクショのパス・本番エントリー記録まで、そのラウンドの判断材料を全部入れる。
+//    本番の注文記録 v2（全板の注文 board_orders・理由のメモ notes）も、そのラウンドの約定に結び付いたものを入れる。
 //    リプレイ（source=REPLAY）は録画 ID・セッション ID と、約定・メモごとの再生位置も入れる。
 //  - summary.md: 全体 / 直近 30 日 / PAPER / SBI / REPLAY の統計。
 // 時刻はすべて JST の ISO8601（+09:00）。金額・数量は 10 進数文字列、足の OHLCV は数値。
@@ -15,6 +16,7 @@ import { barWindowTo } from '@/lib/rounds/excursion';
 import { paperDir } from '@/lib/paper/shots';
 import { replayEndResolver, type ReplayEndResolver } from '@/lib/paper/recordings';
 import { LINK_WINDOW_SEC } from '@/lib/real/memos';
+import { FILL_WINDOW_SEC, NOTE_WINDOW_SEC } from '@/lib/real/board';
 
 const JST_MS = 9 * 3600_000;
 export function toJstIso(d: Date): string {
@@ -52,6 +54,41 @@ export async function exportForAi(db: PrismaClient, outDir: string, now: Date, o
   for (const m of await db.realMemo.findMany({ where: { executionId: { not: null } }, orderBy: [{ ts: 'asc' }, { id: 'asc' }] })) {
     realByExec.set(m.executionId!, [...(realByExec.get(m.executionId!) ?? []), m]);
   }
+  // 本番の注文記録 v2: 約定に結び付いた filled と、同じ order_key の他の行（発注の時刻・板を取る）。理由のメモも結び付いたものだけ
+  type BoardRow = Awaited<ReturnType<typeof db.boardOrder.findMany>>[number];
+  const fills = await db.boardOrder.findMany({ where: { event: 'filled', executionId: { not: null } }, orderBy: [{ ts: 'asc' }, { id: 'asc' }] });
+  const byKey = new Map<string, BoardRow[]>();
+  const keys = [...new Set(fills.map((f) => f.orderKey))];
+  for (let i = 0; i < keys.length; i += 500) {
+    for (const o of await db.boardOrder.findMany({ where: { orderKey: { in: keys.slice(i, i + 500) } }, orderBy: [{ ts: 'asc' }, { id: 'asc' }] })) {
+      byKey.set(o.orderKey, [...(byKey.get(o.orderKey) ?? []), o]);
+    }
+  }
+  const fillsByExec = new Map<string, BoardRow[]>();
+  for (const f of fills) fillsByExec.set(f.executionId!, [...(fillsByExec.get(f.executionId!) ?? []), f]);
+  const notesByExec = new Map<string, Array<Awaited<ReturnType<typeof db.realNote.findMany>>[number]>>();
+  for (const n of await db.realNote.findMany({ where: { executionId: { not: null } }, orderBy: [{ ts: 'asc' }, { id: 'asc' }] })) {
+    notesByExec.set(n.executionId!, [...(notesByExec.get(n.executionId!) ?? []), n]);
+  }
+  const boardOrderOut = (f: BoardRow, executedAt: Date) => {
+    const life = byKey.get(f.orderKey) ?? [];
+    // 発注の時刻は placed（白い背景が出た時刻）。白い背景を見ていない注文は appeared
+    const placed = life.find((o) => o.event === 'placed') ?? life.find((o) => o.event === 'appeared') ?? null;
+    return {
+      order_key: f.orderKey,
+      side: f.side,
+      price: f.price,
+      qty: f.qty ?? placed?.qty ?? null,
+      placed_at: iso(placed?.ts ?? null),
+      filled_at: iso(f.ts),
+      execution_at: iso(executedAt),
+      // 全板で発注を見てから数字が消えるまで（どちらも小窓の時計なので SBI の約定時刻とのずれを含まない）
+      placed_to_fill_sec: placed ? (f.ts.getTime() - placed.ts.getTime()) / 1000 : null,
+      pending_ms: placed?.pendingMs ?? null,
+      board_at_placed: placed ? (JSON.parse(placed.boardJson) as unknown[]) : null,
+      board_at_fill: JSON.parse(f.boardJson) as unknown[],
+    };
+  };
 
   const lines: string[] = [];
   let withBars = 0;
@@ -147,6 +184,10 @@ export async function exportForAi(db: PrismaClient, outDir: string, now: Date, o
           capture_error: m.captureError,
         })),
       ),
+      // 本番の注文記録 v2: このラウンドの約定（建て・返済とも）に結び付いた全板の注文
+      board_orders: r.executions.flatMap((e) => (fillsByExec.get(e.id) ?? []).map((f) => boardOrderOut(f, e.executedAt))),
+      // 本番の注文記録 v2: 理由のメモ（summary は長い文だけの LLM 要約。まだ無ければ null）
+      notes: r.executions.flatMap((e) => (notesByExec.get(e.id) ?? []).map((n) => ({ at: iso(n.ts), text: n.text, summary: n.summary }))),
       shots,
       bars_1m: bars,
     };
@@ -177,6 +218,7 @@ export async function exportForAi(db: PrismaClient, outDir: string, now: Date, o
     expired: await db.paperOrder.count({ where: { state: 'EXPIRED' } }),
     realMemos: await db.realMemo.count(),
     realLinked: await db.realMemo.count({ where: { executionId: { not: null } } }),
+    ...(await boardQuality(db)),
   };
   const md = renderSummary(
     [
@@ -237,7 +279,15 @@ function renderSection(title: string, s: Stats): string {
 function renderSummary(
   sections: Array<[string, Stats]>,
   now: Date,
-  q: { needsReview: number; unresolved: number; barErrors: number; barUnavailable: number; expired: number; realMemos: number; realLinked: number },
+  q: {
+    needsReview: number;
+    unresolved: number;
+    barErrors: number;
+    barUnavailable: number;
+    expired: number;
+    realMemos: number;
+    realLinked: number;
+  } & BoardQuality,
 ): string {
   return [
     '# 取引サマリ',
@@ -252,9 +302,43 @@ function renderSummary(
     `- 失効した指値: ${q.expired} 件`,
     `- 足の取得: 失敗 ${q.barErrors} 日 / 遡れず取得不可 ${q.barUnavailable} 日`,
     `- 本番エントリー記録（Windows の記録小窓）: ${q.realMemos} 件 / SBI の建て約定に結び付いた ${q.realLinked} 件（前後 ${LINK_WINDOW_SEC} 秒以内で最も近い時刻付きの建て約定。trades.jsonl の real_memos）`,
+    `- 板の記録: 注文 ${q.boardOrders} 件（約定 ${q.boardFilledLinked} / 取消 ${q.boardCancelled} / 未結び付け ${q.boardFilledUnlinked}）。` +
+      `注文 = 全板のマスの注文の一生（order_key）。約定 = 数字が消え、前後 ${FILL_WINDOW_SEC} 秒以内の同じ値段・売買の SBI 約定に結び付いた。未結び付け = 消えたが結び付く約定が無い。trades.jsonl の board_orders`,
+    `- 理由のメモ ${q.notes} 件（結び付き ${q.notesLinked}）。注文に結び付いた約定、無ければ前後 ${NOTE_WINDOW_SEC / 60} 分で最も近い建て約定のラウンドに載せる。trades.jsonl の notes`,
     '- SBI の約定は、注文履歴で時刻（秒まで）を付けたもの（time_precision=ms）だけ保有時間・時間帯別・1 分足・MAE/MFE が出る。日付だけ（time_precision=day）の取引は出ない',
     '- REPLAY の時刻は録画上の実時刻（押した現実の時刻ではない）。trades.jsonl の各ラウンドに recording_id / session_id、約定に replay.video_ms（再生位置）がある',
     '- 全体・直近 30 日には PAPER・SBI・REPLAY がすべて入る。種別ごとの成績は各節を見る',
     '',
   ].join('\n');
+}
+
+type BoardQuality = {
+  boardOrders: number;
+  boardFilledLinked: number;
+  boardFilledUnlinked: number;
+  boardCancelled: number;
+  notes: number;
+  notesLinked: number;
+};
+
+/** 板の記録の件数（order_key 単位）。約定（filled）した注文は結び付きの有無で分け、取消は約定していない注文だけ数える */
+async function boardQuality(db: PrismaClient): Promise<BoardQuality> {
+  const rows = await db.boardOrder.findMany({ select: { orderKey: true, event: true, executionId: true } });
+  const keys = new Map<string, { filled: boolean; linked: boolean; cancelled: boolean }>();
+  for (const r of rows) {
+    const k = keys.get(r.orderKey) ?? { filled: false, linked: false, cancelled: false };
+    if (r.event === 'filled') k.filled = true;
+    if (r.event === 'filled' && r.executionId) k.linked = true;
+    if (r.event === 'cancelled') k.cancelled = true;
+    keys.set(r.orderKey, k);
+  }
+  const ks = [...keys.values()];
+  return {
+    boardOrders: ks.length,
+    boardFilledLinked: ks.filter((k) => k.linked).length,
+    boardFilledUnlinked: ks.filter((k) => k.filled && !k.linked).length,
+    boardCancelled: ks.filter((k) => k.cancelled && !k.filled).length,
+    notes: await db.realNote.count(),
+    notesLinked: await db.realNote.count({ where: { executionId: { not: null } } }),
+  };
 }

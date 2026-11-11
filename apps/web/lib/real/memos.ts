@@ -5,6 +5,7 @@
 
 import type { PrismaClient } from '@/generated/prisma/client';
 import { isOpeningSide } from '@/lib/rounds/builder';
+import { parseV2Event, type BoardOrderEvent, type RealNoteEvent } from '@/lib/real/events-v2';
 
 /** 記録の前後この秒数以内の建て約定だけを候補にする（ボタンは約定の前後数秒〜数十秒に押す想定） */
 export const LINK_WINDOW_SEC = 60;
@@ -22,11 +23,20 @@ export type RealMemoEvent = {
   raw: string;
 };
 export type RealParseError = { line: number; id: string | null; message: string };
-export type RealParseResult = { lines: number; memos: RealMemoEvent[]; test: number; partial: number; errors: RealParseError[] };
+export type RealParseResult = {
+  lines: number;
+  memos: RealMemoEvent[];
+  // v2（board_order / real_note）。同じファイルに v1 と混在する
+  boardOrders: BoardOrderEvent[];
+  notes: RealNoteEvent[];
+  test: number;
+  partial: number;
+  errors: RealParseError[];
+};
 
 /** events.jsonl の全行を読む（純粋関数）。契約違反の行はエラーに入れてその行だけ捨てる */
 export function parseRealEvents(text: string): RealParseResult {
-  const out: RealParseResult = { lines: 0, memos: [], test: 0, partial: 0, errors: [] };
+  const out: RealParseResult = { lines: 0, memos: [], boardOrders: [], notes: [], test: 0, partial: 0, errors: [] };
   const rows = text.replace(/^﻿/, '').split('\n');
   rows.forEach((row, i) => {
     const line = i + 1;
@@ -51,7 +61,14 @@ export function parseRealEvents(text: string): RealParseResult {
       out.test++;
       return;
     }
-    if (e.v !== 1) return err(`v が 1 でない（${JSON.stringify(e.v)}）`);
+    if (e.v === 2) {
+      const r = parseV2Event(e, s);
+      if (typeof r === 'string') return err(r);
+      if (r.kind === 'board_order') out.boardOrders.push(r.event);
+      else out.notes.push(r.event);
+      return;
+    }
+    if (e.v !== 1) return err(`v が 1 か 2 でない（${JSON.stringify(e.v)}）`);
     if (e.type !== 'real_memo') return err(`type が real_memo でない（${JSON.stringify(e.type)}）`);
     if (!id) return err('id が無い');
     if (typeof e.ts !== 'string' || !TS.test(e.ts) || Number.isNaN(Date.parse(e.ts))) return err(`ts の形式が違う（${JSON.stringify(e.ts)}）`);

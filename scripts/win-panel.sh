@@ -5,8 +5,9 @@
 #   uninstall-task  そのタスクを消す（小窓も止める）
 #   start / stop    タスク経由で起動（本人のセッションに窓が出る）/ 止める
 #   status          プロセス・タスクの状態と小窓のログの末尾
-#   snap            動作確認用に 1 回撮影させる（"test":true の記録になる）
-#   clean-test      "test":true の記録とその画像を Windows と Mac の両方から消す（本物の記録は残す）
+#   selftest        追跡・行のずれ・数字の読み方と、全板の見本画像（%USERPROFILE%\tradelog\selftest-board.png があれば）の OCR を確かめる
+#   snap            動作確認用に理由を 1 件保存させる（"test":true の real_note になる）
+#   clean-test      "test":true の記録（旧版の画像も）を Windows と Mac の両方から消す（本物の記録は残す）
 # Windows の設定・ファイアウォール・SSH の設定、HYPER SBI 2 には触らない。
 set -euo pipefail
 
@@ -20,6 +21,8 @@ DEST="$(win_real_dir "$REPO")"
 # Windows 側の置き場（%USERPROFILE%\tradelog 以下）
 PS_PATHS='$root = Join-Path $env:USERPROFILE "tradelog"; $app = Join-Path $root "app"; $data = Join-Path $root "data\real"; $exe = Join-Path $app "TradelogPanel.exe";'
 PS_STOP='Stop-ScheduledTask -TaskName "'$TASK'" -ErrorAction SilentlyContinue; Get-Process TradelogPanel -ErrorAction SilentlyContinue | Stop-Process -Force; Start-Sleep -Milliseconds 500;'
+PS_SELFTEST='$img = Join-Path $root "selftest-board.png"; $a = @("--selftest"); if (Test-Path $img) { $a += "`"$img`"" }
+  $p = Start-Process -FilePath $exe -ArgumentList $a -Wait -PassThru; Get-Content (Join-Path $root "logs\selftest.txt") -Encoding UTF8; if ($p.ExitCode -ne 0) { throw "自己テストに失敗（exit $($p.ExitCode)）" };'
 PS_START='if (Get-ScheduledTask -TaskName "'$TASK'" -ErrorAction SilentlyContinue) { Start-ScheduledTask -TaskName "'$TASK'"; Start-Sleep -Seconds 3; Get-Process TradelogPanel -ErrorAction SilentlyContinue | Select-Object Id, SessionId, StartTime | Format-Table -AutoSize | Out-String } else { "タスク '$TASK' が無い（install-task を先に）" }'
 
 cmd="${1:-}"
@@ -41,6 +44,7 @@ case "$cmd" in
       dotnet publish (Join-Path \$src 'panel-win\TradelogPanel.csproj') -c Release -o \$app --nologo -v q
       if (\$LASTEXITCODE -ne 0) { throw 'dotnet publish に失敗' }
       'publish: ' + (Get-Item \$exe).LastWriteTime.ToString('s')
+      $PS_SELFTEST
       $PS_START"
     ;;
   install-task)
@@ -66,6 +70,10 @@ case "$cmd" in
   stop)
     win_ps "$PS_STOP 'stopped'"
     ;;
+  selftest)
+    win_ps "$PS_PATHS \$ErrorActionPreference = 'Stop'
+      $PS_SELFTEST"
+    ;;
   status)
     win_ps "$PS_PATHS
       'process:'; Get-Process TradelogPanel -ErrorAction SilentlyContinue | Select-Object Id, SessionId, StartTime | Format-Table -AutoSize | Out-String
@@ -76,7 +84,7 @@ case "$cmd" in
     win_ps "$PS_PATHS
       \$ev = Join-Path \$data 'events.jsonl'
       \$before = if (Test-Path \$ev) { (Get-Item \$ev).Length } else { 0 }
-      New-Item -ItemType File -Force (Join-Path \$data ('cmd\' + [guid]::NewGuid().ToString() + '.snap')) | Out-Null
+      [IO.File]::WriteAllText((Join-Path \$data ('cmd\' + [guid]::NewGuid().ToString() + '.snap')), 'テスト（win-panel.sh snap）', (New-Object Text.UTF8Encoding \$false))
       for (\$i = 0; \$i -lt 20; \$i++) {
         Start-Sleep -Milliseconds 500
         if ((Test-Path \$ev) -and (Get-Item \$ev).Length -gt \$before) { Get-Content \$ev -Tail 1 -Encoding UTF8; exit 0 }
@@ -114,7 +122,7 @@ case "$cmd" in
     "$HERE/pull-win.sh"
     ;;
   *)
-    sed -n '2,10p' "$0" | sed 's/^# \{0,1\}//'
+    sed -n '2,11p' "$0" | sed 's/^# \{0,1\}//'
     exit 2
     ;;
 esac

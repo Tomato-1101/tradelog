@@ -1,15 +1,19 @@
 using System.Text.Json;
+using System.Text.Json.Nodes;
 
 namespace TradelogPanel;
 
-// 常に最前面の小窓。ボタン 1 回 = 撮影＋そのタグで記録。押しても前面の窓（HYPER SBI 2）からフォーカスを奪わない
+// 常に最前面の小窓。上 2 行 = 監視の状態と最後に見た注文、下 = 理由の入力欄（Win+H の音声入力のまま入れて Enter）。
+// 起動時はフォーカスを奪わない。入力欄をクリックした時かホットキーの時だけ前に出て、保存したら元の窓へフォーカスを返す
 sealed class PanelForm : Form
 {
     const int HotkeyId = 1;
     readonly Settings settings;
-    readonly Label status;
-    readonly System.Windows.Forms.Timer cmdTimer;
-    readonly SemaphoreSlim gate = new(1, 1);
+    readonly Label status, lastEvent, saved;
+    readonly TextBox note;
+    readonly BoardMonitor monitor;
+    readonly System.Windows.Forms.Timer timer;
+    IntPtr lastOther;
     bool hotkeyRegistered;
 
     public PanelForm(Settings settings, string? warning)
@@ -28,71 +32,80 @@ sealed class PanelForm : Form
         ShowInTaskbar = false;
         StartPosition = FormStartPosition.Manual;
 
-        var buttons = new List<(string Text, string? Tag)> { ("記録", null) };
-        buttons.AddRange(settings.Tags.Select(t => (t, (string?)t)));
-        const int bw = 76, bh = 34, gap = 6, perRow = 6, statusH = 24;
-        int cols = Math.Min(perRow, buttons.Count);
-        int rows = (buttons.Count + perRow - 1) / perRow;
-        for (int i = 0; i < buttons.Count; i++)
+        const int width = 380, gap = 6, lineH = 22, noteH = 62;
+        // どの欄も高さ・幅は固定（文言の有無・長さで窓も欄も動かない。長ければ … で切る）
+        Label Line(int y) => new()
         {
-            var (text, tag) = buttons[i];
-            var b = new Button
-            {
-                Text = text,
-                Location = new Point(gap + i % perRow * (bw + gap), gap + i / perRow * (bh + gap)),
-                Size = new Size(bw, bh),
-                AutoEllipsis = true,
-                UseMnemonic = false,
-                TabStop = false,
-            };
-            b.Click += (_, _) => Trigger(tag is null ? [] : [tag], test: false);
-            Controls.Add(b);
-        }
-        int width = gap + cols * (bw + gap);
-        int top = gap + rows * (bh + gap);
-        // 結果の 1 行。高さ・幅は固定（文言の有無・長さで窓もボタンも動かない。長ければ … で切る）
-        status = new Label
-        {
-            AutoSize = false,
-            AutoEllipsis = true,
-            UseMnemonic = false,
-            TextAlign = ContentAlignment.MiddleLeft,
-            Location = new Point(gap, top),
-            Size = new Size(width - gap * 2, statusH),
-            Text = warning ?? "",
+            AutoSize = false, AutoEllipsis = true, UseMnemonic = false, TextAlign = ContentAlignment.MiddleLeft,
+            Location = new Point(gap, y), Size = new Size(width - gap * 2, lineH), Text = "",
         };
-        Controls.Add(status);
-        ClientSize = new Size(width, top + statusH + gap);
+        status = Line(gap);
+        status.Text = warning ?? "起動中…";
+        lastEvent = Line(gap + lineH);
+        lastEvent.ForeColor = SystemColors.GrayText;
+        lastEvent.Text = "注文はまだ見ていない";
+        note = new TextBox
+        {
+            Multiline = true, WordWrap = true, AcceptsReturn = false, ScrollBars = ScrollBars.Vertical,
+            Location = new Point(gap, gap + lineH * 2 + 4), Size = new Size(width - gap * 2, noteH),
+            PlaceholderText = "理由（Win+H で音声入力）→ Enter で保存",
+        };
+        saved = Line(gap + lineH * 2 + 4 + noteH + 2);
+        saved.ForeColor = SystemColors.GrayText;
+        Controls.AddRange([status, lastEvent, note, saved]);
+        ClientSize = new Size(width, saved.Bottom + gap);
         ResumeLayout(false);
 
-        // SSH からの動作確認用: data\real\cmd\ にファイルが置かれたら 1 回撮影（test 付き）
-        cmdTimer = new System.Windows.Forms.Timer { Interval = 1000 };
-        cmdTimer.Tick += (_, _) => PollCmd();
-        cmdTimer.Start();
+        note.KeyDown += (_, e) =>
+        {
+            if (e.KeyCode == Keys.Enter && !e.Shift) { e.SuppressKeyPress = true; Save(test: false); ReturnFocus(); }
+            else if (e.KeyCode == Keys.Escape) { e.SuppressKeyPress = true; ReturnFocus(); }
+        };
+        // 書きかけのまま他の窓をクリックしても文を失わない
+        Deactivate += (_, _) => { if (note.Text.Trim().Length > 0) Save(test: false); };
+
+        monitor = new BoardMonitor(s => Ui(() => status.Text = s), s => Ui(() => { lastEvent.ForeColor = ForeColor; lastEvent.Text = s; }));
+
+        // 保存後にフォーカスを返す先（小窓より前に前面だった窓）と、SSH からの動作確認（data\real\cmd\）を見る
+        timer = new System.Windows.Forms.Timer { Interval = 250 };
+        int ticks = 0;
+        timer.Tick += (_, _) =>
+        {
+            var fg = Native.GetForegroundWindow();
+            if (fg != IntPtr.Zero && fg != Handle) lastOther = fg;
+            if (++ticks % 4 == 0) PollCmd();
+        };
+    }
+
+    void Ui(Action a)
+    {
+        try { if (IsHandleCreated && !IsDisposed) BeginInvoke(a); }
+        catch (InvalidOperationException) { }
     }
 
     protected override bool ShowWithoutActivation => true;
-
-    protected override CreateParams CreateParams
-    {
-        get
-        {
-            var cp = base.CreateParams;
-            cp.ExStyle |= Native.WS_EX_NOACTIVATE;
-            return cp;
-        }
-    }
 
     protected override void OnLoad(EventArgs e)
     {
         base.OnLoad(e);
         Location = LoadLocation();
+        timer.Start();
+        monitor.Start();
     }
 
     protected override void OnHandleCreated(EventArgs e)
     {
         base.OnHandleCreated(e);
         RegisterHotkey();
+    }
+
+    protected override void OnFormClosing(FormClosingEventArgs e)
+    {
+        Log.Write($"窓を閉じる reason={e.CloseReason}");
+        if (note.Text.Trim().Length > 0) Save(test: false);
+        timer.Stop();
+        monitor.Stop();
+        base.OnFormClosing(e);
     }
 
     protected override void OnFormClosed(FormClosedEventArgs e)
@@ -103,33 +116,54 @@ sealed class PanelForm : Form
 
     protected override void WndProc(ref Message m)
     {
-        if (m.Msg == Native.WM_HOTKEY && m.WParam == HotkeyId) Trigger([], test: false);
+        if (m.Msg == Native.WM_HOTKEY && m.WParam == HotkeyId)
+        {
+            var fg = Native.GetForegroundWindow();
+            if (fg != IntPtr.Zero && fg != Handle) lastOther = fg;
+            Activate();
+            note.Focus();
+        }
         base.WndProc(ref m);
     }
 
-    // 押した瞬間の時刻と前面の窓をここで取り、撮影・保存は裏で行う（UI を固めない）
-    void Trigger(List<string> tags, bool test)
+    void ReturnFocus()
     {
-        var ts = DateTimeOffset.Now;
-        var fg = Native.GetForegroundWindow();
-        var fgTitle = Native.TitleOf(fg);
-        status.Text = $"記録中 {ts:HH:mm:ss}…";
-        _ = Task.Run(async () =>
-        {
-            await gate.WaitAsync();
-            string msg;
-            try { msg = Recorder.Record(ts, fg, fgTitle, tags, test); }
-            catch (Exception e)
-            {
-                Log.Write("記録に失敗: " + e);
-                msg = $"記録に失敗 {ts:HH:mm:ss}（logs\\panel.log）";
-            }
-            finally { gate.Release(); }
-            try { BeginInvoke(() => status.Text = msg); }
-            catch (InvalidOperationException) { }
-        });
+        if (lastOther != IntPtr.Zero && Native.IsWindow(lastOther)) Native.SetForegroundWindow(lastOther);
     }
 
+    void Save(bool test, string? text = null)
+    {
+        text = (text ?? note.Text).Trim();
+        if (!test) note.Clear();
+        if (text.Length == 0) return;
+        var ts = DateTimeOffset.Now;
+        var last = monitor.Last;
+        var ev = new JsonObject
+        {
+            ["v"] = 2, ["type"] = "real_note", ["id"] = Guid.NewGuid().ToString(), ["ts"] = Jsonl.Ts(ts), ["text"] = text,
+            ["last_order"] = last == null ? null : new JsonObject
+            {
+                ["order_key"] = last.OrderKey, ["event"] = last.Event, ["side"] = last.Side,
+                ["price"] = last.Price is { } p ? JsonValue.Create(p) : null, ["ts"] = Jsonl.Ts(last.Ts),
+            },
+        };
+        if (test) ev["test"] = true;
+        try
+        {
+            Jsonl.Write(ev);
+            Log.Write($"理由を保存 id={ev["id"]} test={test} 文字数={text.Length} last={last?.Event}");
+            var head = text.Length > 24 ? text[..24] + "…" : text;
+            saved.Text = $"{(test ? "テスト保存" : "保存")} {ts:HH:mm:ss}「{head}」";
+        }
+        catch (Exception e)
+        {
+            Log.Write("理由の保存に失敗: " + e);
+            saved.Text = $"保存に失敗 {ts:HH:mm:ss}（logs\\panel.log）";
+            if (!test) note.Text = text; // 文を捨てない
+        }
+    }
+
+    // SSH からの動作確認用: data\real\cmd\ にファイルが置かれたら、その中身（空なら「テスト」）を test 付きの理由として保存
     void PollCmd()
     {
         string[] files;
@@ -137,10 +171,11 @@ sealed class PanelForm : Form
         catch (Exception) { return; }
         foreach (var f in files)
         {
-            try { File.Delete(f); }
+            string body;
+            try { body = File.ReadAllText(f); File.Delete(f); }
             catch (Exception) { continue; } // まだ書きかけ。次の周期で拾う
             Log.Write("cmd を受け取った: " + Path.GetFileName(f));
-            Trigger([], test: true);
+            Save(test: true, text: body.Trim().Length > 0 ? body : "テスト");
         }
     }
 
@@ -151,7 +186,7 @@ sealed class PanelForm : Form
         if (!TryParseHotkey(spec, out uint mods, out uint vk))
         {
             Log.Write($"ホットキーの書き方が読めない: {spec}");
-            status.Text = $"ホットキー「{spec}」が読めない（settings.json）";
+            saved.Text = $"ホットキー「{spec}」が読めない（settings.json）";
             return;
         }
         const uint MOD_NOREPEAT = 0x4000;
@@ -159,7 +194,7 @@ sealed class PanelForm : Form
         if (!hotkeyRegistered)
         {
             Log.Write($"ホットキー {spec} を登録できない（他のアプリが使用中）");
-            status.Text = $"ホットキー {spec} は他のアプリが使用中";
+            saved.Text = $"ホットキー {spec} は他のアプリが使用中";
         }
     }
 
