@@ -40,6 +40,8 @@ pick_sbi_csv() {
   local dl="${TRADELOG_DOWNLOADS:-$HOME/Downloads}" raw="$ROOT/data/raw/sbi" f h dest have
   local new=()
   mkdir -p "$raw"
+  # ~/Downloads は macOS の権限（ファイルとフォルダ）で launchd からは読めないことがある。黙って「無し」にしない
+  if ! ls "$dl" >/dev/null 2>&1; then log "ダウンロード（$dl）を読めない（macOS の権限）。SBI の CSV は拾わずに続ける"; return 0; fi
   have="$(shasum -a 256 "$raw"/*.csv 2>/dev/null | cut -d' ' -f1)"
   for f in "$dl"/SaveFile_*.csv; do
     [ -f "$f" ] || continue
@@ -55,7 +57,8 @@ pick_sbi_csv() {
   log "SBI の CSV を拾った: ${new[*]##*/}"
   node_modules/.bin/tsx scripts/import-sbi.ts "${new[@]}" || log "SBI の CSV の取り込みに失敗（daily は続ける）"
 }
-pick_sbi_csv
+# 既定 OFF（2026-11-12 本人「自分でやる」。launchd からは ~/Downloads を読めないため）。TRADELOG_PICK_SBI_CSV=1 で ON
+[ "${TRADELOG_PICK_SBI_CSV:-0}" = 1 ] && pick_sbi_csv
 mark="$(mktemp)"
 touch -A -01 "$mark" # 同じ秒に書かれた状態ファイルも「新しい」と判定できるよう 1 秒戻す
 node_modules/.bin/tsx scripts/daily.ts
