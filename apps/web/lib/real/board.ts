@@ -196,6 +196,15 @@ export async function linkRealNotes(db: PrismaClient, windowSec = NOTE_WINDOW_SE
     if (typeof r.symbol === 'string') noteSymbol.set(n.id, r.symbol);
     if (typeof r.symbol === 'string' && (r.position === 'LONG' || r.position === 'SHORT')) hint.set(n.id, { symbol: r.symbol, position: r.position });
   }
+  // 銘柄を書いていない小窓のメモは、直前に見た注文（last_order）の全板の銘柄を使う（注文の記録には銘柄がある）
+  const keys = [...new Set(notes.filter((n) => !noteSymbol.has(n.id) && n.lastOrderKey).map((n) => n.lastOrderKey as string))];
+  const keySymbol = new Map<string, string>();
+  if (keys.length) {
+    for (const o of await db.boardOrder.findMany({ where: { orderKey: { in: keys }, symbol: { not: null } }, select: { orderKey: true, symbol: true } })) {
+      if (o.symbol && !keySymbol.has(o.orderKey)) keySymbol.set(o.orderKey, o.symbol);
+    }
+    for (const n of notes) if (!noteSymbol.has(n.id) && n.lastOrderKey && keySymbol.has(n.lastOrderKey)) noteSymbol.set(n.id, keySymbol.get(n.lastOrderKey) as string);
+  }
   const hinted = notes.filter((n) => hint.has(n.id));
   const dayExecs: DayCandidate[] = hinted.length
     ? (
