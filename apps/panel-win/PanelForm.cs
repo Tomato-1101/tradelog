@@ -140,7 +140,7 @@ sealed class PanelForm : Form
         var last = monitor.Last;
         var ev = new JsonObject
         {
-            ["v"] = 2, ["type"] = "real_note", ["id"] = Guid.NewGuid().ToString(), ["ts"] = Jsonl.Ts(ts), ["text"] = text,
+            ["v"] = 2, ["type"] = "real_note", ["id"] = Guid.NewGuid().ToString(), ["ts"] = Jsonl.Ts(ts), ["text"] = text, ["symbol"] = monitor.Symbol,
             ["last_order"] = last == null ? null : new JsonObject
             {
                 ["order_key"] = last.OrderKey, ["event"] = last.Event, ["side"] = last.Side,
@@ -151,7 +151,7 @@ sealed class PanelForm : Form
         try
         {
             Jsonl.Write(ev);
-            Log.Write($"理由を保存 id={ev["id"]} test={test} 文字数={text.Length} last={last?.Event}");
+            Log.Write($"理由を保存 id={ev["id"]} test={test} 文字数={text.Length} last={last?.Event} symbol={monitor.Symbol}");
             var head = text.Length > 24 ? text[..24] + "…" : text;
             saved.Text = $"{(test ? "テスト保存" : "保存")} {ts:HH:mm:ss}「{head}」";
         }

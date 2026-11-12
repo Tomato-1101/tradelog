@@ -83,16 +83,17 @@ export function pickNoteBySymbol(note: { ts: Date; symbol: string; position: 'LO
  * 理由のメモ 1 件を載せる約定（純粋関数）。
  * 1. last_order.order_key の注文が約定に結び付いていればその約定（orderExec: order_key → 約定）
  * 2. 無ければメモの時刻の前後 windowSec 秒以内で最も近い建て約定（openingExecs は呼び出し側で SBI・時刻付き・建て側に絞る。同点は pickEntryExecution の規則）
+ *    メモに銘柄（小窓が保存時に全板で見ていた銘柄）があれば同じ銘柄の約定だけ。5 分以内に別銘柄を建てても取り違えない
  */
 export function pickNoteExecution(
-  note: { ts: Date; lastOrderKey: string | null },
+  note: { ts: Date; lastOrderKey: string | null; symbol?: string | null },
   orderExec: Map<string, { id: string; executedAt: Date }>,
-  openingExecs: Array<{ id: string; executedAt: Date }>,
+  openingExecs: Array<{ id: string; executedAt: Date; symbol?: string }>,
   windowSec = NOTE_WINDOW_SEC,
 ): NoteLink | null {
   const byOrder = note.lastOrderKey ? orderExec.get(note.lastOrderKey) : undefined;
   if (byOrder) return { executionId: byOrder.id, method: 'order', deltaMs: byOrder.executedAt.getTime() - note.ts.getTime() };
-  const hit = pickEntryExecution(note.ts, openingExecs, windowSec);
+  const hit = pickEntryExecution(note.ts, note.symbol ? openingExecs.filter((e) => e.symbol === note.symbol) : openingExecs, windowSec);
   return hit ? { executionId: hit.id, method: 'time', deltaMs: hit.executedAt.getTime() - note.ts.getTime() } : null;
 }
 
@@ -182,13 +183,17 @@ export async function linkRealNotes(db: PrismaClient, windowSec = NOTE_WINDOW_SE
   const opening = (
     await db.execution.findMany({
       where: { source: 'SBI', timePrecision: 'ms', executedAt: timeRange(notes.map((n) => n.ts.getTime()), windowSec) },
-      select: { id: true, executedAt: true, side: true, marginType: true },
+      select: { id: true, executedAt: true, side: true, marginType: true, instrument: { select: { symbol: true } } },
     })
-  ).filter(isOpeningSide);
+  )
+    .filter(isOpeningSide)
+    .map((e) => ({ id: e.id, executedAt: e.executedAt, symbol: e.instrument.symbol }));
   // 手で書いたメモの銘柄と向き（rawJson にだけある）。その日の SBI 約定を時刻の有無に関係なく候補にする
   const hint = new Map<string, { symbol: string; position: 'LONG' | 'SHORT' }>();
+  const noteSymbol = new Map<string, string>();
   for (const n of notes) {
     const r = JSON.parse(n.rawJson) as { symbol?: unknown; position?: unknown };
+    if (typeof r.symbol === 'string') noteSymbol.set(n.id, r.symbol);
     if (typeof r.symbol === 'string' && (r.position === 'LONG' || r.position === 'SHORT')) hint.set(n.id, { symbol: r.symbol, position: r.position });
   }
   const hinted = notes.filter((n) => hint.has(n.id));
@@ -206,7 +211,7 @@ export async function linkRealNotes(db: PrismaClient, windowSec = NOTE_WINDOW_SE
   for (const n of notes) {
     const h = hint.get(n.id);
     // 銘柄が書いてあるメモは銘柄を優先（時刻だけだと 5 分以内の別銘柄と取り違える）
-    const l = (h ? pickNoteBySymbol({ ts: n.ts, ...h }, dayExecs) : null) ?? pickNoteExecution(n, orderExec, opening, windowSec);
+    const l = (h ? pickNoteBySymbol({ ts: n.ts, ...h }, dayExecs) : null) ?? pickNoteExecution({ ...n, symbol: noteSymbol.get(n.id) }, orderExec, opening, windowSec);
     if (l) linked++;
     if (l?.method === 'order') byOrder++;
     const data = { executionId: l?.executionId ?? null, linkMethod: l?.method ?? null, linkDeltaMs: l?.deltaMs ?? null };

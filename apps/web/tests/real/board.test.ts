@@ -139,6 +139,13 @@ describe('pickNoteExecution', () => {
     expect(pickNoteExecution({ ts, lastOrderKey: null }, orderExec, [at('far', NOTE_WINDOW_SEC + 1)])).toBeNull();
     expect(pickNoteExecution({ ts, lastOrderKey: 'k1' }, new Map(), [])).toBeNull();
   });
+
+  it('メモに銘柄があれば同じ銘柄の建て約定だけ（近い別銘柄には付けない）。銘柄が無ければ従来どおり', () => {
+    const execs = [{ ...at('other', 10), symbol: '9984' }, { ...at('same', -200), symbol: '6525' }];
+    expect(pickNoteExecution({ ts, lastOrderKey: null, symbol: '6525' }, new Map(), execs)).toMatchObject({ executionId: 'same', method: 'time' });
+    expect(pickNoteExecution({ ts, lastOrderKey: null, symbol: '7203' }, new Map(), execs)).toBeNull();
+    expect(pickNoteExecution({ ts, lastOrderKey: null, symbol: null }, new Map(), execs)).toMatchObject({ executionId: 'other' });
+  });
 });
 
 describe('手で書いたメモ（symbol・position）', () => {

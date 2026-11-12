@@ -24,14 +24,14 @@
 - 10-06 本人決定: **朝の自動録画はやめる**（本人が自分で起きて取引する）。launchd record は停止・削除済み、install.sh は RECORD=1 の時だけ入れる。
   理由: HYPER SBI 2 は毎日 6:30 頃のメンテで切断、再ログインはスマホの FIDO 認証が必須で無人では録れない。録画・リプレイ機能のコードは残す（手動の「今すぐ録画」は使える）。
 
-## 本番の癖分析・Windows 記録小窓（11-12 01:10 更新）
+## 本番の癖分析・Windows 記録小窓（11-12 09:40 更新）
 - 目的: SBI 本番の注文・約定の瞬間の板と、本人が声で入れた理由から「どんな形で入る癖があるか」を分析する。本人はデイトレを Windows（HYPER SBI 2）で行う。
 - 現状: 小窓 v2（apps/panel-win）は全板の売注・買注のマスを 1 秒約 30 回見て、注文・約定・取消を数字だけ events.jsonl に残す（契約 docs/real-events.md、画像は撮らない）。
   2026-11-11 の実注文 4 件で 注文・取消・約定 の検出と値段・株数の OCR は正しいと本人確認済み。Windows に配備済み・自己テスト ALL OK（`scripts/win-panel.sh selftest`）。CPU は PC 全体の約 2.5%、場の外は 1 秒 1 回。
   Mac: daily の [real v2] が取り込み → filled を前後 15 秒の SBI 約定に結び付け → 理由メモを結び付け → [llm] で Groq（openai/gpt-oss-120b、無料枠、実呼び出し 1 回で動作確認）が 80 字超の理由を要約 → trades.jsonl の board_orders / notes。本番 DB に migration real_v2 適用済み（損益 -741715.5・1632 ラウンド不変）。
 - 次: (1) 次の取引日に本人と実地確認: 訂正・空のマスへのマウスオーバー・スクロール・銘柄切り替え・voicekey で理由を入れて Enter で保存できるか（入力中に小窓が非アクティブになって途中保存されないか）。
   (2) 起動直後に小窓が 2 回「終了」した（11-11 10:58、原因不明。本人が閉じた可能性）。閉じる理由を panel.log に出すようにしたので再発したら reason を見る。
-  (3) 理由メモの時刻での結び付けは銘柄を見ていない（5 分以内に別銘柄を建てると取り違える）。(4) 注文履歴は約 3 か月で切れるので定期的に Chrome で収集して import:sbi-orders。(5) probe3/probe4 の Windows タスクとフォルダは片付け済み。
+  (3) 11-12: 小窓の理由メモに全板の銘柄（symbol）を載せ、Mac は時刻で結び付ける時に同じ銘柄の約定だけを見るよう直した。Mac 側は main に反映済み。**Windows への配備（`scripts/win-panel.sh deploy` → selftest）はまだ**。小窓が再起動するので場中は避け、引け後に行う（Mac に dotnet が無いため、コンパイルの確認も配備の時になる）。(4) 注文履歴は約 3 か月で切れるので定期的に Chrome で収集して import:sbi-orders。(5) probe3/probe4 の Windows タスクとフォルダは片付け済み。
 - 11-12: 11-10・11-11 の SBI CSV と 11-10 の注文履歴を本番 DB に取り込み済み（1675 ラウンド）。11-11 は小窓 v1 の日で板の記録なし、注文履歴は 00:55 時点でまだ 0 件（約定時刻なし）。
   本人の 11-11 の理由メモは取引ごとに 7 件へ分けて data/real/manual-notes.jsonl（Mac だけ）に入れ、symbol・position で同じ日・同じ銘柄・同じ向きの建て約定に 7 件とも結び付いた（linkMethod=symbol_day）。
   ダウンロードの SaveFile_*.csv の自動拾い上げは launchd から ~/Downloads を読めない（macOS の権限）と分かり、本人「自分でやる」で既定 OFF（TRADELOG_PICK_SBI_CSV=1 で ON）。取り込みは本人が `npm run import:sbi -- <csv>`。

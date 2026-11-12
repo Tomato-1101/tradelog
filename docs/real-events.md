@@ -73,8 +73,8 @@ Windows の記録小窓（`apps/panel-win`）が追記し、Mac の `scripts/pul
 | `text` | string | 入力欄の文（voicekey の入力のまま。前後の空白は除く。空なら行を出さない） |
 | `last_order` | object \| null | 保存した時点で最後に見た `board_order` の `{order_key, event, side, price, ts}`。手がかりで、結び付けの正は Mac |
 | `test` | true（任意） | |
-| `symbol` | string（任意） | 銘柄コード。手で書いたメモだけが持つ（下記） |
-| `position` | `LONG` \| `SHORT`（任意） | 建ての向き。`symbol` と組で使う |
+| `symbol` | string \| null（任意） | 銘柄コード。小窓は保存した時に全板で見ていた銘柄（全板が無ければ null）。手で書いたメモは必須（下記） |
+| `position` | `LONG` \| `SHORT`（任意） | 建ての向き。手で書いたメモだけが持ち、`symbol` と組で使う |
 
 ### 手で書いたメモ（`data/real/manual-notes.jsonl`、Mac だけ）
 - 小窓を使わなかった日の理由を後から入れる場所。形は `real_note` と同じで、`symbol`・`position` を付ける（`ts` は概算でよい）。
@@ -83,6 +83,7 @@ Windows の記録小窓（`apps/panel-win`）が追記し、Mac の `scripts/pul
   約定に時刻が無い日でも結び付く。時刻付きの約定が複数あればメモの時刻に最も近いもの。
 
 ## 取り込みと結び付け（web 側）
+- 小窓のメモは `last_order` の注文が約定に結び付いていればその約定、無ければ前後 5 分の建て約定のうち `symbol` と同じ銘柄で最も近いもの（`symbol` が null なら銘柄を見ない）。
 - `npm run daily` が毎回 `data/real/events.jsonl` を読み、新しい `id` だけ DB に入れる。
 - 結び付けは daily のたびに全件やり直す（SBI の約定時刻は後から注文履歴で付くため）。規則は web の実装（`apps/web/lib/real/`）が正。
 - 理由の文が長いものは daily で LLM（Groq の無料枠）が短く要約する。鍵が無い・失敗した時は要約なしで続ける。

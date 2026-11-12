@@ -21,6 +21,8 @@ sealed class BoardMonitor
     Thread? scan, ocr;
     string lastStatus = "";
     public volatile LastOrder? Last;
+    // いま見張っている全板の銘柄コード。理由のメモに載せ、Mac で同じ銘柄の約定にだけ結び付ける（全板が無ければ null）
+    public volatile string? Symbol;
 
     public BoardMonitor(Action<string> onStatus, Action<string> onEvent)
     {
@@ -104,6 +106,7 @@ sealed class BoardMonitor
         ulong[] sig = [], prev = [];
         var tracker = new Tracker();
         string title = Native.TitleOf(h);
+        Symbol = Board.ParseTitle(title).Code;
         var sw = Stopwatch.StartNew();
         long frames = 0, statFrames = 0;
         double lastT = 0, statT = 0;
@@ -119,7 +122,7 @@ sealed class BoardMonitor
                 {
                     var t = Native.TitleOf(h);
                     if (!t.StartsWith("全板")) { Log.Write("全板ではなくなった: " + t); return; }
-                    if (t != title) { Log.Write($"銘柄が変わった {title} → {t}。追跡をやり直す"); title = t; tracker.Reset(); }
+                    if (t != title) { Log.Write($"銘柄が変わった {title} → {t}。追跡をやり直す"); title = t; Symbol = Board.ParseTitle(t).Code; tracker.Reset(); }
                 }
                 if (Native.IsIconic(h))
                 {
@@ -191,7 +194,7 @@ sealed class BoardMonitor
                 if (wait > 0) Thread.Sleep(wait);
             }
         }
-        finally { img?.Dispose(); }
+        finally { img?.Dispose(); Symbol = null; }
     }
 
     static readonly Dictionary<string, string> Words = new()
