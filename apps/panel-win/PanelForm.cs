@@ -73,6 +73,9 @@ sealed class PanelForm : Form
         {
             var fg = Native.GetForegroundWindow();
             if (fg != IntPtr.Zero && fg != Handle) lastOther = fg;
+            // TopMost だけだと、後から前に出た別の最前面の窓（HYPER SBI 2 の「最前面表示」等）の下に隠れる。
+            // 0.5 秒ごとに最前面の一番上へ置き直す（フォーカスは奪わない）
+            if (ticks % 2 == 0) Native.SetWindowPos(Handle, Native.HWND_TOPMOST, 0, 0, 0, 0, Native.SWP_NOMOVE | Native.SWP_NOSIZE | Native.SWP_NOACTIVATE);
             if (++ticks % 4 == 0) PollCmd();
         };
     }

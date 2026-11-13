@@ -21,13 +21,15 @@ sealed class Tracker
     readonly Dictionary<(bool Buy, int VRow), Slot> slots = [];
     int offset;
     public bool HasBaseline { get; private set; }
+    // 見る画面の行（Layout.Lo..Hi）。範囲外の行は画面外と同じ扱いでマスを触らない
+    public (int Lo, int Hi) Band = (0, int.MaxValue);
 
     // 監視の開始・銘柄の切り替え・ずれが測れない時: 今見えている状態を黙って覚え直す（既にある注文をイベントにしない）
     public void Baseline(CellState[] sell, CellState[] buy)
     {
         slots.Clear();
         offset = 0;
-        for (int k = 0; k < sell.Length; k++)
+        for (int k = Math.Max(0, Band.Lo); k <= Math.Min(sell.Length - 1, Band.Hi); k++)
         {
             Init(false, k, sell[k]);
             Init(true, k, buy[k]);
@@ -49,7 +51,7 @@ sealed class Tracker
     public List<TrackEvent> Step(DateTimeOffset ts, CellState[] sell, CellState[] buy)
     {
         var evs = new List<TrackEvent>();
-        for (int k = 0; k < sell.Length; k++)
+        for (int k = Math.Max(0, Band.Lo); k <= Math.Min(sell.Length - 1, Band.Hi); k++)
         {
             Observe(false, k, sell[k], ts, evs);
             Observe(true, k, buy[k], ts, evs);

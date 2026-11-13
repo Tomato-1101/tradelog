@@ -85,6 +85,18 @@ static class SelfTest
         var b3 = tr.Step(F(3), new CellState[10], At(1));
         var b4 = tr.Step(F(4), new CellState[10], At(1));
         Check("画面外の注文は触らない", b1.Count + b2.Count + b3.Count + b4.Count == 0, Show([.. b1, .. b2, .. b3, .. b4]));
+        // UNDER 行（8 行目、動かない）に自分の注文が出たまま板が 1 行ずつスクロールしても、約定・出現にしない（2026-11-12 285A）
+        tr = new Tracker { Band = (1, 7) };
+        tr.Baseline(new CellState[10], At(8));
+        var c = new List<TrackEvent>();
+        for (int i = 1; i <= 6; i++) { tr.ApplyShift(i % 2 == 0 ? 3 : -3); c.AddRange(tr.Step(F(i), new CellState[10], At(8))); }
+        // 範囲内の注文が範囲外（UNDER の位置）へ流れても約定にしない
+        tr = new Tracker { Band = (1, 7) };
+        tr.Baseline(new CellState[10], At(7));
+        tr.ApplyShift(-2);
+        c.AddRange(tr.Step(F(7), new CellState[10], At(-1)));
+        c.AddRange(tr.Step(F(8), new CellState[10], At(-1)));
+        Check("OVER/UNDER 行の注文は追わない", c.Count == 0, Show(c));
     }
 
     static void ShiftCases()
@@ -133,6 +145,8 @@ static class SelfTest
         var rows = Board.Read(bmp, lay).GetAwaiter().GetResult();
         int priced = rows.Count(r => r.Price != null || r.Label != null);
         Check("値段の OCR", priced >= lay.Rows.Count * 0.8, $"{priced}/{lay.Rows.Count}");
+        Check("追う行の範囲", lay.Lo > 0 && lay.Hi < lay.Rows.Count - 1 && lay.Hi - lay.Lo >= 10
+            && rows[lay.Lo].Price != null && rows[lay.Hi].Price != null, $"{lay.Lo}-{lay.Hi} / {lay.Rows.Count}");
         for (int k = 0; k < rows.Length; k++)
         {
             var r = rows[k];

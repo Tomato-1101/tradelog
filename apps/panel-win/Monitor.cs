@@ -153,6 +153,7 @@ sealed class BoardMonitor
                     int n = lay.Rows.Count;
                     sell = new CellState[n]; buy = new CellState[n]; sig = new ulong[n]; prev = new ulong[n];
                     tracker.Reset();
+                    tracker.Band = (lay.Lo, lay.Hi);
                 }
                 var ts = DateTimeOffset.Now;
                 Board.Grab(h, img!);

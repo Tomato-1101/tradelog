@@ -13,6 +13,11 @@ enum CellState { Empty, Pending, Shown }
 sealed record Layout(int Top, int Bottom, (int L, int R) Sell, (int L, int R) Buy, (int L, int R) Price,
                      List<(int T, int B)> Rows, List<(int L, int R, string Name)> Cols)
 {
+    // 注文を追う行の範囲（OVER と UNDER の間の値段の行）。OVER/UNDER は板の外の注文の合計を出す動かない行で、
+    // スクロールで行番号を付け替えると注文が出入りして見え、消えた時に約定と取り違える（2026-11-12 285A で 17 件）
+    public int Lo { get; init; }
+    public int Hi { get; init; } = int.MaxValue;
+
     public Rectangle ScanRect(int w, int h)
     {
         int l = Math.Max(0, Sell.L - 10), r = Math.Min(w, Buy.R + 10);
@@ -150,7 +155,12 @@ static class Board
             rows.Add((up + 1, dn - 1));
         }
         var lay = new Layout(rows[0].Item1, rows[^1].Item2, sell, buy, (pc.Item1, pc.Item2), rows, cols);
-        return (lay, $"行 {rows.Count} 本 売注 {sell} 買注 {buy}");
+        var read = await Read(img, lay);
+        int over = Array.FindIndex(read, r => r.Label == "OVER"), under = Array.FindLastIndex(read, r => r.Label == "UNDER");
+        int first = Array.FindIndex(read, r => r.Price != null), last = Array.FindLastIndex(read, r => r.Price != null);
+        if (first < 0) return (null, "値段の数字が読めない");
+        lay = lay with { Lo = over >= 0 && over < first ? over + 1 : first, Hi = under > last ? under - 1 : last };
+        return (lay, $"行 {rows.Count} 本 追う行 {lay.Lo}-{lay.Hi} 売注 {sell} 買注 {buy}");
     }
 
     // マス 1 つの状態。背景が白っぽい（灰色がマスの 4 割超）= Pending。数字（赤・青・白の画素が 5 行以上にまたがる）= Shown。
