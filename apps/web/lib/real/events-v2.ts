@@ -1,4 +1,4 @@
-// 本番の注文記録 v2（board_order / real_note。契約は docs/real-events.md）の 1 行を読む（純粋関数）。
+// 本番の注文記録 v2（board_order / board_position / real_note。契約は docs/real-events.md）の 1 行を読む（純粋関数）。
 // 行の振り分け（test・書きかけ・v）は lib/real/memos.ts の parseRealEvents が行い、v=2 の行だけここに来る。
 
 const TS = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}[+-]\d{2}:\d{2}$/;
@@ -31,7 +31,26 @@ export type RealNoteEvent = {
   raw: string;
 };
 
-export type V2Parsed = { kind: 'board_order'; event: BoardOrderEvent } | { kind: 'real_note'; event: RealNoteEvent };
+// 約定の後に全板の右側の建玉欄を読んだもの（板のマスの値段と実際の約定値のずれを見るため）
+export type BoardPositionEvent = {
+  id: string;
+  ts: Date;
+  symbol: string | null;
+  symbolName: string | null;
+  afterOrderKey: string;
+  afterMs: number | null;
+  box: string | null;
+  qty: number | null;
+  avgPrice: number | null;
+  unrealized: number | null;
+  ocrRaw: string | null;
+  raw: string;
+};
+
+export type V2Parsed =
+  | { kind: 'board_order'; event: BoardOrderEvent }
+  | { kind: 'board_position'; event: BoardPositionEvent }
+  | { kind: 'real_note'; event: RealNoteEvent };
 
 const isTs = (x: unknown): x is string => typeof x === 'string' && TS.test(x) && !Number.isNaN(Date.parse(x));
 // 値が読めなかった欄は null。欄そのものが無い行も null として読む
@@ -68,6 +87,30 @@ export function parseV2Event(e: Record<string, unknown>, raw: string): V2Parsed 
       },
     };
   }
+  if (e.type === 'board_position') {
+    if (!id) return 'id が無い';
+    if (!isTs(e.ts)) return `ts の形式が違う（${JSON.stringify(e.ts)}）`;
+    if (typeof e.after_order_key !== 'string' || !e.after_order_key) return 'after_order_key が無い';
+    for (const k of ['after_ms', 'qty', 'avg_price', 'unrealized'] as const) if (!numOrNull(e[k])) return `${k} が数値か null でない（${JSON.stringify(e[k])}）`;
+    for (const k of ['symbol', 'symbol_name', 'box', 'raw'] as const) if (!strOrNull(e[k])) return `${k} が文字列か null でない`;
+    return {
+      kind: 'board_position',
+      event: {
+        id,
+        ts: new Date(e.ts),
+        symbol: (e.symbol as string | null | undefined) ?? null,
+        symbolName: (e.symbol_name as string | null | undefined) ?? null,
+        afterOrderKey: e.after_order_key,
+        afterMs: (e.after_ms as number | null | undefined) ?? null,
+        box: (e.box as string | null | undefined) ?? null,
+        qty: (e.qty as number | null | undefined) ?? null,
+        avgPrice: (e.avg_price as number | null | undefined) ?? null,
+        unrealized: (e.unrealized as number | null | undefined) ?? null,
+        ocrRaw: (e.raw as string | null | undefined) ?? null,
+        raw,
+      },
+    };
+  }
   if (e.type === 'real_note') {
     if (!id) return 'id が無い';
     if (!isTs(e.ts)) return `ts の形式が違う（${JSON.stringify(e.ts)}）`;
@@ -95,5 +138,5 @@ export function parseV2Event(e: Record<string, unknown>, raw: string): V2Parsed 
       },
     };
   }
-  return `type が board_order / real_note でない（${JSON.stringify(e.type)}）`;
+  return `type が board_order / board_position / real_note でない（${JSON.stringify(e.type)}）`;
 }

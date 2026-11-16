@@ -161,6 +161,19 @@ describe('本番の注文記録 v2', () => {
       { at: '2026-11-06T09:24:00.000+09:00', text: LONG, summary: s2 },
       { at: '2026-11-06T09:22:00.000+09:00', text: '利確の指値を置いた', summary: null },
     ]);
+    // 約定の後の建玉欄（board_position）: 同じ注文の、平均建単価が読めた最も遅い読み取りを filled の要素に付ける。DB には入れない
+    const bp = (id: string, key: string, ts: string, avg: number | null) =>
+      JSON.stringify({ v: 2, type: 'board_position', id, ts: `2026-11-06T${ts}+09:00`, symbol: '6976', symbol_name: '太陽誘電', after_order_key: key, after_ms: 1500, box: '買建玉(6カ月)', qty: avg === null ? null : 100, avg_price: avg, unrealized: null, raw: '' });
+    const r2 = await ingestRealMemos(db, [EVENTS, bp('p1', 'kBuy', '09:21:35.000', 5870.5), bp('p2', 'kBuy', '09:21:37.500', 5870.8), bp('p3', 'kBuy', '09:21:39.000', null), bp('p4', 'kSell', '09:40:07.500', null)].join('\n'));
+    expect({ positions: r2.boardPositions.length, errors: r2.errors.length }).toEqual({ positions: 4, errors: 0 });
+    expect(await ingestRealV2(db, r2)).toEqual({ newBoardOrders: 0, newNotes: 0 });
+    await exportForAi(db, out, NOW, { replayEnd: () => null, boardPositions: r2.boardPositions });
+    const [line2] = fs.readFileSync(path.join(out, 'trades.jsonl'), 'utf8').trim().split('\n').map((l) => JSON.parse(l));
+    expect(line2.board_orders.map((o: { order_key: string; position?: unknown }) => [o.order_key, o.position])).toEqual([
+      ['kBuy', { avg_price: '5870.8', qty: 100, box: '買建玉(6カ月)' }],
+      ['kSell', undefined],
+    ]);
+
     const md = fs.readFileSync(path.join(out, 'summary.md'), 'utf8');
     expect(md).toContain('- 板の記録: 注文 4 件（約定 2 / 取消 1 / 未結び付け 1）');
     expect(md).toContain('- 理由のメモ 3 件（結び付き 2）');

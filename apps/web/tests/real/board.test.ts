@@ -1,7 +1,7 @@
 // 本番の注文記録 v2（board_order / real_note）のパースと、結び付け・要約の対象選びの規則（純粋関数）。DB を通す確認は board-flow.test.ts
 import { describe, expect, it } from 'vitest';
 import { parseRealEvents } from '@/lib/real/memos';
-import { FILL_WINDOW_SEC, NOTE_WINDOW_SEC, assignFills, pickNoteBySymbol, pickNoteExecution, type DayCandidate, type FillCandidate, type FillOrder } from '@/lib/real/board';
+import { FILL_WINDOW_SEC, NOTE_WINDOW_SEC, assignFills, pickBoardPositions, pickNoteBySymbol, pickNoteExecution, type DayCandidate, type FillCandidate, type FillOrder } from '@/lib/real/board';
 import { SUMMARY_MIN_CHARS, pickNotesToSummarize } from '@/lib/real/summarize';
 
 const order = (o: Record<string, unknown> = {}) =>
@@ -82,6 +82,65 @@ describe('parseRealEvents（v1 と v2 の混在）', () => {
       [18, 'x'],
       [19, 'y'],
     ]);
+  });
+});
+
+describe('board_position（約定の後の建玉欄）', () => {
+  const pos = (o: Record<string, unknown> = {}) =>
+    JSON.stringify({
+      v: 2,
+      type: 'board_position',
+      id: 'p1',
+      ts: '2026-11-11T10:36:35.000+09:00',
+      symbol: '6976',
+      symbol_name: '太陽誘電',
+      after_order_key: 'k1',
+      after_ms: 1500,
+      box: '買建玉(6カ月)',
+      qty: 100,
+      avg_price: 5870.5,
+      unrealized: -50,
+      raw: '買建玉(6カ月) | 保有株数(注文中) 100(0) | 平均建単価 5,870.5',
+      ...o,
+    });
+
+  it('board_order・real_note と別の配列に読み、契約違反・test は取り込まない', () => {
+    const r = parseRealEvents(
+      [
+        order(),
+        pos(),
+        pos({ id: 'p2', box: null, qty: null, avg_price: null, unrealized: null, raw: '' }),
+        pos({ id: 'p-test', test: true }),
+        pos({ id: 'bad-key', after_order_key: '' }),
+        pos({ id: 'bad-avg', avg_price: '5870' }),
+        pos({ id: 'bad-ts', ts: '2026-11-11 10:36:35' }),
+      ].join('\n'),
+    );
+    expect(r.boardOrders.map((o) => o.id)).toEqual(['o1']);
+    expect(r.notes).toEqual([]);
+    expect(r.test).toBe(1);
+    expect(r.errors.map((e) => e.id)).toEqual(['bad-key', 'bad-avg', 'bad-ts']);
+    expect(r.boardPositions.map((p) => [p.id, p.afterOrderKey, p.afterMs, p.box, p.qty, p.avgPrice, p.unrealized])).toEqual([
+      ['p1', 'k1', 1500, '買建玉(6カ月)', 100, 5870.5, -50],
+      ['p2', 'k1', 1500, null, null, null, null],
+    ]);
+    expect(r.boardPositions[0]).toMatchObject({ symbol: '6976', symbolName: '太陽誘電', ocrRaw: '買建玉(6カ月) | 保有株数(注文中) 100(0) | 平均建単価 5,870.5' });
+    expect(r.boardPositions[0].ts.toISOString()).toBe('2026-11-11T01:36:35.000Z');
+  });
+
+  it('注文ごとに、平均建単価が読めた最も遅い読み取りを選ぶ（入力順に依らない）', () => {
+    const ps = parseRealEvents(
+      [
+        pos({ id: 'late-null', ts: '2026-11-11T10:36:38.000+09:00', avg_price: null }),
+        pos({ id: 'late', ts: '2026-11-11T10:36:37.500+09:00', avg_price: 5869 }),
+        pos({ id: 'early' }),
+        pos({ id: 'other', after_order_key: 'k2', avg_price: 100 }),
+        pos({ id: 'none', after_order_key: 'k3', avg_price: null }),
+      ].join('\n'),
+    ).boardPositions;
+    const picked = (xs: typeof ps) => Object.fromEntries([...pickBoardPositions(xs)].map(([k, p]) => [k, p.id]));
+    expect(picked(ps)).toEqual({ k1: 'late', k2: 'other' });
+    expect(picked([...ps].reverse())).toEqual({ k1: 'late', k2: 'other' });
   });
 });
 

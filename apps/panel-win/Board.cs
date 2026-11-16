@@ -28,6 +28,9 @@ sealed record Layout(int Top, int Bottom, (int L, int R) Sell, (int L, int R) Bu
 
 sealed record BoardRow(decimal? Price, string? Label, decimal? Sell, decimal? Buy, decimal? SellCount, decimal? BuyCount, decimal? MySell, decimal? MyBuy);
 
+// 全板の右側の建玉欄。Box = 見出しの文字（「買建玉（6カ月）」等）、HasAvgLabel = 「平均建単価」の行が見つかった、Raw = OCR した文字のまま
+sealed record PositionBox(string? Box, bool HasAvgLabel, decimal? Qty, decimal? AvgPrice, decimal? Unrealized, string Raw);
+
 static class Board
 {
     static OcrEngine? ja, en;
@@ -284,6 +287,59 @@ static class Board
             return new BoardRow(label != null ? null : Number(priceText), label, Number(Get("売")), Number(Get("買")),
                                 Number(Get("売件数")), Number(Get("買件数")), Number(Get("売注")), Number(Get("買注")));
         }).ToArray();
+    }
+
+    // 板の右側の建玉欄（見出し「買建玉（6カ月）」、行「保有株数(注文中)」「平均建単価」「評価額」「評価損益(率)」。値は右寄せ、建玉が無ければ「--」）を読む。
+    // 板のマスの値段（指値）と実際の約定値はずれることがあるので、約定の後にここの平均建単価を残す。
+    // 欄の位置は窓の配置で変わるので、板の列より右を日本語の OCR にかけて毎回ラベルを探す（呼ぶのは約定の後だけ）
+    public static async Task<PositionBox> ReadPosition(Bitmap img, Layout lay)
+    {
+        int l = lay.Cols.Max(c => c.R) + 8;
+        if (img.Width - l < 50) return new PositionBox(null, false, null, null, null, "");
+        OcrResult res;
+        using (var crop = img.Clone(new Rectangle(l, 0, img.Width - l, img.Height), PixelFormat.Format24bppRgb)) res = await Ocr(Ja, crop);
+        // 日本語の OCR は 1 文字ずつ語に分けることがあるので、行は語をつなげた文字で見る
+        var words = res.Lines.SelectMany(x => x.Words).ToList();
+        var lines = res.Lines.Where(x => x.Words.Count > 0).Select(x => (
+            Text: string.Concat(x.Words.Select(w => w.Text)),
+            Y: x.Words.Average(w => w.BoundingRect.Y + w.BoundingRect.Height / 2),
+            H: x.Words.Max(w => w.BoundingRect.Height))).ToList();
+        var heads = lines.Where(x => x.Text.Contains("建玉")).ToList();
+        int a = lines.FindIndex(x => x.Text.Contains("平均建") || x.Text.Contains("建単価"));
+        if (a < 0) return new PositionBox(heads.Count > 0 ? heads[0].Text : null, false, null, null, null, "");
+        var avg = lines[a];
+        // ラベルは左寄せ・値は右寄せ。同じ高さの語を左から並べ、いちばん広い隙間より右を値とする
+        (string? Label, string? Value) Row(double y, double h)
+        {
+            var ws = words.Where(w => Math.Abs(w.BoundingRect.Y + w.BoundingRect.Height / 2 - y) < h * 0.6).OrderBy(w => w.BoundingRect.X).ToList();
+            int cut = -1; double gap = h * 1.5;
+            for (int i = 1; i < ws.Count; i++)
+            {
+                double g = ws[i].BoundingRect.X - (ws[i - 1].BoundingRect.X + ws[i - 1].BoundingRect.Width);
+                if (g > gap) { gap = g; cut = i; }
+            }
+            return cut < 0 ? (string.Concat(ws.Select(w => w.Text)), null)
+                : (string.Concat(ws.Take(cut).Select(w => w.Text)), string.Concat(ws.Skip(cut).Select(w => w.Text)));
+        }
+        // 見出しと他の行は平均建単価の行のすぐ上下にあるものだけ（注文欄の「株数」等と取り違えない）
+        string? box = heads.Where(x => x.Y < avg.Y && avg.Y - x.Y < avg.H * 6).OrderBy(x => x.Y).Select(x => x.Text).LastOrDefault();
+        var qtyLine = lines.Where(x => x.Y < avg.Y && avg.Y - x.Y < avg.H * 3 && (x.Text.Contains("保有") || x.Text.Contains("株数"))).OrderBy(x => x.Y).ToList();
+        var pnlLine = lines.Where(x => x.Y > avg.Y && x.Y - avg.Y < avg.H * 5 && x.Text.Contains("損益")).OrderBy(x => x.Y).ToList();
+        var rAvg = Row(avg.Y, avg.H);
+        (string? Label, string? Value) rQty = qtyLine.Count > 0 ? Row(qtyLine[^1].Y, qtyLine[^1].H) : (null, null);
+        (string? Label, string? Value) rPnl = pnlLine.Count > 0 ? Row(pnlLine[0].Y, pnlLine[0].H) : (null, null);
+        var raw = string.Join(" | ", new[] { box, $"{rQty.Label} {rQty.Value}".Trim(), $"{rAvg.Label} {rAvg.Value}".Trim(), $"{rPnl.Label} {rPnl.Value}".Trim() }.Where(x => !string.IsNullOrEmpty(x)));
+        return new PositionBox(box, true, LeadNumber(rQty.Value), LeadNumber(rAvg.Value), LeadNumber(rPnl.Value), raw);
+    }
+
+    // 建玉欄の値の先頭の数字（例 "100(0)" → 100、"5,991" → 5991、"+1,200(+0.20%)" → 1200、"--" → null）。
+    // マイナスの出方（- か ▲ か）は実物で未確認なので、どちらも負の数として読む
+    public static decimal? LeadNumber(string? s)
+    {
+        if (string.IsNullOrWhiteSpace(s)) return null;
+        var t = s.Replace(",", "").Replace(" ", "").Replace("o", "0").Replace("O", "0").Replace('−', '-').Replace('▲', '-');
+        var m = Regex.Match(t, @"^[+-]?\d+(\.\d+)?");
+        return m.Success && decimal.TryParse(m.Value, System.Globalization.NumberStyles.Number, System.Globalization.CultureInfo.InvariantCulture, out var v) ? v : null;
     }
 
     // OCR の数字を読む。カンマを除き、0 と読み違えやすい o・O を 0 にする（例 "1ooo" → 1000、"1,394" → 1394）

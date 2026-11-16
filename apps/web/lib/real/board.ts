@@ -7,6 +7,7 @@ import Decimal from 'decimal.js';
 import type { PrismaClient } from '@/generated/prisma/client';
 import { isOpeningSide } from '@/lib/rounds/builder';
 import { pickEntryExecution, type RealParseResult } from '@/lib/real/memos';
+import type { BoardPositionEvent } from '@/lib/real/events-v2';
 
 /** filled の時刻とこの秒数以内の約定だけを候補にする（全板で数字が消えた瞬間と SBI の約定時刻は秒単位でずれる） */
 export const FILL_WINDOW_SEC = 15;
@@ -95,6 +96,20 @@ export function pickNoteExecution(
   if (byOrder) return { executionId: byOrder.id, method: 'order', deltaMs: byOrder.executedAt.getTime() - note.ts.getTime() };
   const hit = pickEntryExecution(note.ts, note.symbol ? openingExecs.filter((e) => e.symbol === note.symbol) : openingExecs, windowSec);
   return hit ? { executionId: hit.id, method: 'time', deltaMs: hit.executedAt.getTime() - note.ts.getTime() } : null;
+}
+
+/**
+ * filled の注文（after_order_key）ごとに、約定の後の建玉欄の読み取りを 1 件選ぶ（純粋関数）。
+ * 平均建単価が読めたもののうち最も遅いもの（SBI の表示の更新が遅れるので後の方が正しい）。同じ時刻なら後の行
+ */
+export function pickBoardPositions(positions: BoardPositionEvent[]): Map<string, BoardPositionEvent> {
+  const out = new Map<string, BoardPositionEvent>();
+  for (const p of positions) {
+    if (p.avgPrice === null) continue;
+    const cur = out.get(p.afterOrderKey);
+    if (!cur || p.ts.getTime() >= cur.ts.getTime()) out.set(p.afterOrderKey, p);
+  }
+  return out;
 }
 
 /** 新しい v2 の行だけを DB に入れる（取り込み済みの id は触らない） */

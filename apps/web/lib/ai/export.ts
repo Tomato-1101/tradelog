@@ -16,7 +16,8 @@ import { barWindowTo } from '@/lib/rounds/excursion';
 import { paperDir } from '@/lib/paper/shots';
 import { replayEndResolver, type ReplayEndResolver } from '@/lib/paper/recordings';
 import { LINK_WINDOW_SEC } from '@/lib/real/memos';
-import { FILL_WINDOW_SEC, NOTE_WINDOW_SEC } from '@/lib/real/board';
+import { FILL_WINDOW_SEC, NOTE_WINDOW_SEC, pickBoardPositions } from '@/lib/real/board';
+import type { BoardPositionEvent } from '@/lib/real/events-v2';
 
 const JST_MS = 9 * 3600_000;
 export function toJstIso(d: Date): string {
@@ -29,8 +30,16 @@ const ROUND_CHUNK = 100;
 
 export type ExportReport = { trades: number; withBars: number; tradesPath: string; summaryPath: string };
 
-/** opts.replayEnd: 録画 ID → 録画の終わり（既定は data/paper の録画メタを読む） */
-export async function exportForAi(db: PrismaClient, outDir: string, now: Date, opts: { replayEnd?: ReplayEndResolver } = {}): Promise<ExportReport> {
+/**
+ * opts.replayEnd: 録画 ID → 録画の終わり（既定は data/paper の録画メタを読む）
+ * opts.boardPositions: 約定の後の建玉欄の読み取り（DB に無いので events.jsonl を読んだ結果を渡す。無ければ付けない）
+ */
+export async function exportForAi(
+  db: PrismaClient,
+  outDir: string,
+  now: Date,
+  opts: { replayEnd?: ReplayEndResolver; boardPositions?: BoardPositionEvent[] } = {},
+): Promise<ExportReport> {
   const replayEnd = opts.replayEnd ?? replayEndResolver(paperDir());
   fs.mkdirSync(outDir, { recursive: true });
   const order = [{ openedAt: 'asc' as const }, { id: 'asc' as const }];
@@ -70,8 +79,10 @@ export async function exportForAi(db: PrismaClient, outDir: string, now: Date, o
   for (const n of await db.realNote.findMany({ where: { executionId: { not: null } }, orderBy: [{ ts: 'asc' }, { id: 'asc' }] })) {
     notesByExec.set(n.executionId!, [...(notesByExec.get(n.executionId!) ?? []), n]);
   }
+  const positions = pickBoardPositions(opts.boardPositions ?? []);
   const boardOrderOut = (f: BoardRow, executedAt: Date) => {
     const life = byKey.get(f.orderKey) ?? [];
+    const pos = positions.get(f.orderKey);
     // 発注の時刻は placed（白い背景が出た時刻）。白い背景を見ていない注文は appeared
     const placed = life.find((o) => o.event === 'placed') ?? life.find((o) => o.event === 'appeared') ?? null;
     return {
@@ -87,6 +98,8 @@ export async function exportForAi(db: PrismaClient, outDir: string, now: Date, o
       pending_ms: placed?.pendingMs ?? null,
       board_at_placed: placed ? (JSON.parse(placed.boardJson) as unknown[]) : null,
       board_at_fill: JSON.parse(f.boardJson) as unknown[],
+      // 約定の後に全板の建玉欄で読めた平均建単価（price は板のマスの行の値段で、実際の約定値とずれることがある）。欄は銘柄の建玉全体の数字
+      ...(pos ? { position: { avg_price: String(pos.avgPrice), qty: pos.qty, box: pos.box } } : {}),
     };
   };
 

@@ -64,7 +64,8 @@ sealed class PanelForm : Form
         // 書きかけのまま他の窓をクリックしても文を失わない
         Deactivate += (_, _) => { if (note.Text.Trim().Length > 0) Save(test: false); };
 
-        monitor = new BoardMonitor(s => Ui(() => status.Text = s), s => Ui(() => { lastEvent.ForeColor = ForeColor; lastEvent.Text = s; }));
+        monitor = new BoardMonitor(s => Ui(() => status.Text = s), s => Ui(() => { lastEvent.ForeColor = ForeColor; lastEvent.Text = s; }),
+            () => Ui(() => { lastEvent.ForeColor = SystemColors.GrayText; lastEvent.Text = "注文はまだ見ていない"; }));
 
         // 保存後にフォーカスを返す先（小窓より前に前面だった窓）と、SSH からの動作確認（data\real\cmd\）を見る
         timer = new System.Windows.Forms.Timer { Interval = 250 };

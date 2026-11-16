@@ -138,7 +138,7 @@ async function main() {
   }
 
   // 5. AI 書き出し
-  const ex = await exportForAi(prisma, outDir, now, { replayEnd });
+  const ex = await exportForAi(prisma, outDir, now, { replayEnd, boardPositions: reing.boardPositions });
   console.log(`[ai] ${ex.tradesPath}（${ex.trades} 件、1 分足あり ${ex.withBars}）/ ${ex.summaryPath}`);
 }
 

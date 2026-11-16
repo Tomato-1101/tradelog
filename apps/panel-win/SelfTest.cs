@@ -120,6 +120,11 @@ static class SelfTest
         Check("数字 1376.5", Board.Number("1376.5") == 1376.5m);
         Check("数字 abc", Board.Number("abc") == null);
         Check("数字 空", Board.Number("") == null);
+        Check("建玉の数字 100(0)", Board.LeadNumber("100(0)") == 100m);
+        Check("建玉の数字 5,991.5", Board.LeadNumber("5,991.5") == 5991.5m);
+        Check("建玉の数字 +1,200(+0.20%)", Board.LeadNumber("+1,200(+0.20%)") == 1200m);
+        Check("建玉の数字 -350", Board.LeadNumber("-350(-0.06%)") == -350m);
+        Check("建玉の数字 --", Board.LeadNumber("--") == null);
         var t = Board.ParseTitle("全板　ソフトバンクグループ(9984)");
         Check("タイトル", t == ("9984", "ソフトバンクグループ"), $"{t}");
         var t2 = Board.ParseTitle("全板");
@@ -147,6 +152,10 @@ static class SelfTest
         Check("値段の OCR", priced >= lay.Rows.Count * 0.8, $"{priced}/{lay.Rows.Count}");
         Check("追う行の範囲", lay.Lo > 0 && lay.Hi < lay.Rows.Count - 1 && lay.Hi - lay.Lo >= 10
             && rows[lay.Lo].Price != null && rows[lay.Hi].Price != null, $"{lay.Lo}-{lay.Hi} / {lay.Rows.Count}");
+        // 見本の画像は建玉が無い（値は「--」）
+        var pos = Board.ReadPosition(bmp, lay).GetAwaiter().GetResult();
+        Check("建玉欄の見出し", pos.Box?.Contains("建玉") == true, pos.Box ?? "（見つからない）");
+        Check("建玉欄の平均建単価", pos.HasAvgLabel && pos.AvgPrice == null, $"avg={pos.AvgPrice} qty={pos.Qty} raw={pos.Raw}");
         for (int k = 0; k < rows.Length; k++)
         {
             var r = rows[k];

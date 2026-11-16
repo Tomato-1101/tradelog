@@ -63,6 +63,30 @@ Windows の記録小窓（`apps/panel-win`）が追記し、Mac の `scripts/pul
 | `my_sell` | number \| null | 自分の売注 |
 | `my_buy` | number \| null | 自分の買注 |
 
+## `board_position`（約定の後の建玉欄 1 回の読み取り = 1 行）
+板のマスの値段（指値の行）と実際の約定値はずれることがある（板の向こう側をクリックして即約定させると、指値より良い値で約定する）。
+`filled` を出すたびに、約 1.5 秒後と約 4 秒後（SBI の建玉表示の更新が遅れるため 2 回）に全板の右側の建玉欄（見出し「買建玉（6カ月）」）を OCR して残す。
+その間に銘柄が切り替わったら読まない。読めなかった値は null（建玉が無い時の表示「--」も null）。
+
+| key | 型 | 説明 |
+|---|---|---|
+| `v` | 2 | |
+| `type` | `board_position` | |
+| `id` | string(UUID) | |
+| `ts` | string | 建玉欄を撮った時刻 |
+| `symbol` | string \| null | `board_order` と同じ |
+| `symbol_name` | string \| null | |
+| `after_order_key` | string | きっかけになった `filled` の `order_key` |
+| `after_ms` | number \| null | その `filled` の `ts` から撮るまでの経過 ms |
+| `box` | string \| null | 欄の見出しの文字（OCR のまま。例 `買建玉(6カ月)`）。見つからなければ null |
+| `qty` | number \| null | 「保有株数(注文中)」の先頭の数字 |
+| `avg_price` | number \| null | 「平均建単価」 |
+| `unrealized` | number \| null | 「評価損益(率)」の先頭の数字（円） |
+| `raw` | string \| null | 欄の OCR の文字のまま（見出し・各行を ` \| ` でつなぐ。「平均建単価」の行が見つからなければ空文字） |
+| `test` | true（任意） | |
+
+- 欄の数字は銘柄の建玉全体のもの（その注文 1 件の約定値ではない）。同じ銘柄を複数回に分けて建てると平均になる。
+
 ## `real_note`（理由の入力 1 回 = 1 行）
 | key | 型 | 説明 |
 |---|---|---|
@@ -86,4 +110,6 @@ Windows の記録小窓（`apps/panel-win`）が追記し、Mac の `scripts/pul
 - 小窓のメモは `last_order` の注文が約定に結び付いていればその約定、無ければ前後 5 分の建て約定のうち `symbol` と同じ銘柄で最も近いもの（`symbol` が null なら銘柄を見ない）。
 - `npm run daily` が毎回 `data/real/events.jsonl` を読み、新しい `id` だけ DB に入れる。
 - 結び付けは daily のたびに全件やり直す（SBI の約定時刻は後から注文履歴で付くため）。規則は web の実装（`apps/web/lib/real/`）が正。
+- `board_position` は DB に入れない。daily が毎回 `events.jsonl` から読み、`trades.jsonl` の `board_orders[]` のうち同じ `after_order_key` の要素に、
+  `avg_price` が読めた最も遅い 1 件を `position`（`{avg_price, qty, box}`）として付ける。
 - 理由の文が長いものは daily で LLM（Groq の無料枠）が短く要約する。鍵が無い・失敗した時は要約なしで続ける。

@@ -5,7 +5,7 @@
 
 import type { PrismaClient } from '@/generated/prisma/client';
 import { isOpeningSide } from '@/lib/rounds/builder';
-import { parseV2Event, type BoardOrderEvent, type RealNoteEvent } from '@/lib/real/events-v2';
+import { parseV2Event, type BoardOrderEvent, type BoardPositionEvent, type RealNoteEvent } from '@/lib/real/events-v2';
 
 /** 記録の前後この秒数以内の建て約定だけを候補にする（ボタンは約定の前後数秒〜数十秒に押す想定） */
 export const LINK_WINDOW_SEC = 60;
@@ -28,6 +28,8 @@ export type RealParseResult = {
   memos: RealMemoEvent[];
   // v2（board_order / real_note）。同じファイルに v1 と混在する
   boardOrders: BoardOrderEvent[];
+  // 約定の後の建玉欄（DB には入れない。書き出しの時に board_orders へ付ける）
+  boardPositions: BoardPositionEvent[];
   notes: RealNoteEvent[];
   test: number;
   partial: number;
@@ -36,7 +38,7 @@ export type RealParseResult = {
 
 /** events.jsonl の全行を読む（純粋関数）。契約違反の行はエラーに入れてその行だけ捨てる */
 export function parseRealEvents(text: string): RealParseResult {
-  const out: RealParseResult = { lines: 0, memos: [], boardOrders: [], notes: [], test: 0, partial: 0, errors: [] };
+  const out: RealParseResult = { lines: 0, memos: [], boardOrders: [], boardPositions: [], notes: [], test: 0, partial: 0, errors: [] };
   const rows = text.replace(/^﻿/, '').split('\n');
   rows.forEach((row, i) => {
     const line = i + 1;
@@ -65,6 +67,7 @@ export function parseRealEvents(text: string): RealParseResult {
       const r = parseV2Event(e, s);
       if (typeof r === 'string') return err(r);
       if (r.kind === 'board_order') out.boardOrders.push(r.event);
+      else if (r.kind === 'board_position') out.boardPositions.push(r.event);
       else out.notes.push(r.event);
       return;
     }

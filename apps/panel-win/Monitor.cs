@@ -12,9 +12,21 @@ sealed record LastOrder(string OrderKey, string Event, string Side, decimal? Pri
 // 窓の操作・クリック・フォーカスの移動は一切しない（撮るだけ）
 sealed class BoardMonitor
 {
-    sealed record Job(Bitmap Img, Layout Lay, List<TrackEvent> Events, string Title);
+    // Pos があれば注文のイベントではなく、約定の後の建玉欄の読み取り（Ts = 撮った時刻）
+    sealed record PosReq(string OrderKey, DateTimeOffset FillTs, DateTimeOffset Ts);
+    sealed record Job(Bitmap Img, Layout Lay, List<TrackEvent> Events, string Title, PosReq? Pos = null);
+
+    // 約定から建玉欄を撮り直すまでの ms。SBI の建玉表示の更新が遅れるので 2 回読む
+    static readonly int[] PosDelays = [1500, 4000];
 
     readonly Action<string> onStatus, onEvent;
+    readonly Action onClear;
+    // 小窓の 2 行目（最後の注文）の表示と、いま見ている全板のタイトルの更新を同時に行わせない。
+    // 銘柄を切り替えた後に、OCR スレッドが切り替え前の銘柄のイベントを表示しないため
+    readonly object uiLock = new();
+    string? curTitle;
+    // 2 行目に最後に出したイベントの文と注文（OCR スレッドだけが触る）。建玉欄が読めたらこの文に付け足す
+    string lastText = "", lastTextKey = "";
     readonly BlockingCollection<Job> jobs = [];
     readonly Dictionary<string, (decimal? Price, decimal? Qty)> known = [];
     volatile bool stop;
@@ -24,10 +36,23 @@ sealed class BoardMonitor
     // いま見張っている全板の銘柄コード。理由のメモに載せ、Mac で同じ銘柄の約定にだけ結び付ける（全板が無ければ null）
     public volatile string? Symbol;
 
-    public BoardMonitor(Action<string> onStatus, Action<string> onEvent)
+    public BoardMonitor(Action<string> onStatus, Action<string> onEvent, Action onClear)
     {
         this.onStatus = onStatus;
         this.onEvent = onEvent;
+        this.onClear = onClear;
+    }
+
+    // 銘柄が変わった・全板が閉じた時: 前の銘柄の注文が新しい銘柄のものに見えないよう、2 行目の表示を消す。
+    // Last（理由のメモの last_order）は Mac の結び付けに使うので消さない
+    void SetTitle(string? title)
+    {
+        lock (uiLock) { curTitle = title; onClear(); }
+    }
+
+    void Show(string title, string text)
+    {
+        lock (uiLock) { if (title == curTitle) onEvent(text); }
     }
 
     public void Start()
@@ -107,6 +132,9 @@ sealed class BoardMonitor
         var tracker = new Tracker();
         string title = Native.TitleOf(h);
         Symbol = Board.ParseTitle(title).Code;
+        SetTitle(title);
+        // 約定の後に建玉欄を撮り直す予定（Due = sw の ms）
+        var posDue = new List<(double Due, string OrderKey, DateTimeOffset FillTs)>();
         var sw = Stopwatch.StartNew();
         long frames = 0, statFrames = 0;
         double lastT = 0, statT = 0;
@@ -122,7 +150,7 @@ sealed class BoardMonitor
                 {
                     var t = Native.TitleOf(h);
                     if (!t.StartsWith("全板")) { Log.Write("全板ではなくなった: " + t); return; }
-                    if (t != title) { Log.Write($"銘柄が変わった {title} → {t}。追跡をやり直す"); title = t; Symbol = Board.ParseTitle(t).Code; tracker.Reset(); }
+                    if (t != title) { Log.Write($"銘柄が変わった {title} → {t}。追跡をやり直す"); title = t; Symbol = Board.ParseTitle(t).Code; tracker.Reset(); posDue.Clear(); SetTitle(t); }
                 }
                 if (Native.IsIconic(h))
                 {
@@ -157,6 +185,14 @@ sealed class BoardMonitor
                 }
                 var ts = DateTimeOffset.Now;
                 Board.Grab(h, img!);
+                for (int i = posDue.Count - 1; i >= 0; i--)
+                {
+                    if (t0 < posDue[i].Due) continue;
+                    // 銘柄が切り替わっていたら別の銘柄の建玉なので読まない
+                    if (Native.TitleOf(h) == title)
+                        jobs.Add(new Job(img!.Clone(new Rectangle(0, 0, w, hh), PixelFormat.Format24bppRgb), lay, [], title, new PosReq(posDue[i].OrderKey, posDue[i].FillTs, ts)));
+                    posDue.RemoveAt(i);
+                }
                 px.Load(img!, lay.ScanRect(w, hh));
                 Board.PriceSig(px, lay, sig);
                 if (!Board.AllBlank(sig)) // 描画が抜けたフレームは飛ばす
@@ -178,6 +214,8 @@ sealed class BoardMonitor
                         tracker.ApplyShift(shift);
                         var evs = tracker.Step(ts, sell, buy);
                         if (evs.Count > 0) jobs.Add(new Job(img!.Clone(new Rectangle(0, 0, w, hh), PixelFormat.Format24bppRgb), lay, evs, title));
+                        foreach (var ev in evs.Where(e => e.Event == "filled"))
+                            foreach (var d in PosDelays) posDue.Add((t0 + d, ev.OrderKey, ev.Ts));
                     }
                     (prev, sig) = (sig, prev);
                 }
@@ -195,7 +233,7 @@ sealed class BoardMonitor
                 if (wait > 0) Thread.Sleep(wait);
             }
         }
-        finally { img?.Dispose(); Symbol = null; }
+        finally { img?.Dispose(); Symbol = null; SetTitle(null); }
     }
 
     static readonly Dictionary<string, string> Words = new()
@@ -212,6 +250,7 @@ sealed class BoardMonitor
         {
             try
             {
+                if (job.Pos != null) { WritePosition(job, job.Pos); continue; }
                 BoardRow[] rows;
                 try { rows = Board.Read(job.Img, job.Lay).GetAwaiter().GetResult(); }
                 catch (Exception e) { Log.Write("板の OCR に失敗: " + e.Message); rows = []; }
@@ -241,11 +280,30 @@ sealed class BoardMonitor
                     Last = new LastOrder(ev.OrderKey, ev.Event, ev.Side, price, ev.Ts);
                     var text = $"{ev.Ts:HH:mm:ss} {(ev.Side == "BUY" ? "買" : "売")} {price?.ToString("0.#") ?? "?"} ×{qty?.ToString("0") ?? "?"} {Words[ev.Event]}";
                     Log.Write($"イベント {ev.Event} {ev.Side} row={ev.Row} price={price} qty={qty} pending_ms={ev.PendingMs} key={ev.OrderKey} 板{rows.Length}行");
-                    onEvent(text);
+                    (lastText, lastTextKey) = (text, ev.OrderKey);
+                    Show(job.Title, text);
                 }
             }
             catch (Exception e) { Log.Write("イベントの書き込みに失敗: " + e); }
             finally { job.Img.Dispose(); }
         }
+    }
+
+    // 約定の後の建玉欄を読んで board_position を 1 行書く（読めなくても raw を残す）
+    void WritePosition(Job job, PosReq req)
+    {
+        var pos = Board.ReadPosition(job.Img, job.Lay).GetAwaiter().GetResult();
+        var (code, name) = Board.ParseTitle(job.Title);
+        int afterMs = (int)Math.Round((req.Ts - req.FillTs).TotalMilliseconds);
+        Jsonl.Write(new JsonObject
+        {
+            ["v"] = 2, ["type"] = "board_position", ["id"] = Guid.NewGuid().ToString(), ["ts"] = Jsonl.Ts(req.Ts),
+            ["symbol"] = code, ["symbol_name"] = name, ["after_order_key"] = req.OrderKey, ["after_ms"] = afterMs,
+            ["box"] = pos.Box, ["qty"] = N(pos.Qty), ["avg_price"] = N(pos.AvgPrice), ["unrealized"] = N(pos.Unrealized), ["raw"] = pos.Raw,
+        });
+        Log.Write($"建玉欄 after_ms={afterMs} box={pos.Box} qty={pos.Qty} avg_price={pos.AvgPrice} unrealized={pos.Unrealized} label={pos.HasAvgLabel} key={req.OrderKey} raw={pos.Raw}");
+        // 2 行目がまだその約定のままなら、読めた平均建単価を付け足す（後の読み取りで上書き）
+        if (pos.AvgPrice is { } avg && req.OrderKey == lastTextKey)
+            Show(job.Title, $"{lastText} / 平均建単価 {avg:#,0.#}{(pos.Qty is { } q ? $"({q:0}株)" : "")}");
     }
 }
