@@ -125,10 +125,45 @@ static class SelfTest
         Check("建玉の数字 +1,200(+0.20%)", Board.LeadNumber("+1,200(+0.20%)") == 1200m);
         Check("建玉の数字 -350", Board.LeadNumber("-350(-0.06%)") == -350m);
         Check("建玉の数字 --", Board.LeadNumber("--") == null);
+        PositionCases();
         var t = Board.ParseTitle("全板　ソフトバンクグループ(9984)");
         Check("タイトル", t == ("9984", "ソフトバンクグループ"), $"{t}");
         var t2 = Board.ParseTitle("全板");
         Check("タイトル（銘柄なし）", t2 == (null, null), $"{t2}");
+    }
+
+    // 建玉欄の値の拾い方（合成の OCR 結果。1 文字 16px・高さ 20px）。値が右・下の段・ラベルが横並びの 3 通りと、建玉が無い時
+    static void PositionCases()
+    {
+        static List<Board.PosWord> L(double y, params (string T, double X)[] ws) =>
+            ws.Select(w => new Board.PosWord(w.T, w.X, y, w.T.Length * 16, 20)).ToList();
+        void Expect(string name, List<List<Board.PosWord>> lines, decimal? qty, decimal? avg, decimal? pnl)
+        {
+            var p = Board.ParsePosition(lines);
+            Check(name, p.HasAvgLabel && p.Qty == qty && p.AvgPrice == avg && p.Unrealized == pnl,
+                $"qty={p.Qty} avg={p.AvgPrice} pnl={p.Unrealized} raw={p.Raw}");
+        }
+        Expect("建玉欄: 値が右", [
+            L(0, ("買建玉(6カ月)", 0)),
+            L(30, ("保有株数(注文中)", 0), ("100(0)", 300)),
+            L(60, ("平均建単価", 0), ("5,991.5", 300)),
+            L(90, ("評価額", 0), ("599,150", 300)),
+            L(120, ("評価損益(率)", 0), ("+1,200(+0.20%)", 260))], 100m, 5991.5m, 1200m);
+        Expect("建玉欄: 値がラベルの下", [
+            L(0, ("買建玉(6カ月)", 0)),
+            L(30, ("保有株数(注文中)", 0)), L(60, ("100(0)", 100)),
+            L(90, ("平均建単価", 0)), L(120, ("5,991.5", 60)),
+            L(150, ("評価損益(率)", 0)), L(180, ("+1,200(+0.20%)", 40))], 100m, 5991.5m, 1200m);
+        Expect("建玉欄: ラベルが横並びで値が下", [
+            L(0, ("買建玉(6カ月)", 0)),
+            L(30, ("保有株数(注文中)", 0), ("平", 200), ("均", 216), ("建", 232), ("単", 248), ("価", 264), ("評価損益(率)", 360)),
+            L(60, ("100(0)", 40), ("5,991.5", 190), ("+1,200(+0.20%)", 340))], 100m, 5991.5m, 1200m);
+        Expect("建玉欄: 建玉なし（--）", [
+            L(0, ("買建玉(6カ月)", 0)),
+            L(30, ("保有株数(注文中)", 0), ("--", 300)),
+            L(60, ("平均建単価", 0), ("--", 300)),
+            L(90, ("評価額", 0), ("--", 300)),
+            L(120, ("評価損益(率)", 0), ("--", 300))], null, null, null);
     }
 
     static void ImageCase(string path)

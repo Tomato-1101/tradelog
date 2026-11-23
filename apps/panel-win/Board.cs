@@ -298,12 +298,30 @@ static class Board
         if (img.Width - l < 50) return new PositionBox(null, false, null, null, null, "");
         OcrResult res;
         using (var crop = img.Clone(new Rectangle(l, 0, img.Width - l, img.Height), PixelFormat.Format24bppRgb)) res = await Ocr(Ja, crop);
+        return ParsePosition(res.Lines.Select(x => x.Words.Select(w =>
+            new PosWord(w.Text, w.BoundingRect.X, w.BoundingRect.Y, w.BoundingRect.Width, w.BoundingRect.Height)).ToList()).ToList());
+    }
+
+    // OCR の 1 語（位置は切り出した画像の中の px）
+    public readonly record struct PosWord(string Text, double X, double Y, double W, double H)
+    {
+        public double Cy => Y + H / 2;
+        public double R => X + W;
+    }
+
+    // 建玉欄の OCR の行（行ごとの語）から値を拾う。値の出方は 2 通りに対応する:
+    // (1) ラベルの右に同じ行で右寄せ（「平均建単価      5,991.5」）
+    // (2) ラベルのすぐ下の段（「平均建単価」の下に「5,991.5」。本人の画面ではこう出るとの指摘、2026-11-23）
+    // 同じ行の右に数字が読めた時は (1)、読めなければラベルの文字の真下の段を (2) として読む
+    public static PositionBox ParsePosition(List<List<PosWord>> lineWords)
+    {
         // 日本語の OCR は 1 文字ずつ語に分けることがあるので、行は語をつなげた文字で見る
-        var words = res.Lines.SelectMany(x => x.Words).ToList();
-        var lines = res.Lines.Where(x => x.Words.Count > 0).Select(x => (
-            Text: string.Concat(x.Words.Select(w => w.Text)),
-            Y: x.Words.Average(w => w.BoundingRect.Y + w.BoundingRect.Height / 2),
-            H: x.Words.Max(w => w.BoundingRect.Height))).ToList();
+        var words = lineWords.SelectMany(x => x).ToList();
+        var lines = lineWords.Where(x => x.Count > 0).Select(x => (
+            Text: string.Concat(x.Select(w => w.Text)),
+            Y: x.Average(w => w.Cy),
+            H: x.Max(w => w.H),
+            Words: x)).ToList();
         var heads = lines.Where(x => x.Text.Contains("建玉")).ToList();
         int a = lines.FindIndex(x => x.Text.Contains("平均建") || x.Text.Contains("建単価"));
         if (a < 0) return new PositionBox(heads.Count > 0 ? heads[0].Text : null, false, null, null, null, "");
@@ -311,25 +329,59 @@ static class Board
         // ラベルは左寄せ・値は右寄せ。同じ高さの語を左から並べ、いちばん広い隙間より右を値とする
         (string? Label, string? Value) Row(double y, double h)
         {
-            var ws = words.Where(w => Math.Abs(w.BoundingRect.Y + w.BoundingRect.Height / 2 - y) < h * 0.6).OrderBy(w => w.BoundingRect.X).ToList();
+            var ws = words.Where(w => Math.Abs(w.Cy - y) < h * 0.6).OrderBy(w => w.X).ToList();
             int cut = -1; double gap = h * 1.5;
             for (int i = 1; i < ws.Count; i++)
             {
-                double g = ws[i].BoundingRect.X - (ws[i - 1].BoundingRect.X + ws[i - 1].BoundingRect.Width);
+                double g = ws[i].X - ws[i - 1].R;
                 if (g > gap) { gap = g; cut = i; }
             }
             return cut < 0 ? (string.Concat(ws.Select(w => w.Text)), null)
                 : (string.Concat(ws.Take(cut).Select(w => w.Text)), string.Concat(ws.Skip(cut).Select(w => w.Text)));
         }
-        // 見出しと他の行は平均建単価の行のすぐ上下にあるものだけ（注文欄の「株数」等と取り違えない）
+        // ラベルの文字の幅（key を含む最短の連続した語を、隙間なく続く語まで広げる）の真下で、いちばん近い段の文字
+        string? Below(List<PosWord> lw, double y, double h, string[] keys)
+        {
+            var ws = lw.OrderBy(w => w.X).ToList();
+            int bi = -1, bj = -1;
+            for (int i = 0; i < ws.Count; i++)
+            {
+                var s = "";
+                for (int j = i; j < ws.Count; j++)
+                {
+                    s += ws[j].Text;
+                    if (!keys.Any(k => s.Contains(k))) continue;
+                    if (bi < 0 || ws[j].R - ws[i].X < ws[bj].R - ws[bi].X) (bi, bj) = (i, j);
+                    break;
+                }
+            }
+            if (bi < 0) return null;
+            while (bi > 0 && ws[bi].X - ws[bi - 1].R < h * 0.8) bi--;
+            while (bj < ws.Count - 1 && ws[bj + 1].X - ws[bj].R < h * 0.8) bj++;
+            double l = ws[bi].X - h * 0.5, r = ws[bj].R + h * 0.5;
+            var under = words.Where(w => w.Cy > y + h * 0.6 && w.Cy < y + h * 3 && w.R > l && w.X < r).ToList();
+            if (under.Count == 0) return null;
+            double top = under.Min(w => w.Cy);
+            return string.Concat(under.Where(w => w.Cy - top < h * 0.6).OrderBy(w => w.X).Select(w => w.Text));
+        }
+        (string? Label, string? Value, decimal? Num) Pick((string Text, double Y, double H, List<PosWord> Words) line, params string[] keys)
+        {
+            var (label, value) = Row(line.Y, line.H);
+            if (LeadNumber(value) is { } n) return (label, value, n);
+            var below = Below(line.Words, line.Y, line.H, keys);
+            if (LeadNumber(below) is { } nb) return (keys[0], "↓" + below, nb);
+            return (label, value, null);
+        }
+        // 見出しと他の行は平均建単価の行のすぐ上下にあるものだけ（注文欄の「株数」等と取り違えない）。
+        // 値が下の段に出る並びでは保有株数が 2 段上、ラベルが横に並ぶ並びでは同じ行になる
         string? box = heads.Where(x => x.Y < avg.Y && avg.Y - x.Y < avg.H * 6).OrderBy(x => x.Y).Select(x => x.Text).LastOrDefault();
-        var qtyLine = lines.Where(x => x.Y < avg.Y && avg.Y - x.Y < avg.H * 3 && (x.Text.Contains("保有") || x.Text.Contains("株数"))).OrderBy(x => x.Y).ToList();
-        var pnlLine = lines.Where(x => x.Y > avg.Y && x.Y - avg.Y < avg.H * 5 && x.Text.Contains("損益")).OrderBy(x => x.Y).ToList();
-        var rAvg = Row(avg.Y, avg.H);
-        (string? Label, string? Value) rQty = qtyLine.Count > 0 ? Row(qtyLine[^1].Y, qtyLine[^1].H) : (null, null);
-        (string? Label, string? Value) rPnl = pnlLine.Count > 0 ? Row(pnlLine[0].Y, pnlLine[0].H) : (null, null);
+        var qtyLine = lines.Where(x => x.Y <= avg.Y + avg.H * 0.3 && avg.Y - x.Y < avg.H * 5 && (x.Text.Contains("保有") || x.Text.Contains("株数"))).OrderBy(x => x.Y).ToList();
+        var pnlLine = lines.Where(x => x.Y >= avg.Y - avg.H * 0.3 && x.Y - avg.Y < avg.H * 5 && x.Text.Contains("損益")).OrderBy(x => x.Y).ToList();
+        var rAvg = Pick(avg, "平均建", "建単価");
+        (string? Label, string? Value, decimal? Num) rQty = qtyLine.Count > 0 ? Pick(qtyLine[^1], "保有", "株数") : (null, null, null);
+        (string? Label, string? Value, decimal? Num) rPnl = pnlLine.Count > 0 ? Pick(pnlLine[0], "損益") : (null, null, null);
         var raw = string.Join(" | ", new[] { box, $"{rQty.Label} {rQty.Value}".Trim(), $"{rAvg.Label} {rAvg.Value}".Trim(), $"{rPnl.Label} {rPnl.Value}".Trim() }.Where(x => !string.IsNullOrEmpty(x)));
-        return new PositionBox(box, true, LeadNumber(rQty.Value), LeadNumber(rAvg.Value), LeadNumber(rPnl.Value), raw);
+        return new PositionBox(box, true, rQty.Num, rAvg.Num, rPnl.Num, raw);
     }
 
     // 建玉欄の値の先頭の数字（例 "100(0)" → 100、"5,991" → 5991、"+1,200(+0.20%)" → 1200、"--" → null）。
