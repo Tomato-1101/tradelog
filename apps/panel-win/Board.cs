@@ -296,10 +296,16 @@ static class Board
     {
         int l = lay.Cols.Max(c => c.R) + 8;
         if (img.Width - l < 50) return new PositionBox(null, false, null, null, null, "");
-        OcrResult res;
-        using (var crop = img.Clone(new Rectangle(l, 0, img.Width - l, img.Height), PixelFormat.Format24bppRgb)) res = await Ocr(Ja, crop);
-        return ParsePosition(res.Lines.Select(x => x.Words.Select(w =>
-            new PosWord(w.Text, w.BoundingRect.X, w.BoundingRect.Y, w.BoundingRect.Width, w.BoundingRect.Height)).ToList()).ToList());
+        OcrResult res, num;
+        // ラベルは日本語の OCR で探し、数字は英語の OCR で読む（日本語の OCR はカンマを「ノ」「′」、7 を「乙」と読み違えた。2026-11-24 の実物）
+        using (var crop = img.Clone(new Rectangle(l, 0, img.Width - l, img.Height), PixelFormat.Format24bppRgb))
+        {
+            res = await Ocr(Ja, crop);
+            num = await Ocr(En, crop);
+        }
+        static List<PosWord> Words(OcrLine x) => x.Words.Select(w =>
+            new PosWord(w.Text, w.BoundingRect.X, w.BoundingRect.Y, w.BoundingRect.Width, w.BoundingRect.Height)).ToList();
+        return ParsePosition(res.Lines.Select(Words).ToList(), num.Lines.SelectMany(Words).ToList());
     }
 
     // OCR の 1 語（位置は切り出した画像の中の px）
@@ -313,7 +319,8 @@ static class Board
     // (1) ラベルの右に同じ行で右寄せ（「平均建単価      5,991.5」）
     // (2) ラベルのすぐ下の段（「平均建単価」の下に「5,991.5」。本人の画面ではこう出るとの指摘、2026-11-23）
     // 同じ行の右に数字が読めた時は (1)、読めなければラベルの文字の真下の段を (2) として読む
-    public static PositionBox ParsePosition(List<List<PosWord>> lineWords)
+    // numWords = 同じ画像を英語の OCR で読んだ語。値の場所の数字はこちらを優先し、数字が読めなければ日本語の OCR の文字を使う
+    public static PositionBox ParsePosition(List<List<PosWord>> lineWords, List<PosWord>? numWords = null)
     {
         // 日本語の OCR は 1 文字ずつ語に分けることがあるので、行は語をつなげた文字で見る
         var words = lineWords.SelectMany(x => x).ToList();
@@ -326,6 +333,16 @@ static class Board
         int a = lines.FindIndex(x => x.Text.Contains("平均建") || x.Text.Contains("建単価"));
         if (a < 0) return new PositionBox(heads.Count > 0 ? heads[0].Text : null, false, null, null, null, "");
         var avg = lines[a];
+        // 値の場所（inRegion）にある英語の OCR の語。数字として読めればそれ、読めなければ日本語の OCR の文字（ja）
+        string? Num(string? ja, Func<PosWord, bool> inRegion, double h)
+        {
+            if (numWords == null) return ja;
+            var ws = numWords.Where(inRegion).ToList();
+            if (ws.Count == 0) return ja;
+            double top = ws.Min(w => w.Cy);
+            var en = string.Concat(ws.Where(w => w.Cy - top < h * 0.6).OrderBy(w => w.X).Select(w => w.Text));
+            return LeadNumber(en) != null ? en : ja;
+        }
         // ラベルは左寄せ・値は右寄せ。同じ高さの語を左から並べ、いちばん広い隙間より右を値とする
         (string? Label, string? Value) Row(double y, double h)
         {
@@ -336,8 +353,10 @@ static class Board
                 double g = ws[i].X - ws[i - 1].R;
                 if (g > gap) { gap = g; cut = i; }
             }
-            return cut < 0 ? (string.Concat(ws.Select(w => w.Text)), null)
-                : (string.Concat(ws.Take(cut).Select(w => w.Text)), string.Concat(ws.Skip(cut).Select(w => w.Text)));
+            if (cut < 0) return (string.Concat(ws.Select(w => w.Text)), null);
+            double vx = ws[cut].X - h * 0.5;
+            return (string.Concat(ws.Take(cut).Select(w => w.Text)),
+                Num(string.Concat(ws.Skip(cut).Select(w => w.Text)), w => Math.Abs(w.Cy - y) < h * 0.6 && w.X >= vx, h));
         }
         // ラベルの文字の幅（key を含む最短の連続した語を、隙間なく続く語まで広げる）の真下で、いちばん近い段の文字
         string? Below(List<PosWord> lw, double y, double h, string[] keys)
@@ -359,10 +378,11 @@ static class Board
             while (bi > 0 && ws[bi].X - ws[bi - 1].R < h * 0.8) bi--;
             while (bj < ws.Count - 1 && ws[bj + 1].X - ws[bj].R < h * 0.8) bj++;
             double l = ws[bi].X - h * 0.5, r = ws[bj].R + h * 0.5;
-            var under = words.Where(w => w.Cy > y + h * 0.6 && w.Cy < y + h * 3 && w.R > l && w.X < r).ToList();
-            if (under.Count == 0) return null;
+            bool In(PosWord w) => w.Cy > y + h * 0.6 && w.Cy < y + h * 3 && w.R > l && w.X < r;
+            var under = words.Where(In).ToList();
+            if (under.Count == 0) return Num(null, In, h);
             double top = under.Min(w => w.Cy);
-            return string.Concat(under.Where(w => w.Cy - top < h * 0.6).OrderBy(w => w.X).Select(w => w.Text));
+            return Num(string.Concat(under.Where(w => w.Cy - top < h * 0.6).OrderBy(w => w.X).Select(w => w.Text)), In, h);
         }
         (string? Label, string? Value, decimal? Num) Pick((string Text, double Y, double H, List<PosWord> Words) line, params string[] keys)
         {

@@ -137,9 +137,9 @@ static class SelfTest
     {
         static List<Board.PosWord> L(double y, params (string T, double X)[] ws) =>
             ws.Select(w => new Board.PosWord(w.T, w.X, y, w.T.Length * 16, 20)).ToList();
-        void Expect(string name, List<List<Board.PosWord>> lines, decimal? qty, decimal? avg, decimal? pnl)
+        void Expect(string name, List<List<Board.PosWord>> lines, decimal? qty, decimal? avg, decimal? pnl, List<Board.PosWord>? num = null)
         {
-            var p = Board.ParsePosition(lines);
+            var p = Board.ParsePosition(lines, num);
             Check(name, p.HasAvgLabel && p.Qty == qty && p.AvgPrice == avg && p.Unrealized == pnl,
                 $"qty={p.Qty} avg={p.AvgPrice} pnl={p.Unrealized} raw={p.Raw}");
         }
@@ -164,6 +164,15 @@ static class SelfTest
             L(60, ("平均建単価", 0), ("--", 300)),
             L(90, ("評価額", 0), ("--", 300)),
             L(120, ("評価損益(率)", 0), ("--", 300))], null, null, null);
+        // 2026-11-24 の実物: 日本語の OCR は「6,783.9」を「6ノ83.9」、「100(0)」を「1開←)」と読んだ。数字は英語の OCR の語から取る
+        Expect("建玉欄: 数字は英語の OCR で読む", [
+            L(0, ("買建玉(1日)", 0)),
+            L(30, ("保有株数(注文中)", 0), ("1開←)", 300)),
+            L(60, ("平均建単価", 0), ("6ノ83.9", 300)),
+            L(90, ("評価損益(率)", 0), ("-0.12%", 300))], 100m, 6783.9m, -0.12m,
+            [.. L(30, ("SIS", 0), ("100(0)", 300)), .. L(60, ("Ffi", 0), ("6,783.9", 300)), .. L(90, ("-0.12%", 300))]);
+        Expect("建玉欄: 英語の OCR が無ければ日本語のまま", [
+            L(60, ("平均建単価", 0), ("乙103", 300))], null, null, null, []);
     }
 
     static void ImageCase(string path)
