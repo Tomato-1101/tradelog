@@ -15,6 +15,7 @@ HERE="$(cd "$(dirname "$0")" && pwd)"
 REPO="$(cd "$HERE/.." && pwd)"
 . "$HERE/win-lib.sh"
 win_check_conf
+win_shell
 TASK=tradelog-panel
 DEST="$(win_real_dir "$REPO")"
 
@@ -32,7 +33,7 @@ case "$cmd" in
     # macOS の拡張属性（._*）を入れない。入るとコンパイラが .cs として読んで失敗する
     COPYFILE_DISABLE=1 tar -C "$REPO/apps" --no-mac-metadata --exclude 'bin' --exclude 'obj' --exclude '._*' --exclude '.DS_Store' -cf "$tarball" panel-win
     win_ps "$PS_PATHS New-Item -ItemType Directory -Force (Join-Path \$root 'src') | Out-Null" >/dev/null
-    scp -q "${WIN_SSH_OPTS[@]}" "$tarball" "$WIN_USER@$WIN_HOST:tradelog/src/panel-win.tar"
+    win_put "$tarball" tradelog/src/panel-win.tar
     rm -f "$tarball"
     win_ps "$PS_PATHS \$ErrorActionPreference = 'Stop'
       \$src = Join-Path \$root 'src'
@@ -119,7 +120,7 @@ case "$cmd" in
           ;;
       esac
     done <<<"$removed"
-    "$HERE/pull-win.sh"
+    TRADELOG_PULL_REWRITE=1 "$HERE/pull-win.sh" # test 行を除いた分だけ短くなるので書き直しを許す
     ;;
   *)
     sed -n '2,11p' "$0" | sed 's/^# \{0,1\}//'
