@@ -200,19 +200,19 @@ sealed class BoardMonitor
                     Board.Scan(px, lay, sell, buy);
                     if (!tracker.HasBaseline)
                     {
-                        tracker.Baseline(sell, buy);
+                        tracker.Baseline(sell, buy, sig);
                         var (code, name) = Board.ParseTitle(title);
                         Status($"監視中 {name ?? ""}{(code != null ? $"({code})" : "")}");
                     }
                     else if (Board.Shift(prev, sig) is not { } shift)
                     {
                         Log.Write("板のずれが測れないので追跡をやり直す");
-                        tracker.Baseline(sell, buy);
+                        tracker.Baseline(sell, buy, sig);
                     }
                     else
                     {
                         tracker.ApplyShift(shift);
-                        var evs = tracker.Step(ts, sell, buy);
+                        var evs = tracker.Step(ts, sell, buy, sig);
                         if (evs.Count > 0) jobs.Add(new Job(img!.Clone(new Rectangle(0, 0, w, hh), PixelFormat.Format24bppRgb), lay, evs, title));
                         foreach (var ev in evs.Where(e => e.Event == "filled"))
                             foreach (var d in PosDelays) posDue.Add((t0 + d, ev.OrderKey, ev.Ts));

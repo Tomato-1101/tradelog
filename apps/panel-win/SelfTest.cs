@@ -68,6 +68,33 @@ static class SelfTest
         // スクロール: 5 行目の注文が 3 行目に来ても同じ注文のまま。そこで消えたら約定
         var tr = new Tracker();
         CellState[] At(int k) { var a = new CellState[10]; if (k >= 0) a[k] = S; return a; }
+
+        // 値段の無い行（銘柄の切り替え直後の OVER の下）で両方のマスが一瞬埋まっても注文にしない。値段のある行は今まで通り
+        ulong[] Sig(params int[] blank) { var g = Enumerable.Repeat(1UL, 10).ToArray(); foreach (var k in blank) g[k] = 0; return g; }
+        tr = new Tracker();
+        tr.Baseline(new CellState[10], new CellState[10]);
+        var u = new List<TrackEvent>();
+        foreach (var (st, i) in new[] { (S, 1), (S, 2), (E, 3), (E, 4) }) u.AddRange(tr.Step(F(i), At(st == S ? 1 : -1), At(st == S ? 1 : -1), Sig(1)));
+        Check("値段の無い行の一瞬の表示は注文にしない", u.Count == 0, Show(u));
+        tr = new Tracker();
+        tr.Baseline(new CellState[10], new CellState[10]);
+        u = [.. tr.Step(F(1), new CellState[10], At(4), Sig(1)), .. tr.Step(F(2), new CellState[10], At(4), Sig(1))];
+        Check("値段のある行の注文は今まで通り", u is [{ Event: "appeared", Row: 4 }], Show(u));
+        tr = new Tracker();
+        tr.Baseline(new CellState[10], At(4));
+        u = [.. tr.Step(F(1), new CellState[10], At(-1), Sig(4)), .. tr.Step(F(2), new CellState[10], At(-1), Sig(4))];
+        Check("追っている注文は値段が一瞬消えても約定を出す", u is [{ Event: "filled", Row: 4 }], Show(u));
+        tr = new Tracker();
+        tr.Baseline(At(1), At(1), Sig(1));
+        u = [.. tr.Step(F(1), At(-1), At(-1), Sig(1)), .. tr.Step(F(2), At(-1), At(-1), Sig(1))];
+        Check("監視開始時に値段の無い行で見えた物が消えても約定にしない", u.Count == 0, Show(u));
+        tr = new Tracker();
+        tr.Baseline(new CellState[10], new CellState[10]);
+        u = [.. tr.Step(F(1), new CellState[10], At(4)), .. tr.Step(F(2), new CellState[10], At(4), Sig(4)), .. tr.Step(F(3), new CellState[10], At(4), Sig(4))];
+        Check("値段のある 1 フレームの後に値段が消えても注文にしない", u.Count == 0, Show(u));
+        u = [.. tr.Step(F(4), new CellState[10], At(4)), .. tr.Step(F(5), new CellState[10], At(4))];
+        Check("値段が戻れば注文にする", u is [{ Event: "appeared", Row: 4 }], Show(u));
+        tr = new Tracker();
         tr.Baseline(new CellState[10], At(5));
         tr.ApplyShift(2);
         var a1 = tr.Step(F(1), new CellState[10], At(3));
